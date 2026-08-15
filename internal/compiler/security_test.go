@@ -5,17 +5,6 @@ import (
 	"testing"
 )
 
-const execBase = `schema: proceed/v1
-name: exec-shapes
-nodes:
-  - id: work
-    type: task
-    executor: %s
-    contract: pure
-    terminal: true
-edges: []
-`
-
 func TestValidateExecutorRequiredFields(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -72,7 +61,9 @@ nodes:
     executor: { kind: http, method: GET, url: https://a.example, headers: { Authorization: "${api_token}" } }
     contract: idempotent
     terminal: true
-    capability: { network: { allowlisted_hosts: [a.example] } }
+    capability:
+      network: { allowlisted_hosts: [a.example] }
+      secrets: [api_token]
 edges: []
 `
 	doc, err = Parse([]byte(reference))
@@ -80,7 +71,55 @@ edges: []
 		t.Fatal(err)
 	}
 	if err := Validate(doc); err != nil {
-		t.Fatalf("reference header value must pass: %v", err)
+		t.Fatalf("declared reference header value must pass: %v", err)
+	}
+
+	undeclared := `schema: proceed/v1
+name: headers
+nodes:
+  - id: call
+    type: tool
+    executor: { kind: http, method: GET, url: https://a.example, headers: { Authorization: "${api_token}" } }
+    contract: idempotent
+    terminal: true
+    capability: { network: { allowlisted_hosts: [a.example] } }
+edges: []
+`
+	doc, err = Parse([]byte(undeclared))
+	if err != nil {
+		t.Fatal(err)
+	}
+	verr = Validate(doc)
+	if verr == nil {
+		t.Fatal("undeclared secret reference must be rejected")
+	}
+	requireRule(t, verr, RuleParse, "nodes[0].executor.headers.Authorization")
+}
+
+func TestValidateHTTPURLUserinfoRejected(t *testing.T) {
+	for _, u := range []string{
+		"https://user:literal-secret@allowed.example/fetch",
+		"https://user@allowed.example/fetch",
+	} {
+		doc, err := Parse([]byte(fmt.Sprintf(`schema: proceed/v1
+name: userinfo
+nodes:
+  - id: call
+    type: tool
+    executor: { kind: http, method: GET, url: "%s" }
+    contract: idempotent
+    terminal: true
+    capability: { network: { allowlisted_hosts: [allowed.example] } }
+edges: []
+`, u)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		verr := Validate(doc)
+		if verr == nil {
+			t.Fatalf("url %s must be rejected", u)
+		}
+		requireRule(t, verr, RuleParse, "nodes[0].executor.url")
 	}
 }
 

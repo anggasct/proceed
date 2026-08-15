@@ -3,6 +3,7 @@ package compiler
 import (
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 )
 
@@ -114,7 +115,7 @@ func (v *validator) nodePass() {
 			v.capabilityFields(n.Capability, joinPath(path, "capability"))
 		}
 		if n.Executor != nil && n.Executor.Kind == "http" {
-			v.httpHostAllowlist(n.Executor, n.Capability, joinPath(path, "executor.url"))
+			v.httpExecutorPolicy(n.Executor, n.Capability, joinPath(path, "executor"))
 		}
 		if n.Retry != nil {
 			if n.Retry.MaxAttempts < 1 {
@@ -226,14 +227,19 @@ func isName(s string) bool {
 	return true
 }
 
-func (v *validator) httpHostAllowlist(e *Executor, c *Capability, path string) {
+func (v *validator) httpExecutorPolicy(e *Executor, c *Capability, path string) {
+	urlPath := joinPath(path, "url")
 	u, err := url.Parse(e.URL)
 	if err != nil || u.Host == "" {
-		v.errf(RuleParse, path, "http executor url must be absolute with a host")
+		v.errf(RuleParse, urlPath, "http executor url must be absolute with a host")
 		return
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		v.errf(RuleParse, path, "http executor url scheme must be http or https")
+		v.errf(RuleParse, urlPath, "http executor url scheme must be http or https")
+		return
+	}
+	if u.User != nil {
+		v.errf(RuleParse, urlPath, "http executor url must not contain credentials or userinfo")
 		return
 	}
 	host := strings.ToLower(u.Hostname())
@@ -244,7 +250,30 @@ func (v *validator) httpHostAllowlist(e *Executor, c *Capability, path string) {
 		}
 	}
 	if !allowlisted[host] {
-		v.errf(RuleParse, path, "http executor host %q is not in capability.network.allowlisted_hosts", host)
+		v.errf(RuleParse, urlPath, "http executor host %q is not in capability.network.allowlisted_hosts", host)
+	}
+
+	declared := map[string]bool{}
+	if c != nil {
+		for _, name := range c.Secrets {
+			declared[name] = true
+		}
+	}
+	names := make([]string, 0, len(e.Headers))
+	for name := range e.Headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		value := e.Headers[name]
+		if !isSecretReference(value) {
+			continue
+		}
+		ref := value[len(secretRefPrefix) : len(value)-1]
+		if !declared[ref] {
+			v.errf(RuleParse, joinPath(path, "headers."+name),
+				"header references secret %q which is not declared in capability.secrets", ref)
+		}
 	}
 }
 

@@ -14,22 +14,6 @@ func validateSrc(t *testing.T, src string) (*Document, error) {
 	return doc, Validate(doc)
 }
 
-const twoNodeBase = `schema: proceed/v1
-name: chain
-nodes:
-  - id: build
-    type: task
-    executor: { kind: shell, command: [scripts/build] }
-    contract: pure
-  - id: test
-    type: task
-    executor: { kind: shell, command: [scripts/test] }
-    contract: pure
-    terminal: true
-edges:
-  - { from: build, to: test, type: depends_on }
-`
-
 func TestValidateCanonicalFixturePasses(t *testing.T) {
 	doc, err := Parse(mustRead(t, "testdata/customer-research.yaml"))
 	if err != nil {

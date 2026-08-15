@@ -93,28 +93,30 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	if err := db.Ping(); err != nil {
-		db.Close()
-		return nil, err
+		return nil, closeOnErr(db, err)
 	}
 	if _, err := db.Exec(definitionDDL); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("apply definition schema: %w", err)
+		return nil, closeOnErr(db, fmt.Errorf("apply definition schema: %w", err))
 	}
 	var current int
 	if err := db.QueryRow("PRAGMA user_version").Scan(&current); err != nil {
-		db.Close()
-		return nil, err
+		return nil, closeOnErr(db, err)
 	}
 	if current == 0 {
 		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", definitionSchemaVersion)); err != nil {
-			db.Close()
-			return nil, err
+			return nil, closeOnErr(db, err)
 		}
 	} else if current != definitionSchemaVersion {
-		db.Close()
-		return nil, fmt.Errorf("store schema version %d is newer than supported %d", current, definitionSchemaVersion)
+		return nil, closeOnErr(db, fmt.Errorf("store schema version %d is newer than supported %d", current, definitionSchemaVersion))
 	}
 	return &Store{db: db}, nil
+}
+
+func closeOnErr(db *sql.DB, err error) error {
+	if closeErr := db.Close(); closeErr != nil {
+		return fmt.Errorf("%w (close: %v)", err, closeErr)
+	}
+	return err
 }
 
 func (s *Store) Close() error {
@@ -212,7 +214,9 @@ func (s *Store) withTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 		return err
 	}
 	if err := fn(tx); err != nil {
-		tx.Rollback()
+		if rbErr := tx.Rollback(); rbErr != nil {
+			return fmt.Errorf("%w (rollback: %v)", err, rbErr)
+		}
 		return err
 	}
 	return tx.Commit()
