@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 )
 
@@ -112,6 +113,9 @@ func (v *validator) nodePass() {
 		if n.Capability != nil {
 			v.capabilityFields(n.Capability, joinPath(path, "capability"))
 		}
+		if n.Executor != nil && n.Executor.Kind == "http" {
+			v.httpHostAllowlist(n.Executor, n.Capability, joinPath(path, "executor.url"))
+		}
 		if n.Retry != nil {
 			if n.Retry.MaxAttempts < 1 {
 				v.errf(RuleParse, joinPath(path, "retry.max_attempts"), "retry.max_attempts must be >= 1")
@@ -220,6 +224,28 @@ func isName(s string) bool {
 		}
 	}
 	return true
+}
+
+func (v *validator) httpHostAllowlist(e *Executor, c *Capability, path string) {
+	u, err := url.Parse(e.URL)
+	if err != nil || u.Host == "" {
+		v.errf(RuleParse, path, "http executor url must be absolute with a host")
+		return
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		v.errf(RuleParse, path, "http executor url scheme must be http or https")
+		return
+	}
+	host := strings.ToLower(u.Hostname())
+	allowlisted := map[string]bool{}
+	if c != nil && c.Network != nil {
+		for _, h := range c.Network.AllowlistedHosts {
+			allowlisted[strings.ToLower(h)] = true
+		}
+	}
+	if !allowlisted[host] {
+		v.errf(RuleParse, path, "http executor host %q is not in capability.network.allowlisted_hosts", host)
+	}
 }
 
 func (v *validator) edgePass() {

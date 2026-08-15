@@ -1,6 +1,9 @@
 package compiler
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 const execBase = `schema: proceed/v1
 name: exec-shapes
@@ -69,6 +72,7 @@ nodes:
     executor: { kind: http, method: GET, url: https://a.example, headers: { Authorization: "${api_token}" } }
     contract: idempotent
     terminal: true
+    capability: { network: { allowlisted_hosts: [a.example] } }
 edges: []
 `
 	doc, err = Parse([]byte(reference))
@@ -78,6 +82,73 @@ edges: []
 	if err := Validate(doc); err != nil {
 		t.Fatalf("reference header value must pass: %v", err)
 	}
+}
+
+func TestValidateHTTPHostAllowlist(t *testing.T) {
+	const docTemplate = `schema: proceed/v1
+name: allowlist
+nodes:
+  - id: call
+    type: tool
+    executor: { kind: http, method: GET, url: %s }
+    contract: idempotent
+    terminal: true
+    capability: { network: { allowlisted_hosts: [allowed.example] } }
+edges: []
+`
+	cases := []struct {
+		name   string
+		url    string
+		reject bool
+	}{
+		{name: "host outside allowlist", url: "https://evil.example/fetch", reject: true},
+		{name: "host inside allowlist", url: "https://allowed.example/fetch", reject: false},
+		{name: "host with port inside allowlist", url: "https://allowed.example:8443/fetch", reject: false},
+		{name: "host with port outside allowlist", url: "https://evil.example:8443/fetch", reject: true},
+		{name: "case-insensitive host match", url: "https://ALLOWED.Example/fetch", reject: false},
+		{name: "scheme not http", url: "ftp://allowed.example/fetch", reject: true},
+		{name: "relative url", url: "/relative/path", reject: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc, err := Parse([]byte(fmt.Sprintf(docTemplate, tc.url)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			verr := Validate(doc)
+			if tc.reject && verr == nil {
+				t.Fatalf("url %s must be rejected", tc.url)
+			}
+			if !tc.reject && verr != nil {
+				t.Fatalf("url %s must pass: %v", tc.url, verr)
+			}
+			if tc.reject {
+				requireRule(t, verr, RuleParse, "nodes[0].executor.url")
+			}
+		})
+	}
+}
+
+func TestValidateHTTPHostWithoutCapabilityRejected(t *testing.T) {
+	src := `schema: proceed/v1
+name: no-cap
+nodes:
+  - id: call
+    type: tool
+    executor: { kind: http, method: GET, url: https://a.example }
+    contract: idempotent
+    terminal: true
+edges: []
+`
+	doc, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	verr := Validate(doc)
+	if verr == nil {
+		t.Fatal("http node without allowlist capability must be rejected")
+	}
+	requireRule(t, verr, RuleParse, "nodes[0].executor.url")
 }
 
 func TestValidateCapabilityEnums(t *testing.T) {
