@@ -99,14 +99,18 @@ func (v *validator) nodePass() {
 			v.errf(RuleContractRequired, joinPath(path, "executor"), "node type %q requires an executor", n.Type)
 		}
 		if n.Executor != nil {
+			v.executorFields(n.Executor, joinPath(path, "executor"))
 			if !n.HasContract {
 				v.errf(RuleContractRequired, joinPath(path, "contract"), "node with executor requires a contract")
 			} else if !contractSet[n.Contract] {
 				v.errf(RuleContractRequired, joinPath(path, "contract"), "unknown contract %q", n.Contract)
 			}
 		}
-		if n.TimeoutMs < 0 {
+		if n.HasTimeout && n.TimeoutMs < 1 {
 			v.errf(RuleParse, joinPath(path, "timeout_ms"), "timeout_ms must be >= 1")
+		}
+		if n.Capability != nil {
+			v.capabilityFields(n.Capability, joinPath(path, "capability"))
 		}
 		if n.Retry != nil {
 			if n.Retry.MaxAttempts < 1 {
@@ -117,6 +121,105 @@ func (v *validator) nodePass() {
 			}
 		}
 	}
+}
+
+var filesystemSet = map[string]bool{
+	"none": true, "workspace-read": true, "workspace-write": true, "declared-paths": true,
+}
+
+var processSet = map[string]bool{
+	"none": true, "declared-command": true,
+}
+
+var humanSet = map[string]bool{
+	"none": true, "approval-scope": true,
+}
+
+const secretRefPrefix = "${"
+
+func (v *validator) executorFields(e *Executor, path string) {
+	switch e.Kind {
+	case "shell":
+		if len(e.Command) == 0 {
+			v.errf(RuleParse, joinPath(path, "command"), "shell executor requires command")
+		}
+	case "http":
+		if e.Method == "" {
+			v.errf(RuleParse, joinPath(path, "method"), "http executor requires method")
+		}
+		if e.URL == "" {
+			v.errf(RuleParse, joinPath(path, "url"), "http executor requires url")
+		}
+		for name, value := range e.Headers {
+			if !isSecretReference(value) {
+				v.errf(RuleParse, joinPath(path, "headers."+name),
+					"header value must be a secret reference (${name}), not a literal")
+			}
+		}
+	case "human_approval":
+		if e.Scope == "" {
+			v.errf(RuleParse, joinPath(path, "scope"), "human_approval executor requires scope")
+		}
+	case "agent_cli":
+		if e.CLI == "" {
+			v.errf(RuleParse, joinPath(path, "cli"), "agent_cli executor requires cli")
+		}
+	}
+}
+
+func (v *validator) capabilityFields(c *Capability, path string) {
+	if c.Filesystem != "" && !filesystemSet[c.Filesystem] {
+		v.errf(RuleParse, joinPath(path, "filesystem"),
+			"filesystem must be one of none, workspace-read, workspace-write, declared-paths")
+	}
+	if c.Process != "" && !processSet[c.Process] {
+		v.errf(RuleParse, joinPath(path, "process"), "process must be one of none, declared-command")
+	}
+	if c.Human != "" && !humanSet[c.Human] {
+		v.errf(RuleParse, joinPath(path, "human"), "human must be one of none, approval-scope")
+	}
+	if c.SecretsLiteral != "" && c.SecretsLiteral != "none" {
+		v.errf(RuleParse, joinPath(path, "secrets"), "secrets must be none or a list of named references")
+	}
+	for i, name := range c.Secrets {
+		if !isName(name) {
+			v.errf(RuleParse, joinPath(path, fmt.Sprintf("secrets[%d]", i)),
+				"secret entry %q must be a named reference", name)
+		}
+	}
+	if c.Network != nil {
+		net := c.Network
+		if net.Mode != "" {
+			if net.Mode != "none" {
+				v.errf(RuleParse, joinPath(path, "network"), "network must be none or an allowlisted_hosts object")
+			}
+		} else if len(net.AllowlistedHosts) == 0 {
+			v.errf(RuleParse, joinPath(path, "network.allowlisted_hosts"),
+				"network object requires a non-empty allowlisted_hosts list")
+		}
+	}
+}
+
+func isSecretReference(value string) bool {
+	if !strings.HasPrefix(value, secretRefPrefix) || !strings.HasSuffix(value, "}") {
+		return false
+	}
+	return isName(value[len(secretRefPrefix) : len(value)-1])
+}
+
+func isName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '.':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (v *validator) edgePass() {

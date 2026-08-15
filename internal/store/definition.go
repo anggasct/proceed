@@ -12,6 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/oklog/ulid/v2"
+	yaml "gopkg.in/yaml.v3"
 
 	"proceed/internal/compiler"
 )
@@ -31,6 +32,7 @@ CREATE TABLE IF NOT EXISTS graph_version (
   source_schema_version   TEXT NOT NULL,
   compiled_schema_version TEXT NOT NULL,
   source_metadata         TEXT NOT NULL,
+  extras                  TEXT NOT NULL DEFAULT '{}',
   status                  TEXT NOT NULL DEFAULT 'frozen'
                             CHECK (status IN ('frozen', 'superseded')),
   created_at              INTEGER NOT NULL
@@ -56,6 +58,7 @@ CREATE TABLE IF NOT EXISTS graph_edge (
                                    'verifies','derived_from','blocks','approves','measures','improves')),
   condition        TEXT,
   max_traversals   INTEGER,
+  extras           TEXT NOT NULL DEFAULT '{}',
   CHECK (type = 'routes_to' OR condition IS NULL),
   FOREIGN KEY (graph_version_id, from_node_key)
     REFERENCES graph_node(graph_version_id, node_key),
@@ -67,7 +70,8 @@ CREATE TABLE IF NOT EXISTS policy (
   id               TEXT PRIMARY KEY,
   graph_version_id TEXT NOT NULL REFERENCES graph_version(id),
   kind             TEXT NOT NULL,
-  rule             TEXT NOT NULL
+  rule             TEXT NOT NULL,
+  extras           TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_graph_node_version ON graph_node(graph_version_id);
@@ -135,6 +139,7 @@ type definitionRow struct {
 	Digest              string
 	SourceSchemaVersion string
 	SourceMetadata      string
+	Extras              string
 	Doc                 *compiler.Document
 }
 
@@ -157,6 +162,7 @@ func (s *Store) FreezeDefinition(ctx context.Context, sourcePath string, src []b
 		Digest:              digest,
 		SourceSchemaVersion: doc.Schema,
 		SourceMetadata:      string(meta),
+		Extras:              extrasJSON(doc.Extras),
 		Doc:                 doc,
 	}
 	var result FrozenVersion
@@ -243,10 +249,10 @@ func versionIDByDigest(ctx context.Context, tx *sql.Tx, digest string) (string, 
 func insertVersion(ctx context.Context, tx *sql.Tx, versionID, graphID string, row definitionRow) error {
 	_, err := tx.ExecContext(ctx, `
 INSERT INTO graph_version (id, graph_id, definition_digest, source_schema_version,
-                           compiled_schema_version, source_metadata, status, created_at)
-VALUES (?, ?, ?, ?, ?, ?, 'frozen', ?)`,
+                           compiled_schema_version, source_metadata, extras, status, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, 'frozen', ?)`,
 		versionID, graphID, row.Digest, row.SourceSchemaVersion,
-		compiler.CompiledSchemaVersion, row.SourceMetadata, time.Now().UnixMilli())
+		compiler.CompiledSchemaVersion, row.SourceMetadata, row.Extras, time.Now().UnixMilli())
 	return err
 }
 
@@ -278,9 +284,9 @@ func insertEdges(ctx context.Context, tx *sql.Tx, versionID string, doc *compile
 			maxTraversals = e.MaxTraversals
 		}
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO graph_edge (id, graph_version_id, from_node_key, to_node_key, type, condition, max_traversals)
-VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			ulid.Make().String(), versionID, e.From, e.To, e.Type, condition, maxTraversals); err != nil {
+INSERT INTO graph_edge (id, graph_version_id, from_node_key, to_node_key, type, condition, max_traversals, extras)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			ulid.Make().String(), versionID, e.From, e.To, e.Type, condition, maxTraversals, extrasJSON(e.Extras)); err != nil {
 			return err
 		}
 	}
@@ -299,12 +305,31 @@ func insertPolicies(ctx context.Context, tx *sql.Tx, versionID string, doc *comp
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
-			"INSERT INTO policy (id, graph_version_id, kind, rule) VALUES (?, ?, ?, ?)",
-			ulid.Make().String(), versionID, po.Kind, string(encoded)); err != nil {
+			"INSERT INTO policy (id, graph_version_id, kind, rule, extras) VALUES (?, ?, ?, ?, ?)",
+			ulid.Make().String(), versionID, po.Kind, string(encoded), extrasJSON(po.Extras)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func extrasJSON(extras map[string]yaml.Node) string {
+	if len(extras) == 0 {
+		return "{}"
+	}
+	out := make(map[string]any, len(extras))
+	for k, v := range extras {
+		val, err := compiler.NodeToJSONValue(&v)
+		if err != nil {
+			return "{}"
+		}
+		out[k] = val
+	}
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		return "{}"
+	}
+	return string(encoded)
 }
 
 func nodeConfigJSON(n *compiler.Node) (string, error) {
@@ -366,18 +391,21 @@ func nodeConfigJSON(n *compiler.Node) (string, error) {
 			capability["filesystem"] = n.Capability.Filesystem
 		}
 		if n.Capability.Network != nil {
-			network := map[string]any{}
-			for k, v := range n.Capability.Network.Extras {
-				nv, err := compiler.NodeToJSONValue(&v)
-				if err != nil {
-					return "", err
+			net := n.Capability.Network
+			if net.Mode != "" {
+				capability["network"] = net.Mode
+			} else {
+				network := map[string]any{}
+				for k, v := range net.Extras {
+					nv, err := compiler.NodeToJSONValue(&v)
+					if err != nil {
+						return "", err
+					}
+					network[k] = nv
 				}
-				network[k] = nv
-			}
-			if n.Capability.Network.Mode != "" {
-				capability["network"] = n.Capability.Network.Mode
-			} else if len(n.Capability.Network.AllowlistedHosts) > 0 {
-				network["allowlisted_hosts"] = n.Capability.Network.AllowlistedHosts
+				if len(net.AllowlistedHosts) > 0 {
+					network["allowlisted_hosts"] = net.AllowlistedHosts
+				}
 				capability["network"] = network
 			}
 		}

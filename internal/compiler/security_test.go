@@ -1,0 +1,174 @@
+package compiler
+
+import "testing"
+
+const execBase = `schema: proceed/v1
+name: exec-shapes
+nodes:
+  - id: work
+    type: task
+    executor: %s
+    contract: pure
+    terminal: true
+edges: []
+`
+
+func TestValidateExecutorRequiredFields(t *testing.T) {
+	cases := []struct {
+		name     string
+		executor string
+		location string
+	}{
+		{"shell without command", `{ kind: shell }`, "nodes[0].executor.command"},
+		{"http without method", `{ kind: http, url: https://a.example }`, "nodes[0].executor.method"},
+		{"http without url", `{ kind: http, method: GET }`, "nodes[0].executor.url"},
+		{"human_approval without scope", `{ kind: human_approval }`, "nodes[0].executor.scope"},
+		{"agent_cli without cli", `{ kind: agent_cli, args: [x] }`, "nodes[0].executor.cli"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc, err := Parse([]byte("schema: proceed/v1\nname: e\nnodes:\n  - id: work\n    type: task\n    executor: " + tc.executor + "\n    contract: pure\n    terminal: true\nedges: []\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			verr := Validate(doc)
+			if verr == nil {
+				t.Fatal("expected error")
+			}
+			requireRule(t, verr, RuleParse, tc.location)
+		})
+	}
+}
+
+func TestValidateHTTPHeaderValuesMustBeReferences(t *testing.T) {
+	literal := `schema: proceed/v1
+name: headers
+nodes:
+  - id: call
+    type: tool
+    executor: { kind: http, method: GET, url: https://a.example, headers: { Authorization: "Bearer sk-live-abcdef" } }
+    contract: idempotent
+    terminal: true
+edges: []
+`
+	doc, err := Parse([]byte(literal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	verr := Validate(doc)
+	if verr == nil {
+		t.Fatal("literal header value must be rejected")
+	}
+	requireRule(t, verr, RuleParse, "nodes[0].executor.headers.Authorization")
+
+	reference := `schema: proceed/v1
+name: headers
+nodes:
+  - id: call
+    type: tool
+    executor: { kind: http, method: GET, url: https://a.example, headers: { Authorization: "${api_token}" } }
+    contract: idempotent
+    terminal: true
+edges: []
+`
+	doc, err = Parse([]byte(reference))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Validate(doc); err != nil {
+		t.Fatalf("reference header value must pass: %v", err)
+	}
+}
+
+func TestValidateCapabilityEnums(t *testing.T) {
+	cases := []struct {
+		name     string
+		cap      string
+		location string
+	}{
+		{"filesystem enum", `{ filesystem: arbitrary-access }`, "nodes[0].capability.filesystem"},
+		{"process enum", `{ process: arbitrary-command }`, "nodes[0].capability.process"},
+		{"human enum", `{ human: everyone }`, "nodes[0].capability.human"},
+		{"scalar secrets", `{ secrets: github-token }`, "nodes[0].capability.secrets"},
+		{"network scalar mode", `{ network: allow-all }`, "nodes[0].capability.network"},
+		{"network object without hosts", `{ network: { allowlisted_hosts: [] } }`, "nodes[0].capability.network.allowlisted_hosts"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := "schema: proceed/v1\nname: caps\nnodes:\n  - id: work\n    type: task\n    executor: { kind: shell, command: [bin/do] }\n    contract: pure\n    terminal: true\n    capability: " + tc.cap + "\nedges: []\n"
+			doc, err := Parse([]byte(src))
+			if err != nil {
+				t.Fatal(err)
+			}
+			verr := Validate(doc)
+			if verr == nil {
+				t.Fatal("expected error")
+			}
+			requireRule(t, verr, RuleParse, tc.location)
+		})
+	}
+}
+
+func TestValidateCapabilityAcceptedForms(t *testing.T) {
+	src := `schema: proceed/v1
+name: caps-ok
+nodes:
+  - id: work
+    type: task
+    executor: { kind: shell, command: [bin/do] }
+    contract: pure
+    terminal: true
+    capability:
+      filesystem: workspace-read
+      process: declared-command
+      human: approval-scope
+      secrets: [github-token, openai_key.1]
+      network: { allowlisted_hosts: [api.github.com] }
+edges: []
+`
+	doc, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Validate(doc); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateSecretListEntriesMustBeNames(t *testing.T) {
+	src := `schema: proceed/v1
+name: caps-bad-secret
+nodes:
+  - id: work
+    type: task
+    executor: { kind: shell, command: [bin/do] }
+    contract: pure
+    terminal: true
+    capability: { secrets: ["sk-live-abcdef with spaces"] }
+edges: []
+`
+	doc, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	verr := Validate(doc)
+	if verr == nil {
+		t.Fatal("non-name secret entry must be rejected")
+	}
+	requireRule(t, verr, RuleParse, "nodes[0].capability.secrets[0]")
+}
+
+func TestValidateTimeoutPresence(t *testing.T) {
+	for _, value := range []string{"0", "-5"} {
+		src := "schema: proceed/v1\nname: t\nnodes:\n  - id: work\n    type: task\n    executor: { kind: shell, command: [bin/do] }\n    contract: pure\n    terminal: true\n    timeout_ms: " + value + "\nedges: []\n"
+		doc, err := Parse([]byte(src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		verr := Validate(doc)
+		if verr == nil {
+			t.Fatalf("timeout_ms=%s must be rejected", value)
+		}
+		requireRule(t, verr, RuleParse, "nodes[0].timeout_ms")
+	}
+}

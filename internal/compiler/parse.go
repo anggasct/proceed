@@ -33,6 +33,7 @@ type Node struct {
 	Contract    string
 	HasContract bool
 	TimeoutMs   int64
+	HasTimeout  bool
 	Retry       *Retry
 	Extras      map[string]yaml.Node
 }
@@ -245,6 +246,7 @@ func (p *parser) node(n *yaml.Node, path string) Node {
 			nd.Contract, nd.HasContract = p.strPresent(f.value, loc)
 		case "timeout_ms":
 			nd.TimeoutMs = p.integer(f.value, loc)
+			nd.HasTimeout = true
 		case "retry":
 			nd.Retry = p.retry(f.value, joinPath(path, "retry"))
 		}
