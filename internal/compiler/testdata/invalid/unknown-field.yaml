@@ -1,0 +1,10 @@
+schema: proceed/v1
+name: unknown-field-demo
+ttl: 3600
+nodes:
+  - id: only
+    type: task
+    executor: { kind: shell, command: [bin/do] }
+    contract: pure
+    terminal: true
+edges: []
