@@ -1,0 +1,13 @@
+schema: proceed/v1
+name: duplicate-node-id-demo
+nodes:
+  - id: classify
+    type: model
+    executor: { kind: agent_cli, cli: opencode, args: [classify] }
+    contract: pure
+  - id: classify
+    type: model
+    executor: { kind: agent_cli, cli: opencode, args: [again] }
+    contract: pure
+    terminal: true
+edges: []

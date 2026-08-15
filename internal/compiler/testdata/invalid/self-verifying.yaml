@@ -1,0 +1,10 @@
+schema: proceed/v1
+name: self-verifying-demo
+nodes:
+  - id: verify
+    type: verifier
+    executor: { kind: shell, command: [scripts/verify] }
+    contract: pure
+    terminal: true
+edges:
+  - { from: verify, to: verify, type: routes_to, when: retry, max_traversals: 2 }

@@ -1,0 +1,14 @@
+schema: proceed/v1
+name: when-on-depends-demo
+nodes:
+  - id: build
+    type: task
+    executor: { kind: shell, command: [scripts/build] }
+    contract: pure
+  - id: test
+    type: task
+    executor: { kind: shell, command: [scripts/test] }
+    contract: pure
+    terminal: true
+edges:
+  - { from: build, to: test, type: depends_on, when: always }

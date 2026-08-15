@@ -1,0 +1,8 @@
+schema: proceed/v1
+name: sink-without-terminal-demo
+nodes:
+  - id: only
+    type: task
+    executor: { kind: shell, command: [bin/do] }
+    contract: pure
+edges: []

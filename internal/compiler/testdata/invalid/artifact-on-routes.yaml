@@ -1,0 +1,14 @@
+schema: proceed/v1
+name: artifact-on-routes-demo
+nodes:
+  - id: classify
+    type: model
+    executor: { kind: agent_cli, cli: opencode, args: [classify] }
+    contract: pure
+  - id: review
+    type: task
+    executor: { kind: shell, command: [scripts/review] }
+    contract: pure
+    terminal: true
+edges:
+  - { from: classify, to: review, type: routes_to, when: always, artifact: notes }
