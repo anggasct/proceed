@@ -80,8 +80,15 @@ func (v *validator) documentPass() {
 	}
 	for i := range v.doc.Policies {
 		po := &v.doc.Policies[i]
+		path := fmt.Sprintf("policies[%d]", i)
+		if po.Name == "" {
+			v.errf(RuleParse, joinPath(path, "name"), "policy name is required")
+		}
 		if !policyKindSet[po.Kind] {
-			v.errf(RuleParse, fmt.Sprintf("policies[%d].kind", i), "policy kind must be one of retry, gate, capability")
+			v.errf(RuleParse, joinPath(path, "kind"), "policy kind must be one of retry, gate, capability")
+		}
+		if po.Rule == nil {
+			v.errf(RuleParse, joinPath(path, "rule"), "policy rule is required")
 		}
 	}
 }
@@ -94,12 +101,18 @@ func (v *validator) nodePass() {
 		if !nodeTypeSet[n.Type] {
 			v.errf(RuleNodeType, joinPath(path, "type"), "unknown node type %q", n.Type)
 		}
+		if n.ID == "" {
+			v.errf(RuleParse, joinPath(path, "id"), "node id must be a non-empty string")
+		}
 		if seen[n.ID] {
 			v.errf(RuleDuplicateNode, joinPath(path, "id"), "duplicate node id %q", n.ID)
 		}
 		seen[n.ID] = true
 		if executableTypeSet[n.Type] && n.Executor == nil {
 			v.errf(RuleContractRequired, joinPath(path, "executor"), "node type %q requires an executor", n.Type)
+		}
+		if n.Type == "gate" && n.Executor != nil {
+			v.errf(RuleParse, joinPath(path, "executor"), "gate nodes take no executor")
 		}
 		if n.Executor != nil {
 			v.executorFields(n.Executor, joinPath(path, "executor"))
