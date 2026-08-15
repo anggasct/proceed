@@ -8,7 +8,7 @@ import (
 
 var version = "dev"
 
-const usageText = `proceed — graph engineering system
+const usageText = `proceed — compile, run, and explain graphs of work
 
 Usage:
   proceed <command> [arguments]
