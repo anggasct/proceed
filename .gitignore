@@ -1,0 +1,14 @@
+# Local bridges to Obsidian vault — do not commit
+project-docs
+AGENTS.md
+
+# Worktrees
+.worktree/
+
+# Build artifacts
+/proceed
+*.test
+*.out
+
+# Local runtime data
+.proceed/
