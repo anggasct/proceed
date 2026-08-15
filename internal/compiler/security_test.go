@@ -147,6 +147,8 @@ edges: []
 		{name: "case-insensitive host match", url: "https://ALLOWED.Example/fetch", reject: false},
 		{name: "scheme not http", url: "ftp://allowed.example/fetch", reject: true},
 		{name: "relative url", url: "/relative/path", reject: true},
+		{name: "empty hostname", url: "https://:443/fetch", reject: true},
+		{name: "ip literal host", url: "https://10.0.0.1:443/fetch", reject: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -163,6 +165,55 @@ edges: []
 			}
 			if tc.reject {
 				requireRule(t, verr, RuleParse, "nodes[0].executor.url")
+			}
+		})
+	}
+}
+
+func TestValidateAllowlistEntriesMustBeValidHosts(t *testing.T) {
+	cases := []struct {
+		name   string
+		hosts  string
+		reject bool
+	}{
+		{name: "empty entry", hosts: `[""]`, reject: true},
+		{name: "hostname with spaces", hosts: `["not a host"]`, reject: true},
+		{name: "hostname with scheme", hosts: `["https://a.example"]`, reject: true},
+		{name: "leading hyphen label", hosts: `["-bad.example"]`, reject: true},
+		{name: "valid hostname", hosts: `["api.github.com"]`, reject: false},
+		{name: "valid ip literal", hosts: `["10.0.0.1"]`, reject: false},
+		{name: "trailing dot hostname", hosts: `["a.example."]`, reject: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			urlValue := "https://a.example/f"
+			if tc.name == "valid ip literal" {
+				urlValue = "https://10.0.0.1/f"
+			}
+			src := fmt.Sprintf(`schema: proceed/v1
+name: hosts
+nodes:
+  - id: call
+    type: tool
+    executor: { kind: http, method: GET, url: "%s" }
+    contract: idempotent
+    terminal: true
+    capability: { network: { allowlisted_hosts: %s } }
+edges: []
+`, urlValue, tc.hosts)
+			doc, err := Parse([]byte(src))
+			if err != nil {
+				t.Fatal(err)
+			}
+			verr := Validate(doc)
+			if tc.reject && verr == nil {
+				t.Fatalf("hosts %s must be rejected", tc.hosts)
+			}
+			if !tc.reject && verr != nil {
+				t.Fatalf("hosts %s must pass: %v", tc.hosts, verr)
+			}
+			if tc.reject {
+				requireRule(t, verr, RuleParse, "nodes[0].capability.network.allowlisted_hosts[0]")
 			}
 		})
 	}

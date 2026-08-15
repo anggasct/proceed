@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"sort"
 	"strings"
@@ -201,6 +202,13 @@ func (v *validator) capabilityFields(c *Capability, path string) {
 		} else if len(net.AllowlistedHosts) == 0 {
 			v.errf(RuleParse, joinPath(path, "network.allowlisted_hosts"),
 				"network object requires a non-empty allowlisted_hosts list")
+		} else {
+			for i, host := range net.AllowlistedHosts {
+				if !isValidHost(host) {
+					v.errf(RuleParse, joinPath(path, fmt.Sprintf("network.allowlisted_hosts[%d]", i)),
+						"allowlisted host %q must be a hostname or IP literal", host)
+				}
+			}
 		}
 	}
 }
@@ -243,6 +251,10 @@ func (v *validator) httpExecutorPolicy(e *Executor, c *Capability, path string) 
 		return
 	}
 	host := strings.ToLower(u.Hostname())
+	if !isValidHost(host) {
+		v.errf(RuleParse, urlPath, "http executor url must have a valid hostname")
+		return
+	}
 	allowlisted := map[string]bool{}
 	if c != nil && c.Network != nil {
 		for _, h := range c.Network.AllowlistedHosts {
@@ -275,6 +287,36 @@ func (v *validator) httpExecutorPolicy(e *Executor, c *Capability, path string) 
 				"header references secret %q which is not declared in capability.secrets", ref)
 		}
 	}
+}
+
+func isValidHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	labels := strings.Split(strings.TrimSuffix(host, "."), ".")
+	if len(labels) == 0 {
+		return false
+	}
+	for _, label := range labels {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		for _, r := range label {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			case r == '-':
+			default:
+				return false
+			}
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+	}
+	return true
 }
 
 func (v *validator) edgePass() {
