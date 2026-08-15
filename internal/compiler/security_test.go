@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -186,10 +187,8 @@ func TestValidateAllowlistEntriesMustBeValidHosts(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			urlValue := "https://a.example/f"
-			if tc.name == "valid ip literal" {
-				urlValue = "https://10.0.0.1/f"
-			}
+			host := strings.TrimSuffix(strings.TrimSuffix(strings.TrimPrefix(tc.hosts, `["`), `"]`), `"`)
+			urlValue := "https://" + strings.TrimSuffix(host, ".") + "/f"
 			src := fmt.Sprintf(`schema: proceed/v1
 name: hosts
 nodes:

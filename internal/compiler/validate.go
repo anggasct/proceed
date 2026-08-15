@@ -250,7 +250,7 @@ func (v *validator) httpExecutorPolicy(e *Executor, c *Capability, path string) 
 		v.errf(RuleParse, urlPath, "http executor url must not contain credentials or userinfo")
 		return
 	}
-	host := strings.ToLower(u.Hostname())
+	host := canonicalHost(u.Hostname())
 	if !isValidHost(host) {
 		v.errf(RuleParse, urlPath, "http executor url must have a valid hostname")
 		return
@@ -258,7 +258,7 @@ func (v *validator) httpExecutorPolicy(e *Executor, c *Capability, path string) 
 	allowlisted := map[string]bool{}
 	if c != nil && c.Network != nil {
 		for _, h := range c.Network.AllowlistedHosts {
-			allowlisted[strings.ToLower(h)] = true
+			allowlisted[canonicalHost(h)] = true
 		}
 	}
 	if !allowlisted[host] {
@@ -287,6 +287,10 @@ func (v *validator) httpExecutorPolicy(e *Executor, c *Capability, path string) 
 				"header references secret %q which is not declared in capability.secrets", ref)
 		}
 	}
+}
+
+func canonicalHost(host string) string {
+	return strings.ToLower(strings.TrimSuffix(host, "."))
 }
 
 func isValidHost(host string) bool {
