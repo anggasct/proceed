@@ -43,11 +43,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	if _, known := commands[args[0]]; known {
-		if args[0] == "validate" {
+		switch args[0] {
+		case "validate":
 			return cmdValidate(args[1:], stdout, stderr)
+		case "store":
+			return cmdStore(args[1:], stdout, stderr)
+		default:
+			fmt.Fprintf(stderr, "proceed %s: not implemented\n", args[0])
+			return 1
 		}
-		fmt.Fprintf(stderr, "proceed %s: not implemented\n", args[0])
-		return 1
 	}
 	fmt.Fprintf(stderr, "proceed: unknown command %q\n\n", args[0])
 	fmt.Fprint(stderr, usageText)
