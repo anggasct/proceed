@@ -1,9 +1,7 @@
 # proceed
 
-Proceed is a standalone tool: a single binary that compiles
-typed graph definitions (YAML), executes them durably, persists an append-only
-event log with materialized runtime/evidence graphs, and answers causal queries
-about what ran and why.
+A single binary that compiles typed graph definitions (YAML), runs them
+durably, and records every execution decision to an append-only event log.
 
 ## Build
 
