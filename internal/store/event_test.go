@@ -188,7 +188,7 @@ func TestAppendMonotonicUnderConcurrency(t *testing.T) {
 						t.Errorf("MaxSequence: %v", err)
 						return
 					}
-					ev := makeEvent(runID, next+1, "edge_traversed")
+					ev := makeEvent(runID, next+1, "checkpoint")
 					_, err = s.Append(ctx, ev)
 					if err == nil {
 						break

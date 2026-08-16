@@ -72,6 +72,8 @@ func payloadDigest(payload string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+const eventSchemaVersion = "proceed/v1"
+
 func (s *Store) Append(ctx context.Context, ev Event) (Event, error) {
 	now := time.Now().UnixMilli()
 	if ev.EventID == "" {
@@ -86,50 +88,54 @@ func (s *Store) Append(ctx context.Context, ev Event) (Event, error) {
 	ev.RecordedAt = now
 
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
-		if ev.IdempotencyKey != "" {
-			var existing string
-			err := tx.QueryRowContext(ctx,
-				"SELECT event_id FROM event WHERE idempotency_key = ?", ev.IdempotencyKey).Scan(&existing)
-			if err == nil {
-				return storeErr(CodeStoreConflict,
-					"idempotency_key %q already recorded as event %s", ev.IdempotencyKey, existing)
-			}
-			if err != sql.ErrNoRows {
-				return err
-			}
-		}
-		var max int64
-		if err := tx.QueryRowContext(ctx,
-			"SELECT COALESCE(MAX(sequence), 0) FROM event WHERE run_id = ?", ev.RunID).Scan(&max); err != nil {
-			return err
-		}
-		if ev.Sequence <= max {
-			if ev.Sequence == max {
-				return storeErr(CodeStoreConflict,
-					"sequence %d for run %s is a duplicate of the latest event", ev.Sequence, ev.RunID)
-			}
-			return storeErr(CodeStoreConflict,
-				"sequence %d for run %s is not monotonic (latest is %d)", ev.Sequence, ev.RunID, max)
-		}
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO event (event_id, run_id, sequence, schema_version, type, occurred_at, recorded_at,
-                   actor_type, actor_id, causation_id, correlation_id, idempotency_key,
-                   payload_digest, payload)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			ev.EventID, ev.RunID, ev.Sequence, ev.SchemaVersion, ev.Type, ev.OccurredAt, ev.RecordedAt,
-			ev.ActorType, ev.ActorID, nullable(ev.CausationID), nullable(ev.CorrelationID),
-			nullable(ev.IdempotencyKey), ev.PayloadDigest, ev.Payload); err != nil {
-			if strings.Contains(err.Error(), "FOREIGN KEY constraint failed") {
-				return storeErr(CodeGraphInvalid, "run %s does not exist", ev.RunID)
-			}
-			return err
-		}
-		return nil
+		return appendEventTx(ctx, tx, &ev)
 	})
 	if err != nil {
 		return Event{}, err
 	}
 	return ev, nil
+}
+
+func appendEventTx(ctx context.Context, tx *sql.Tx, ev *Event) error {
+	if ev.IdempotencyKey != "" {
+		var existing string
+		err := tx.QueryRowContext(ctx,
+			"SELECT event_id FROM event WHERE idempotency_key = ?", ev.IdempotencyKey).Scan(&existing)
+		if err == nil {
+			return storeErr(CodeStoreConflict,
+				"idempotency_key %q already recorded as event %s", ev.IdempotencyKey, existing)
+		}
+		if err != sql.ErrNoRows {
+			return err
+		}
+	}
+	var max int64
+	if err := tx.QueryRowContext(ctx,
+		"SELECT COALESCE(MAX(sequence), 0) FROM event WHERE run_id = ?", ev.RunID).Scan(&max); err != nil {
+		return err
+	}
+	if ev.Sequence <= max {
+		if ev.Sequence == max {
+			return storeErr(CodeStoreConflict,
+				"sequence %d for run %s is a duplicate of the latest event", ev.Sequence, ev.RunID)
+		}
+		return storeErr(CodeStoreConflict,
+			"sequence %d for run %s is not monotonic (latest is %d)", ev.Sequence, ev.RunID, max)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO event (event_id, run_id, sequence, schema_version, type, occurred_at, recorded_at,
+                   actor_type, actor_id, causation_id, correlation_id, idempotency_key,
+                   payload_digest, payload)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		ev.EventID, ev.RunID, ev.Sequence, ev.SchemaVersion, ev.Type, ev.OccurredAt, ev.RecordedAt,
+		ev.ActorType, ev.ActorID, nullable(ev.CausationID), nullable(ev.CorrelationID),
+		nullable(ev.IdempotencyKey), ev.PayloadDigest, ev.Payload); err != nil {
+		if strings.Contains(err.Error(), "FOREIGN KEY constraint failed") {
+			return storeErr(CodeGraphInvalid, "run %s does not exist", ev.RunID)
+		}
+		return err
+	}
+	return applyProjections(ctx, tx, ev)
 }
 
 func (s *Store) Events(ctx context.Context, runID string) ([]Event, error) {
