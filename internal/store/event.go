@@ -82,9 +82,12 @@ func (s *Store) Append(ctx context.Context, ev Event) (Event, error) {
 	if err := ev.validate(now); err != nil {
 		return Event{}, err
 	}
-	if ev.PayloadDigest == "" {
-		ev.PayloadDigest = payloadDigest(ev.Payload)
+	computed := payloadDigest(ev.Payload)
+	if ev.PayloadDigest != "" && ev.PayloadDigest != computed {
+		return Event{}, storeErr(CodeGraphInvalid,
+			"payload_digest %s does not match payload (computed %s)", ev.PayloadDigest, computed)
 	}
+	ev.PayloadDigest = computed
 	ev.RecordedAt = now
 
 	err := s.withTx(ctx, func(tx *sql.Tx) error {

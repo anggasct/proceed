@@ -244,58 +244,123 @@ func Import(ctx context.Context, archive, dataDir string) error {
 		return storeErr(CodeStoreBusy, "target store holds an active controller lease")
 	}
 
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return err
+	}
 	staging, err := os.MkdirTemp(dataDir, ".import-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(staging)
-	commit := func() error {
-		if err := os.MkdirAll(dataDir, 0o755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(filepath.Join(staging, dbMember), members[manifest.DB.Path], 0o644); err != nil {
-			return err
-		}
-		for _, a := range manifest.Artifacts {
-			target := filepath.Join(staging, filepath.FromSlash(a.Path))
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
-			}
-			if err := os.WriteFile(target, members[a.Path], 0o644); err != nil {
-				return err
-			}
-		}
-		if _, err := os.Stat(dbPath); err == nil {
-			if err := os.Remove(dbPath); err != nil {
-				return err
-			}
-		}
-		if err := os.Rename(filepath.Join(staging, dbMember), dbPath); err != nil {
-			return err
-		}
-		for _, a := range manifest.Artifacts {
-			dest := filepath.Join(dataDir, filepath.FromSlash(a.Path))
-			if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-				return err
-			}
-			if err := os.Rename(filepath.Join(staging, filepath.FromSlash(a.Path)), dest); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	if err := commit(); err != nil {
+
+	if err := stageRestore(staging, dataDir, &manifest, members); err != nil {
 		return err
 	}
+	if err := validateStagedStore(filepath.Join(staging, dbMember), manifest.SchemaVersion); err != nil {
+		return err
+	}
+	return commitRestore(staging, dataDir, dbPath, &manifest)
+}
 
-	restored, err := Open(dbPath)
+func stageRestore(staging, dataDir string, manifest *exportManifest, members map[string][]byte) error {
+	if err := os.WriteFile(filepath.Join(staging, dbMember), members[manifest.DB.Path], 0o644); err != nil {
+		return err
+	}
+	for _, a := range manifest.Artifacts {
+		target := filepath.Join(staging, filepath.FromSlash(a.Path))
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(target, members[a.Path], 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateStagedStore(path string, manifestVersion int) error {
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		return err
 	}
-	defer restored.Close()
-	if restored.SchemaVersion() != manifest.SchemaVersion {
-		return storeErr(CodeGraphInvalid, "restored store schema version %d does not match archive manifest %d",
-			restored.SchemaVersion(), manifest.SchemaVersion)
+	defer db.Close()
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return storeErr(CodeGraphInvalid, "corrupt archive: store snapshot is unreadable: %v", err)
+	}
+	if version != manifestVersion {
+		return storeErr(CodeGraphInvalid,
+			"corrupt archive: store snapshot schema version %d does not match manifest %d", version, manifestVersion)
+	}
+	if version > storeSchemaVersion {
+		return storeErr(CodeGraphInvalid, "archive schema version %d is newer than supported %d",
+			version, storeSchemaVersion)
+	}
+	var tables int
+	if err := db.QueryRow(
+		"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'event'").Scan(&tables); err != nil {
+		return storeErr(CodeGraphInvalid, "corrupt archive: store snapshot is unreadable: %v", err)
+	}
+	if tables != 1 {
+		return storeErr(CodeGraphInvalid, "corrupt archive: store snapshot is missing the event table")
+	}
+	return nil
+}
+
+func commitRestore(staging, dataDir, dbPath string, manifest *exportManifest) error {
+	type applied struct {
+		dest   string
+		backup string
+	}
+	var appliedMoves []applied
+	rollback := func() {
+		for i := len(appliedMoves) - 1; i >= 0; i-- {
+			m := appliedMoves[i]
+			os.Remove(m.dest)
+			if m.backup != "" {
+				_ = os.Rename(m.backup, m.dest)
+			}
+		}
+	}
+	moveIn := func(from, dest string) error {
+		var backup string
+		if _, err := os.Stat(dest); err == nil {
+			rel, err := filepath.Rel(dataDir, dest)
+			if err != nil {
+				return err
+			}
+			backup = filepath.Join(staging, "prev", filepath.FromSlash(rel))
+			if err := os.MkdirAll(filepath.Dir(backup), 0o755); err != nil {
+				return err
+			}
+			if err := os.Rename(dest, backup); err != nil {
+				return err
+			}
+		}
+		if err := os.Rename(from, dest); err != nil {
+			if backup != "" {
+				_ = os.Rename(backup, dest)
+			}
+			return err
+		}
+		appliedMoves = append(appliedMoves, applied{dest: dest, backup: backup})
+		return nil
+	}
+
+	if err := moveIn(filepath.Join(staging, dbMember), dbPath); err != nil {
+		rollback()
+		return err
+	}
+	for _, a := range manifest.Artifacts {
+		dest := filepath.Join(dataDir, filepath.FromSlash(a.Path))
+		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+			rollback()
+			return err
+		}
+		if err := moveIn(filepath.Join(staging, filepath.FromSlash(a.Path)), dest); err != nil {
+			rollback()
+			return err
+		}
 	}
 	return nil
 }

@@ -156,6 +156,25 @@ func TestAppendUnknownRunRejected(t *testing.T) {
 	}
 }
 
+func TestAppendRejectsMismatchedPayloadDigest(t *testing.T) {
+	s := openTestStore(t)
+	runID := seededRun(t, s)
+	ev := makeEvent(runID, 1, "node_started")
+	ev.PayloadDigest = payloadDigest("a different payload")
+	_, err := s.Append(context.Background(), ev)
+	if !IsCode(err, CodeGraphInvalid) {
+		t.Fatalf("error = %v, want GRAPH_INVALID", err)
+	}
+	if n := count(t, s, "SELECT COUNT(*) FROM event"); n != 0 {
+		t.Errorf("event rows = %d, want 0", n)
+	}
+
+	ev.PayloadDigest = payloadDigest(ev.Payload)
+	if _, err := s.Append(context.Background(), ev); err != nil {
+		t.Fatalf("matching digest must be accepted: %v", err)
+	}
+}
+
 func TestAppendComputesPayloadDigest(t *testing.T) {
 	s := openTestStore(t)
 	runID := seededRun(t, s)

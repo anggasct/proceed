@@ -9,9 +9,15 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
 
 const artifactContent = "research artifact payload"
 
@@ -198,6 +204,27 @@ func TestImportRejectsCorruptArchive(t *testing.T) {
 	}
 }
 
+func writeArchive(t *testing.T, path string, members map[string][]byte) {
+	t.Helper()
+	out, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz := gzip.NewWriter(out)
+	tw := tar.NewWriter(gz)
+	for name, content := range members {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(content))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(content); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tw.Close()
+	gz.Close()
+	out.Close()
+}
+
 func TestImportRejectsChecksumMismatch(t *testing.T) {
 	ctx := context.Background()
 	sourceDir := t.TempDir()
@@ -215,23 +242,7 @@ func TestImportRejectsChecksumMismatch(t *testing.T) {
 	members["artifacts/aa"] = []byte("tampered payload")
 
 	tampered := filepath.Join(t.TempDir(), "tampered.tgz")
-	out, err := os.Create(tampered)
-	if err != nil {
-		t.Fatal(err)
-	}
-	gz := gzip.NewWriter(out)
-	tw := tar.NewWriter(gz)
-	for name, content := range members {
-		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(content))}); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := tw.Write(content); err != nil {
-			t.Fatal(err)
-		}
-	}
-	tw.Close()
-	gz.Close()
-	out.Close()
+	writeArchive(t, tampered, members)
 
 	targetDir := t.TempDir()
 	err = Import(ctx, tampered, targetDir)
@@ -240,5 +251,157 @@ func TestImportRejectsChecksumMismatch(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(targetDir, "proceed.db")); !os.IsNotExist(err) {
 		t.Error("checksum-mismatched import wrote into the target directory")
+	}
+}
+
+func TestImportValidatesStagedStoreBeforeReplacingTarget(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	archive := filepath.Join(t.TempDir(), "backup.tgz")
+	if err := s.Export(ctx, sourceDir, archive); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	targetDir := t.TempDir()
+	target := buildPopulatedDir(t, targetDir)
+	before, err := target.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.Close()
+
+	members, err := readArchiveMembers(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest exportManifest
+	if err := json.Unmarshal(members[manifestMember], &manifest); err != nil {
+		t.Fatal(err)
+	}
+	garbage := []byte("definitely not a sqlite database, just bytes that pass the recorded checksum")
+	manifest.DB.SHA256 = sha256Hex(garbage)
+	manifest.DB.SizeBytes = int64(len(garbage))
+	members[manifest.DB.Path] = garbage
+	encoded, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members[manifestMember] = encoded
+
+	crafted := filepath.Join(t.TempDir(), "crafted.tgz")
+	writeArchive(t, crafted, members)
+
+	err = Import(ctx, crafted, targetDir)
+	if !IsCode(err, CodeGraphInvalid) {
+		t.Fatalf("error = %v, want GRAPH_INVALID", err)
+	}
+	survivor, err := Open(filepath.Join(targetDir, "proceed.db"))
+	if err != nil {
+		t.Fatalf("target store damaged by refused import: %v", err)
+	}
+	defer survivor.Close()
+	digest, err := survivor.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest != before {
+		t.Error("target store content changed by refused import")
+	}
+}
+
+func TestImportRejectsSchemaVersionDisagreement(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	archive := filepath.Join(t.TempDir(), "backup.tgz")
+	if err := s.Export(ctx, sourceDir, archive); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	targetDir := t.TempDir()
+	target := buildPopulatedDir(t, targetDir)
+	before, err := target.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.Close()
+
+	members, err := readArchiveMembers(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest exportManifest
+	if err := json.Unmarshal(members[manifestMember], &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.SchemaVersion = storeSchemaVersion + 7
+	encoded, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members[manifestMember] = encoded
+
+	crafted := filepath.Join(t.TempDir(), "crafted.tgz")
+	writeArchive(t, crafted, members)
+
+	err = Import(ctx, crafted, targetDir)
+	if !IsCode(err, CodeGraphInvalid) {
+		t.Fatalf("error = %v, want GRAPH_INVALID", err)
+	}
+	survivor, err := Open(filepath.Join(targetDir, "proceed.db"))
+	if err != nil {
+		t.Fatalf("target store damaged by refused import: %v", err)
+	}
+	defer survivor.Close()
+	digest, err := survivor.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest != before {
+		t.Error("target store content changed by refused import")
+	}
+	entries, err := os.ReadDir(targetDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".import-") {
+			t.Errorf("staging directory %s left behind", e.Name())
+		}
+	}
+}
+
+func TestImportCreatesMissingTargetDirectory(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	before, err := s.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(t.TempDir(), "backup.tgz")
+	if err := s.Export(ctx, sourceDir, archive); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	targetDir := filepath.Join(t.TempDir(), "fresh", "nested", "data")
+	if err := Import(ctx, archive, targetDir); err != nil {
+		t.Fatalf("import into fresh data dir failed: %v", err)
+	}
+	restored, err := Open(filepath.Join(targetDir, "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	digest, err := restored.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest != before {
+		t.Errorf("restored digest %s != source %s", digest, before)
 	}
 }
