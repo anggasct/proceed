@@ -76,7 +76,7 @@ func runStoreExport(args []string, stdout io.Writer) error {
 	}
 	dataDir := flags["--data-dir"]
 	if dataDir == "" {
-		dataDir = ".proceed"
+		return &usageErr{msg: "--data-dir is required"}
 	}
 	output := flags["--output"]
 	if output == "" {
@@ -96,7 +96,7 @@ func runStoreImport(args []string, stdout io.Writer) error {
 	}
 	dataDir := flags["--data-dir"]
 	if dataDir == "" {
-		dataDir = ".proceed"
+		return &usageErr{msg: "--data-dir is required"}
 	}
 	input := flags["--input"]
 	if input == "" {

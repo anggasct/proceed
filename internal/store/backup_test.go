@@ -960,3 +960,114 @@ func TestImportRejectsReservedArtifactNames(t *testing.T) {
 		t.Error("target store content changed by refused import")
 	}
 }
+
+func TestExportRejectsSymlinkedDataDirCollision(t *testing.T) {
+	ctx := context.Background()
+	realDir := t.TempDir()
+	s := buildPopulatedDir(t, realDir)
+	before, err := s.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	linkDir := filepath.Join(t.TempDir(), "linked-data")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Fatal(err)
+	}
+
+	err = Export(ctx, linkDir, filepath.Join(realDir, "proceed.db"))
+	if !IsCode(err, CodeGraphInvalid) {
+		t.Fatalf("export via symlinked data dir to the real db: error = %v, want GRAPH_INVALID", err)
+	}
+
+	survivor, err := Open(filepath.Join(realDir, "proceed.db"))
+	if err != nil {
+		t.Fatalf("live store damaged by refused export: %v", err)
+	}
+	defer survivor.Close()
+	digest, err := survivor.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest != before {
+		t.Error("live store content changed by refused export")
+	}
+
+	archive := filepath.Join(t.TempDir(), "ok.tgz")
+	if err := Export(ctx, linkDir, archive); err != nil {
+		t.Fatalf("legitimate export through symlinked data dir failed: %v", err)
+	}
+}
+
+func TestImportRejectsSidecarAndTraversalArtifacts(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	archive := filepath.Join(t.TempDir(), "backup.tgz")
+	s.Close()
+	if err := Export(ctx, sourceDir, archive); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, bad := range []string{
+		"proceed.db-wal",
+		"proceed.db-shm",
+		"proceed.db-journal",
+		"proceed.db",
+		"proceed.lock",
+		"manifest.json",
+		"artifacts/../proceed.db",
+		"../outside.txt",
+		"/abs/path.txt",
+		"artifacts/..",
+		"",
+	} {
+		targetDir := t.TempDir()
+		target := buildPopulatedDir(t, targetDir)
+		before, err := target.ProjectionDigest(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		target.Close()
+
+		members, err := readArchiveMembers(archive)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var manifest exportManifest
+		if err := json.Unmarshal(members[manifestMember], &manifest); err != nil {
+			t.Fatal(err)
+		}
+		manifest.Artifacts = append(manifest.Artifacts, archiveEntry{
+			Path:      bad,
+			SHA256:    sha256Hex(members[manifest.DB.Path]),
+			SizeBytes: int64(len(members[manifest.DB.Path])),
+		})
+		encoded, err := json.Marshal(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		members[bad] = members[manifest.DB.Path]
+		members[manifestMember] = encoded
+		crafted := filepath.Join(t.TempDir(), "crafted.tgz")
+		writeTestArchive(t, crafted, members)
+
+		err = Import(ctx, crafted, targetDir)
+		if !IsCode(err, CodeGraphInvalid) {
+			t.Errorf("artifact path %q: error = %v, want GRAPH_INVALID", bad, err)
+		}
+		survivor, serr := Open(filepath.Join(targetDir, "proceed.db"))
+		if serr != nil {
+			t.Fatalf("artifact path %q: target store damaged: %v", bad, serr)
+		}
+		digest, derr := survivor.ProjectionDigest(ctx)
+		survivor.Close()
+		if derr != nil {
+			t.Fatal(derr)
+		}
+		if digest != before {
+			t.Errorf("artifact path %q: target store content changed", bad)
+		}
+	}
+}

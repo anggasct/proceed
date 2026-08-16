@@ -168,3 +168,19 @@ func TestStoreExportOutputCollisionCLI(t *testing.T) {
 		t.Fatalf("store database corrupted by refused export: %v", err)
 	}
 }
+
+func TestStoreRequiresDataDirFlag(t *testing.T) {
+	cases := [][]string{
+		{"store", "export", "--output", filepath.Join(t.TempDir(), "a.tgz")},
+		{"store", "import", "--input", filepath.Join(t.TempDir(), "a.tgz")},
+	}
+	for _, args := range cases {
+		var stdout, stderr bytes.Buffer
+		if code := run(args, &stdout, &stderr); code != 2 {
+			t.Errorf("%v: exit = %d, want 2 (stderr %q)", args, code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "--data-dir is required") {
+			t.Errorf("%v: stderr = %q, want --data-dir is required", args, stderr.String())
+		}
+	}
+}

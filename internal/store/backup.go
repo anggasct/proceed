@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -51,6 +52,25 @@ func sha256File(path string) (string, int64, error) {
 		return "", 0, err
 	}
 	return hex.EncodeToString(h.Sum(nil)), n, nil
+}
+
+func canonicalPath(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err == nil {
+		return resolved, nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+	parent, err := canonicalPath(filepath.Dir(abs))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parent, filepath.Base(abs)), nil
 }
 
 func withinDir(path, dir string) bool {
@@ -175,11 +195,11 @@ func writeArchive(output string, manifest *exportManifest, absData, snapshotPath
 }
 
 func Export(ctx context.Context, dataDir, output string) error {
-	absOut, err := filepath.Abs(output)
+	absOut, err := canonicalPath(output)
 	if err != nil {
 		return err
 	}
-	absData, err := filepath.Abs(dataDir)
+	absData, err := canonicalPath(dataDir)
 	if err != nil {
 		return err
 	}
@@ -349,6 +369,17 @@ func withDataDirLock(dataDir string, fn func() error) error {
 	return fn()
 }
 
+func validArtifactPath(p string) bool {
+	if p == "" || strings.ContainsRune(p, '\\') || strings.ContainsRune(p, 0) {
+		return false
+	}
+	clean := path.Clean(p)
+	if clean != p || clean == ".." || strings.HasPrefix(clean, "../") || strings.HasPrefix(clean, "/") {
+		return false
+	}
+	return strings.HasPrefix(clean, "artifacts/")
+}
+
 func Import(ctx context.Context, archive, dataDir string) error {
 	members, err := readArchiveMembers(archive)
 	if err != nil {
@@ -362,16 +393,13 @@ func Import(ctx context.Context, archive, dataDir string) error {
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		return storeErr(CodeGraphInvalid, "corrupt archive: bad manifest: %v", err)
 	}
-	reservedArtifactNames := map[string]bool{
-		dbMember: true, manifestMember: true, dirLockName: true,
-	}
 	if err := verifyMember(members, manifest.DB, "store"); err != nil {
 		return err
 	}
 	for _, a := range manifest.Artifacts {
-		if reservedArtifactNames[a.Path] {
+		if !validArtifactPath(a.Path) {
 			return storeErr(CodeGraphInvalid,
-				"corrupt archive: artifact %q uses a reserved name", a.Path)
+				"corrupt archive: artifact path %q is not a clean path inside the artifact tree", a.Path)
 		}
 		if err := verifyMember(members, a, "artifact"); err != nil {
 			return err

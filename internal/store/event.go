@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 
@@ -74,6 +75,23 @@ func payloadDigest(payload string) string {
 
 const eventSchemaVersion = "proceed/v1"
 
+func canonicalJSON(s string) (string, error) {
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return "", err
+	}
+	if dec.More() {
+		return "", errors.New("trailing data after JSON value")
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
 func (s *Store) Append(ctx context.Context, ev Event) (Event, error) {
 	now := time.Now().UnixMilli()
 	if ev.EventID == "" {
@@ -82,6 +100,11 @@ func (s *Store) Append(ctx context.Context, ev Event) (Event, error) {
 	if err := ev.validate(now); err != nil {
 		return Event{}, err
 	}
+	canonical, cerr := canonicalJSON(ev.Payload)
+	if cerr != nil {
+		return Event{}, storeErr(CodeGraphInvalid, "event payload must be a single valid JSON value: %v", cerr)
+	}
+	ev.Payload = canonical
 	computed := payloadDigest(ev.Payload)
 	if ev.PayloadDigest != "" && ev.PayloadDigest != computed {
 		return Event{}, storeErr(CodeGraphInvalid,

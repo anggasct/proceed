@@ -486,3 +486,50 @@ func TestConcurrentOpenMigratesOnce(t *testing.T) {
 		t.Errorf("final store = v%d runs=%d, want v%d runs=1", v, runs, storeSchemaVersion)
 	}
 }
+
+func TestAppendCanonicalizesPayloadDigest(t *testing.T) {
+	s := openTestStore(t)
+	runID := seededRun(t, s)
+	ctx := context.Background()
+
+	first := makeEvent(runID, 1, "node_started")
+	first.Payload = `{"node_key":"research","attempt":1}`
+	stored, err := s.Append(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second := makeEvent(runID, 2, "node_started")
+	second.Payload = "{\n  \"attempt\": 1,\n  \"node_key\": \"research\"\n}"
+	stored2, err := s.Append(ctx, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored2.PayloadDigest != stored.PayloadDigest {
+		t.Errorf("equivalent JSON produced different digests: %s vs %s",
+			stored2.PayloadDigest, stored.PayloadDigest)
+	}
+	if stored2.Payload != stored.Payload {
+		t.Errorf("stored payloads differ after canonicalization: %q vs %q",
+			stored2.Payload, stored.Payload)
+	}
+	if want := payloadDigest(stored2.Payload); stored2.PayloadDigest != want {
+		t.Errorf("stored digest does not match stored canonical payload")
+	}
+
+	third := makeEvent(runID, 3, "node_started")
+	third.Payload = `{"node_key":"research","attempt":2}`
+	stored3, err := s.Append(ctx, third)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored3.PayloadDigest == stored.PayloadDigest {
+		t.Error("different payload produced the same digest")
+	}
+
+	bad := makeEvent(runID, 4, "node_started")
+	bad.Payload = `{"a":1} trailing`
+	if _, err := s.Append(ctx, bad); !IsCode(err, CodeGraphInvalid) {
+		t.Errorf("trailing garbage accepted: %v", err)
+	}
+}
