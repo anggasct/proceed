@@ -568,51 +568,58 @@ func (s *Store) ProjectionDigest(ctx context.Context) (string, error) {
 func (s *Store) RebuildProjections(ctx context.Context) (RebuildReport, error) {
 	var report RebuildReport
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, "PRAGMA defer_foreign_keys = 1"); err != nil {
-			return err
+		r, err := rebuildProjectionsTx(ctx, tx)
+		if err == nil {
+			report = r
 		}
-		before, err := projectionDigestTx(ctx, tx)
-		if err != nil {
-			return err
-		}
-		for _, table := range wipeOrder {
-			if _, err := tx.ExecContext(ctx, "DELETE FROM "+table); err != nil {
-				return err
-			}
-		}
-		rows, err := tx.QueryContext(ctx, `
-SELECT event_id, run_id, sequence, schema_version, type, occurred_at, recorded_at,
-       actor_type, actor_id, causation_id, correlation_id, idempotency_key,
-       payload_digest, payload
-FROM event ORDER BY run_id, sequence`)
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
-			ev, err := scanEvent(rows)
-			if err != nil {
-				rows.Close()
-				return err
-			}
-			if err := applyProjections(ctx, tx, &ev); err != nil {
-				rows.Close()
-				return err
-			}
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return err
-		}
-		rows.Close()
-		after, err := projectionDigestTx(ctx, tx)
-		if err != nil {
-			return err
-		}
-		report = RebuildReport{Before: before, After: after, Diverged: before != after}
-		return nil
+		return err
 	})
 	if err != nil {
 		return RebuildReport{}, err
 	}
 	return report, nil
+}
+
+func rebuildProjectionsTx(ctx context.Context, tx *sql.Tx) (RebuildReport, error) {
+	if _, err := tx.ExecContext(ctx, "PRAGMA defer_foreign_keys = 1"); err != nil {
+		return RebuildReport{}, err
+	}
+	before, err := projectionDigestTx(ctx, tx)
+	if err != nil {
+		return RebuildReport{}, err
+	}
+	for _, table := range wipeOrder {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM "+table); err != nil {
+			return RebuildReport{}, err
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `
+SELECT event_id, run_id, sequence, schema_version, type, occurred_at, recorded_at,
+       actor_type, actor_id, causation_id, correlation_id, idempotency_key,
+       payload_digest, payload
+FROM event ORDER BY run_id, sequence`)
+	if err != nil {
+		return RebuildReport{}, err
+	}
+	for rows.Next() {
+		ev, err := scanEvent(rows)
+		if err != nil {
+			rows.Close()
+			return RebuildReport{}, err
+		}
+		if err := applyProjections(ctx, tx, &ev); err != nil {
+			rows.Close()
+			return RebuildReport{}, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return RebuildReport{}, err
+	}
+	rows.Close()
+	after, err := projectionDigestTx(ctx, tx)
+	if err != nil {
+		return RebuildReport{}, err
+	}
+	return RebuildReport{Before: before, After: after, Diverged: before != after}, nil
 }

@@ -8,11 +8,13 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -213,6 +215,32 @@ func targetHasActiveLease(dbPath string, now int64) (bool, error) {
 	return expires > now, nil
 }
 
+const dirLockName = "proceed.lock"
+
+func acquireDirLock(dataDir string) (release func() error, err error) {
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(dataDir, dirLockName), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f.Close, nil
+}
+
+func withDataDirLock(dataDir string, fn func() error) error {
+	release, err := acquireDirLock(dataDir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = release() }()
+	return fn()
+}
+
 func Import(ctx context.Context, archive, dataDir string) error {
 	members, err := readArchiveMembers(archive)
 	if err != nil {
@@ -235,34 +263,36 @@ func Import(ctx context.Context, archive, dataDir string) error {
 		}
 	}
 
-	dbPath := filepath.Join(dataDir, dbMember)
-	busy, err := targetHasActiveLease(dbPath, time.Now().UnixMilli())
-	if err != nil {
-		return err
-	}
-	if busy {
-		return storeErr(CodeStoreBusy, "target store holds an active controller lease")
-	}
+	return withDataDirLock(dataDir, func() error {
+		dbPath := filepath.Join(dataDir, dbMember)
+		busy, err := targetHasActiveLease(dbPath, time.Now().UnixMilli())
+		if err != nil {
+			return err
+		}
+		if busy {
+			return storeErr(CodeStoreBusy, "target store holds an active controller lease")
+		}
 
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		return err
-	}
-	staging, err := os.MkdirTemp(dataDir, ".import-")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(staging)
+		staging, err := os.MkdirTemp(dataDir, ".import-")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(staging)
 
-	if err := stageRestore(staging, dataDir, &manifest, members); err != nil {
-		return err
-	}
-	if err := validateStagedStore(filepath.Join(staging, dbMember), manifest.SchemaVersion); err != nil {
-		return err
-	}
-	return commitRestore(staging, dataDir, dbPath, &manifest)
+		if err := stageRestore(staging, &manifest, members); err != nil {
+			return err
+		}
+		if err := validateStagedStore(filepath.Join(staging, dbMember), manifest.SchemaVersion); err != nil {
+			return err
+		}
+		if err := verifyStagedProjections(ctx, staging); err != nil {
+			return err
+		}
+		return commitRestore(staging, dataDir, dbPath, &manifest)
+	})
 }
 
-func stageRestore(staging, dataDir string, manifest *exportManifest, members map[string][]byte) error {
+func stageRestore(staging string, manifest *exportManifest, members map[string][]byte) error {
 	if err := os.WriteFile(filepath.Join(staging, dbMember), members[manifest.DB.Path], 0o644); err != nil {
 		return err
 	}
@@ -276,6 +306,14 @@ func stageRestore(staging, dataDir string, manifest *exportManifest, members map
 		}
 	}
 	return nil
+}
+
+var requiredTables = []string{
+	"graph", "graph_version", "graph_node", "graph_edge", "policy",
+	"graph_run", "run_node", "run_edge", "node_attempt", "controller_lease",
+	"event", "artifact", "evaluation", "effect",
+	"decision", "causal_link", "approval",
+	"anchor", "outcome", "metric", "policy_change_proposal", "proposal_metric",
 }
 
 func validateStagedStore(path string, manifestVersion int) error {
@@ -296,18 +334,88 @@ func validateStagedStore(path string, manifestVersion int) error {
 		return storeErr(CodeGraphInvalid, "archive schema version %d is newer than supported %d",
 			version, storeSchemaVersion)
 	}
-	var tables int
-	if err := db.QueryRow(
-		"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'event'").Scan(&tables); err != nil {
+	for _, table := range requiredTables {
+		var n int
+		if err := db.QueryRow(
+			"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&n); err != nil {
+			return storeErr(CodeGraphInvalid, "corrupt archive: store snapshot is unreadable: %v", err)
+		}
+		if n != 1 {
+			return storeErr(CodeGraphInvalid, "corrupt archive: store snapshot is missing table %q", table)
+		}
+	}
+	rows, err := db.Query("PRAGMA foreign_key_check")
+	if err != nil {
 		return storeErr(CodeGraphInvalid, "corrupt archive: store snapshot is unreadable: %v", err)
 	}
-	if tables != 1 {
-		return storeErr(CodeGraphInvalid, "corrupt archive: store snapshot is missing the event table")
+	defer rows.Close()
+	if rows.Next() {
+		return storeErr(CodeGraphInvalid, "corrupt archive: store snapshot violates foreign key constraints")
 	}
-	return nil
+	return rows.Err()
+}
+
+func verifyStagedProjections(ctx context.Context, staging string) error {
+	source := filepath.Join(staging, dbMember)
+	copyPath := filepath.Join(staging, "verify.db")
+	content, err := os.ReadFile(source)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(copyPath, content, 0o644); err != nil {
+		return err
+	}
+	db, err := sql.Open("sqlite",
+		"file:"+copyPath+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_txlock=immediate")
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	var verifyErr error
+	err = func() error {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		report, err := rebuildProjectionsTx(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if report.Diverged {
+			return storeErr(CodeGraphInvalid,
+				"corrupt archive: projections diverge from the event stream")
+		}
+		return tx.Commit()
+	}()
+	if err != nil {
+		var se *Error
+		if errors.As(err, &se) {
+			verifyErr = err
+		} else {
+			verifyErr = storeErr(CodeGraphInvalid, "corrupt archive: projection verification failed: %v", err)
+		}
+	} else {
+		rows, ferr := db.Query("PRAGMA foreign_key_check")
+		if ferr == nil {
+			defer rows.Close()
+			if rows.Next() {
+				verifyErr = storeErr(CodeGraphInvalid, "corrupt archive: rebuilt projections violate foreign key constraints")
+			}
+		}
+	}
+	return verifyErr
 }
 
 func commitRestore(staging, dataDir, dbPath string, manifest *exportManifest) error {
+	busy, err := targetHasActiveLease(dbPath, time.Now().UnixMilli())
+	if err != nil {
+		return err
+	}
+	if busy {
+		return storeErr(CodeStoreBusy, "target store holds an active controller lease")
+	}
+
 	type applied struct {
 		dest   string
 		backup string

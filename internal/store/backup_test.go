@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 func sha256Hex(b []byte) string {
@@ -371,6 +374,207 @@ func TestImportRejectsSchemaVersionDisagreement(t *testing.T) {
 		if strings.HasPrefix(e.Name(), ".import-") {
 			t.Errorf("staging directory %s left behind", e.Name())
 		}
+	}
+}
+
+func recraftArchiveWithDB(t *testing.T, archive, outPath string, mutate func(db *sql.DB)) {
+	t.Helper()
+	members, err := readArchiveMembers(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest exportManifest
+	if err := json.Unmarshal(members[manifestMember], &manifest); err != nil {
+		t.Fatal(err)
+	}
+	work := filepath.Join(t.TempDir(), "work.db")
+	if err := os.WriteFile(work, members[manifest.DB.Path], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+work+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Ping(); err != nil {
+		t.Fatal(err)
+	}
+	mutate(db)
+	db.Close()
+	content, err := os.ReadFile(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members[manifest.DB.Path] = content
+	manifest.DB.SHA256 = sha256Hex(content)
+	manifest.DB.SizeBytes = int64(len(content))
+	encoded, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members[manifestMember] = encoded
+	writeArchive(t, outPath, members)
+}
+
+func TestImportRefusesDivergentProjectionArchive(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	archive := filepath.Join(t.TempDir(), "backup.tgz")
+	if err := s.Export(ctx, sourceDir, archive); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	targetDir := t.TempDir()
+	target := buildPopulatedDir(t, targetDir)
+	before, err := target.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.Close()
+
+	crafted := filepath.Join(t.TempDir(), "divergent.tgz")
+	recraftArchiveWithDB(t, archive, crafted, func(db *sql.DB) {
+		if _, err := db.Exec("UPDATE run_node SET attempt_count = 99 WHERE rowid = 1"); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	err = Import(ctx, crafted, targetDir)
+	if !IsCode(err, CodeGraphInvalid) {
+		t.Fatalf("error = %v, want GRAPH_INVALID", err)
+	}
+	survivor, err := Open(filepath.Join(targetDir, "proceed.db"))
+	if err != nil {
+		t.Fatalf("target store damaged by refused import: %v", err)
+	}
+	defer survivor.Close()
+	digest, err := survivor.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest != before {
+		t.Error("target store content changed by refused import")
+	}
+}
+
+func TestImportRefusesIncompleteSchemaArchive(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	archive := filepath.Join(t.TempDir(), "backup.tgz")
+	if err := s.Export(ctx, sourceDir, archive); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	targetDir := t.TempDir()
+	target := buildPopulatedDir(t, targetDir)
+	before, err := target.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.Close()
+
+	crafted := filepath.Join(t.TempDir(), "incomplete.tgz")
+	recraftArchiveWithDB(t, archive, crafted, func(db *sql.DB) {
+		if _, err := db.Exec("DROP TABLE causal_link"); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	err = Import(ctx, crafted, targetDir)
+	if !IsCode(err, CodeGraphInvalid) {
+		t.Fatalf("error = %v, want GRAPH_INVALID", err)
+	}
+	survivor, err := Open(filepath.Join(targetDir, "proceed.db"))
+	if err != nil {
+		t.Fatalf("target store damaged by refused import: %v", err)
+	}
+	defer survivor.Close()
+	digest, err := survivor.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest != before {
+		t.Error("target store content changed by refused import")
+	}
+}
+
+func TestDataDirLockMutualExclusion(t *testing.T) {
+	dir := t.TempDir()
+	release, err := acquireDirLock(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	blocked := make(chan error, 1)
+	go func() {
+		blocked <- withDataDirLock(dir, func() error {
+			close(entered)
+			return nil
+		})
+	}()
+	select {
+	case <-entered:
+		t.Fatal("second lock holder entered while the first still holds the lock")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-blocked:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("second lock holder never acquired after release")
+	}
+	select {
+	case <-entered:
+	default:
+		t.Fatal("second lock holder did not run after acquiring")
+	}
+}
+
+func TestImportWaitsForDataDirLock(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	archive := filepath.Join(t.TempDir(), "backup.tgz")
+	if err := s.Export(ctx, sourceDir, archive); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	targetDir := filepath.Join(t.TempDir(), "data")
+	release, err := acquireDirLock(targetDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- Import(ctx, archive, targetDir)
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("import completed while the data dir lock was held: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("import never completed after the lock was released")
+	}
+	if _, err := os.Stat(filepath.Join(targetDir, "proceed.db")); err != nil {
+		t.Fatal(err)
 	}
 }
 
