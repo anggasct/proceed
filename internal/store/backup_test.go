@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -188,7 +190,7 @@ VALUES ('default', 'controller-1', 'run', ?, ?)`, now, now+60000); err != nil {
 	}
 }
 
-func TestExportMigratesOlderStore(t *testing.T) {
+func TestExportRejectsOlderStoreReadonly(t *testing.T) {
 	ctx := context.Background()
 	sourceDir := t.TempDir()
 	s := buildPopulatedDir(t, sourceDir)
@@ -197,26 +199,111 @@ func TestExportMigratesOlderStore(t *testing.T) {
 	}
 	s.Close()
 
-	archive := filepath.Join(t.TempDir(), "older.tgz")
-	if err := Export(ctx, sourceDir, archive); err != nil {
-		t.Fatalf("export of older store must migrate and succeed: %v", err)
-	}
-
-	members, err := readArchiveMembers(archive)
+	before, err := snapshotDirExcluding(sourceDir, dirLockName, "proceed.db-wal", "proceed.db-shm")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var manifest exportManifest
-	if err := json.Unmarshal(members[manifestMember], &manifest); err != nil {
-		t.Fatal(err)
+	archive := filepath.Join(t.TempDir(), "older.tgz")
+	err = Export(ctx, sourceDir, archive)
+	if !IsCode(err, CodeGraphInvalid) {
+		t.Fatalf("error = %v, want GRAPH_INVALID", err)
 	}
-	if manifest.SchemaVersion != storeSchemaVersion {
-		t.Fatalf("manifest schema version = %d, want %d", manifest.SchemaVersion, storeSchemaVersion)
+	if _, statErr := os.Stat(archive); !os.IsNotExist(statErr) {
+		t.Errorf("refused export must not create an archive (stat err = %v)", statErr)
 	}
 
-	target := filepath.Join(t.TempDir(), "restored")
-	if err := Import(ctx, archive, target); err != nil {
-		t.Fatalf("archive exported from migrated older store must import: %v", err)
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(sourceDir, "proceed.db")+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 1 {
+		t.Errorf("export mutated source schema version: got %d, want 1", version)
+	}
+	after, err := snapshotDirExcluding(sourceDir, dirLockName, "proceed.db-wal", "proceed.db-shm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Errorf("export mutated source directory:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+func TestImportPreExistingTargetWithSentinelSurvivesFailure(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	s.Close()
+	archive := filepath.Join(t.TempDir(), "backup.tgz")
+	if err := Export(ctx, sourceDir, archive); err != nil {
+		t.Fatal(err)
+	}
+
+	garbage := filepath.Join(t.TempDir(), "garbage.tgz")
+	recraftArchiveWithGarbageDB(t, archive, garbage)
+
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(target, "sentinel.txt")
+	if err := os.WriteFile(sentinel, []byte("created concurrently"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Import(ctx, garbage, target)
+	if !IsCode(err, CodeGraphInvalid) {
+		t.Fatalf("error = %v, want GRAPH_INVALID", err)
+	}
+	content, err := os.ReadFile(sentinel)
+	if err != nil {
+		t.Fatalf("sentinel removed by failed import: %v", err)
+	}
+	if string(content) != "created concurrently" {
+		t.Errorf("sentinel mutated: %q", content)
+	}
+}
+
+func TestFailedCallbackLockContention(t *testing.T) {
+	dir := t.TempDir()
+	const workers = 8
+	const rounds = 25
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for r := 0; r < rounds; r++ {
+				err := withDataDirLock(dir, func() error {
+					cur := active.Add(1)
+					for {
+						old := maxActive.Load()
+						if cur <= old || maxActive.CompareAndSwap(old, cur) {
+							break
+						}
+					}
+					active.Add(-1)
+					return storeErr(CodeGraphInvalid, "intentional failure")
+				})
+				if !IsCode(err, CodeGraphInvalid) {
+					t.Errorf("unexpected error: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if got := maxActive.Load(); got > 1 {
+		t.Fatalf("mutual exclusion defeated: %d concurrent callbacks", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, dirLockName)); !os.IsNotExist(err) {
+		t.Errorf("failed acquisitions must not leave the lock file behind (stat err = %v)", err)
 	}
 }
 
@@ -612,7 +699,11 @@ func TestImportRejectsSymlinkedTargetParent(t *testing.T) {
 	}
 }
 
-func snapshotDirExcluding(dir, skip string) (string, error) {
+func snapshotDirExcluding(dir string, skip ...string) (string, error) {
+	skipSet := make(map[string]bool, len(skip))
+	for _, s := range skip {
+		skipSet[s] = true
+	}
 	var names []string
 	err := filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -622,8 +713,8 @@ func snapshotDirExcluding(dir, skip string) (string, error) {
 		if err != nil {
 			return err
 		}
-		if rel == skip || strings.HasPrefix(rel, skip+string(filepath.Separator)) {
-			if info.IsDir() && rel != skip {
+		if skipSet[rel] {
+			if info.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
@@ -874,6 +965,9 @@ func TestImportWaitsForDataDirLock(t *testing.T) {
 	s.Close()
 
 	targetDir := filepath.Join(t.TempDir(), "data")
+	if err := os.Mkdir(targetDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	release, err := acquireDirLock(targetDir)
 	if err != nil {
 		t.Fatal(err)
