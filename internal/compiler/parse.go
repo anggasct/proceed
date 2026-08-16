@@ -19,6 +19,7 @@ type Document struct {
 	Name     string
 	Nodes    []Node
 	Edges    []Edge
+	HasEdges bool
 	Policies []Policy
 	Extras   map[string]yaml.Node
 }
@@ -200,6 +201,7 @@ func (p *parser) document(n *yaml.Node) *Document {
 			doc.Nodes = p.nodes(f.value)
 		case "edges":
 			doc.Edges = p.edges(f.value)
+			doc.HasEdges = true
 		case "policies":
 			doc.Policies = p.policies(f.value)
 		}

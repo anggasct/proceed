@@ -2,6 +2,47 @@ package compiler
 
 import "testing"
 
+func TestValidateMissingEdgesFieldRejected(t *testing.T) {
+	src := `schema: proceed/v1
+name: missing-edges
+nodes:
+  - id: only
+    type: task
+    executor: { kind: shell, command: [bin/do] }
+    contract: pure
+    terminal: true
+`
+	doc, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	verr := Validate(doc)
+	if verr == nil {
+		t.Fatal("missing edges field must be rejected")
+	}
+	requireRule(t, verr, RuleParse, "edges")
+}
+
+func TestValidateExplicitEmptyEdgesStillLegal(t *testing.T) {
+	src := `schema: proceed/v1
+name: empty-edges
+nodes:
+  - id: only
+    type: task
+    executor: { kind: shell, command: [bin/do] }
+    contract: pure
+    terminal: true
+edges: []
+`
+	doc, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Validate(doc); err != nil {
+		t.Fatalf("explicit edges: [] with single terminal node must pass: %v", err)
+	}
+}
+
 func TestValidateEmptyNodeIDRejected(t *testing.T) {
 	src := `schema: proceed/v1
 name: empty-id

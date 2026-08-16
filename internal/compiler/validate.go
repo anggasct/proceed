@@ -78,6 +78,9 @@ func (v *validator) documentPass() {
 	if len(v.doc.Nodes) == 0 {
 		v.errf(RuleParse, "nodes", "nodes must be a non-empty array")
 	}
+	if !v.doc.HasEdges {
+		v.errf(RuleParse, "edges", `missing required field "edges"`)
+	}
 	for i := range v.doc.Policies {
 		po := &v.doc.Policies[i]
 		path := fmt.Sprintf("policies[%d]", i)
