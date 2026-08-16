@@ -1,0 +1,17 @@
+schema: proceed/v1
+name: unbounded-cycle-demo
+nodes:
+  - id: classify
+    type: model
+    executor: { kind: agent_cli, cli: opencode, args: [classify] }
+    contract: pure
+  - id: verify
+    type: verifier
+    executor: { kind: shell, command: [scripts/verify] }
+    contract: pure
+  - id: human_approval
+    type: gate
+    terminal: true
+edges:
+  - { from: classify, to: verify, type: depends_on }
+  - { from: verify, to: classify, type: routes_to, when: needs_revision }

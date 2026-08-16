@@ -43,6 +43,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	if _, known := commands[args[0]]; known {
+		if args[0] == "validate" {
+			return cmdValidate(args[1:], stdout, stderr)
+		}
 		fmt.Fprintf(stderr, "proceed %s: not implemented\n", args[0])
 		return 1
 	}

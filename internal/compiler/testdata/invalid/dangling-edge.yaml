@@ -1,0 +1,10 @@
+schema: proceed/v1
+name: dangling-edge-demo
+nodes:
+  - id: classify
+    type: model
+    executor: { kind: agent_cli, cli: opencode, args: [classify] }
+    contract: pure
+    terminal: true
+edges:
+  - { from: classify, to: ghost, type: routes_to, when: missing }

@@ -1,0 +1,38 @@
+schema: proceed/v1
+name: customer-research
+
+nodes:
+  - id: classify
+    type: model
+    executor: { kind: agent_cli, cli: opencode, args: [classify] }
+    contract: pure
+  - id: github_search
+    type: agent
+    executor: { kind: shell, command: [scripts/github-search] }
+    contract: idempotent
+    capability: { filesystem: workspace-read, network: { allowlisted_hosts: [api.github.com] } }
+    timeout_ms: 600000
+  - id: docs_search
+    type: agent
+    executor: { kind: shell, command: [scripts/docs-search] }
+    contract: idempotent
+    capability: { filesystem: workspace-read, network: { allowlisted_hosts: [docs.example.com] } }
+  - id: synthesize
+    type: model
+    executor: { kind: agent_cli, cli: opencode, args: [synthesize] }
+    contract: pure
+  - id: verify
+    type: verifier
+    executor: { kind: shell, command: [scripts/verify] }
+    contract: pure
+  - id: human_approval
+    type: gate
+
+edges:
+  - { from: classify, to: github_search, type: routes_to, when: requires_code }
+  - { from: classify, to: docs_search,   type: routes_to, when: requires_docs }
+  - { from: github_search, to: synthesize, type: produces, artifact: research_context }
+  - { from: docs_search,   to: synthesize, type: produces, artifact: research_context }
+  - { from: synthesize, to: verify, type: depends_on }
+  - { from: verify, to: synthesize,     type: routes_to, when: needs_revision, max_traversals: 2 }
+  - { from: verify, to: human_approval, type: routes_to, when: verified }

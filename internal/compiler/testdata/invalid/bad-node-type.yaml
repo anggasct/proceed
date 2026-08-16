@@ -1,0 +1,9 @@
+schema: proceed/v1
+name: bad-node-type-demo
+nodes:
+  - id: only
+    type: workflow
+    executor: { kind: shell, command: [bin/do] }
+    contract: pure
+    terminal: true
+edges: []
