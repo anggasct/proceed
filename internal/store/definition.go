@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -17,77 +18,17 @@ import (
 	"proceed/internal/compiler"
 )
 
-const definitionSchemaVersion = 1
-
-const definitionDDL = `
-CREATE TABLE IF NOT EXISTS graph (
-  id   TEXT PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE COLLATE NOCASE
-);
-
-CREATE TABLE IF NOT EXISTS graph_version (
-  id                      TEXT PRIMARY KEY,
-  graph_id                TEXT NOT NULL REFERENCES graph(id),
-  definition_digest       TEXT NOT NULL UNIQUE,
-  source_schema_version   TEXT NOT NULL,
-  compiled_schema_version TEXT NOT NULL,
-  source_metadata         TEXT NOT NULL,
-  extras                  TEXT NOT NULL DEFAULT '{}',
-  status                  TEXT NOT NULL DEFAULT 'frozen'
-                            CHECK (status IN ('frozen', 'superseded')),
-  created_at              INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS graph_node (
-  id               TEXT PRIMARY KEY,
-  graph_version_id TEXT NOT NULL REFERENCES graph_version(id),
-  node_key         TEXT NOT NULL,
-  type             TEXT NOT NULL
-                   CHECK (type IN ('task','model','agent','tool','verifier','router','gate')),
-  config           TEXT NOT NULL,
-  UNIQUE (graph_version_id, node_key)
-);
-
-CREATE TABLE IF NOT EXISTS graph_edge (
-  id               TEXT PRIMARY KEY,
-  graph_version_id TEXT NOT NULL REFERENCES graph_version(id),
-  from_node_key    TEXT NOT NULL,
-  to_node_key      TEXT NOT NULL,
-  type             TEXT NOT NULL
-                   CHECK (type IN ('defines','depends_on','routes_to','produces','consumes',
-                                   'verifies','derived_from','blocks','approves','measures','improves')),
-  condition        TEXT,
-  max_traversals   INTEGER,
-  extras           TEXT NOT NULL DEFAULT '{}',
-  CHECK (type = 'routes_to' OR condition IS NULL),
-  FOREIGN KEY (graph_version_id, from_node_key)
-    REFERENCES graph_node(graph_version_id, node_key),
-  FOREIGN KEY (graph_version_id, to_node_key)
-    REFERENCES graph_node(graph_version_id, node_key)
-);
-
-CREATE TABLE IF NOT EXISTS policy (
-  id               TEXT PRIMARY KEY,
-  graph_version_id TEXT NOT NULL REFERENCES graph_version(id),
-  kind             TEXT NOT NULL,
-  rule             TEXT NOT NULL,
-  extras           TEXT NOT NULL DEFAULT '{}'
-);
-
-CREATE INDEX IF NOT EXISTS idx_graph_node_version ON graph_node(graph_version_id);
-CREATE INDEX IF NOT EXISTS idx_graph_edge_version ON graph_edge(graph_version_id);
-CREATE INDEX IF NOT EXISTS idx_policy_version ON policy(graph_version_id);
-`
-
 type Store struct {
-	db *sql.DB
+	db       *sql.DB
+	lockPath string
 }
 
 func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	dsn := fmt.Sprintf("file:%s?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=strict(1)", path)
+	lockPath := filepath.Join(filepath.Dir(path), dirLockName)
+	dsn := fmt.Sprintf("file:%s?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=strict(1)&_txlock=immediate", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -95,21 +36,72 @@ func Open(path string) (*Store, error) {
 	if err := db.Ping(); err != nil {
 		return nil, closeOnErr(db, err)
 	}
-	if _, err := db.Exec(definitionDDL); err != nil {
-		return nil, closeOnErr(db, fmt.Errorf("apply definition schema: %w", err))
-	}
 	var current int
 	if err := db.QueryRow("PRAGMA user_version").Scan(&current); err != nil {
 		return nil, closeOnErr(db, err)
 	}
-	if current == 0 {
-		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", definitionSchemaVersion)); err != nil {
+	if current > storeSchemaVersion {
+		return nil, closeOnErr(db, storeErr(CodeGraphInvalid,
+			"store schema version %d is newer than supported %d", current, storeSchemaVersion))
+	}
+	if current < storeSchemaVersion {
+		if err := withDataDirLock(filepath.Dir(path), func() error {
+			var locked int
+			if err := db.QueryRow("PRAGMA user_version").Scan(&locked); err != nil {
+				return err
+			}
+			if locked >= storeSchemaVersion {
+				return nil
+			}
+			return migrateUnderLock(ctxBackground(), db, path)
+		}); err != nil {
 			return nil, closeOnErr(db, err)
 		}
-	} else if current != definitionSchemaVersion {
-		return nil, closeOnErr(db, fmt.Errorf("store schema version %d is newer than supported %d", current, definitionSchemaVersion))
+	} else if _, err := db.Exec(schemaDDL); err != nil {
+		return nil, closeOnErr(db, fmt.Errorf("apply schema: %w", err))
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, lockPath: lockPath}, nil
+}
+
+func migrateUnderLock(ctx context.Context, db *sql.DB, path string) error {
+	backupPath := migrationBackupPath(path)
+	if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if _, err := db.Exec(fmt.Sprintf("VACUUM INTO '%s'", backupPath)); err != nil {
+		return fmt.Errorf("pre-migration backup: %w", err)
+	}
+	return migrateInPlace(ctx, db)
+}
+
+func migrationBackupPath(path string) string {
+	return path + fmt.Sprintf(".pre-schema-%d.bak", storeSchemaVersion)
+}
+
+func ctxBackground() context.Context { return context.Background() }
+
+func migrateInPlace(ctx context.Context, db *sql.DB) error {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, schemaDDL); err != nil {
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return fmt.Errorf("apply schema: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", storeSchemaVersion)); err != nil {
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return err
+	}
+	return nil
 }
 
 func closeOnErr(db *sql.DB, err error) error {
@@ -208,7 +200,30 @@ func (s *Store) FreezeDefinition(ctx context.Context, sourcePath string, src []b
 	return result, nil
 }
 
+func (s *Store) lockShared() (release func(), err error) {
+	if s.lockPath == "" {
+		return func() {}, nil
+	}
+	f, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		f.Close()
+	}, nil
+}
+
 func (s *Store) withTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	release, err := s.lockShared()
+	if err != nil {
+		return err
+	}
+	defer release()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
