@@ -422,6 +422,54 @@ func recraftArchiveWithDB(t *testing.T, archive, outPath string, mutate func(db 
 	writeTestArchive(t, outPath, members)
 }
 
+func TestImportFailedIntoFreshTargetLeavesNoTrace(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	s.Close()
+	archive := filepath.Join(t.TempDir(), "backup.tgz")
+	if err := Export(ctx, sourceDir, archive); err != nil {
+		t.Fatal(err)
+	}
+
+	garbage := filepath.Join(t.TempDir(), "garbage.tgz")
+	recraftArchiveWithGarbageDB(t, archive, garbage)
+
+	target := filepath.Join(t.TempDir(), "fresh-target")
+	err := Import(ctx, garbage, target)
+	if !IsCode(err, CodeGraphInvalid) {
+		t.Fatalf("error = %v, want GRAPH_INVALID", err)
+	}
+	if _, statErr := os.Stat(target); !os.IsNotExist(statErr) {
+		t.Errorf("failed import into a fresh target must leave no directory behind (stat err = %v)", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(target, dirLockName)); !os.IsNotExist(statErr) {
+		t.Errorf("failed import into a fresh target must leave no lock file behind (stat err = %v)", statErr)
+	}
+}
+
+func recraftArchiveWithGarbageDB(t *testing.T, archive, outPath string) {
+	t.Helper()
+	members, err := readArchiveMembers(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest exportManifest
+	if err := json.Unmarshal(members[manifestMember], &manifest); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("this is not a sqlite database at all")
+	members[manifest.DB.Path] = content
+	manifest.DB.SHA256 = sha256Hex(content)
+	manifest.DB.SizeBytes = int64(len(content))
+	encoded, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members[manifestMember] = encoded
+	writeTestArchive(t, outPath, members)
+}
+
 func TestExportRefusesDivergentSource(t *testing.T) {
 	ctx := context.Background()
 	sourceDir := t.TempDir()

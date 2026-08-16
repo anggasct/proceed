@@ -406,7 +406,8 @@ func Import(ctx context.Context, archive, dataDir string) error {
 		}
 	}
 
-	return withDataDirLock(dataDir, func() error {
+	freshTarget := !dirExists(dataDir)
+	err = withDataDirLock(dataDir, func() error {
 		dbPath := filepath.Join(dataDir, dbMember)
 		busy, err := targetHasActiveLease(dbPath, time.Now().UnixMilli())
 		if err != nil {
@@ -433,6 +434,17 @@ func Import(ctx context.Context, archive, dataDir string) error {
 		}
 		return commitRestore(staging, dataDir, dbPath, &manifest)
 	})
+	if err != nil && freshTarget {
+		if rmErr := os.RemoveAll(dataDir); rmErr != nil {
+			return storeErr(CodeGraphInvalid, "failed import cleanup: %v (import error: %v)", rmErr, err)
+		}
+	}
+	return err
+}
+
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
 func stageRestore(staging string, manifest *exportManifest, members map[string][]byte) error {
