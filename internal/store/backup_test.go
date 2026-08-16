@@ -54,7 +54,8 @@ func TestExportImportRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	archive := filepath.Join(t.TempDir(), "backup.tgz")
-	if err := s.Export(ctx, sourceDir, archive); err != nil {
+	s.Close()
+	if err := Export(ctx, sourceDir, archive); err != nil {
 		t.Fatal(err)
 	}
 	if info, err := os.Stat(archive); err != nil || info.Size() == 0 {
@@ -93,7 +94,8 @@ func TestExportManifestCarriesChecksums(t *testing.T) {
 	s := buildPopulatedDir(t, sourceDir)
 	defer s.Close()
 	archive := filepath.Join(t.TempDir(), "backup.tgz")
-	if err := s.Export(ctx, sourceDir, archive); err != nil {
+	s.Close()
+	if err := Export(ctx, sourceDir, archive); err != nil {
 		t.Fatal(err)
 	}
 	members, err := readArchiveMembers(archive)
@@ -129,7 +131,8 @@ func TestImportRefusesActiveLease(t *testing.T) {
 	sourceDir := t.TempDir()
 	s := buildPopulatedDir(t, sourceDir)
 	archive := filepath.Join(t.TempDir(), "backup.tgz")
-	if err := s.Export(ctx, sourceDir, archive); err != nil {
+	s.Close()
+	if err := Export(ctx, sourceDir, archive); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
@@ -171,7 +174,8 @@ func TestImportAcceptsExpiredLease(t *testing.T) {
 	sourceDir := t.TempDir()
 	s := buildPopulatedDir(t, sourceDir)
 	archive := filepath.Join(t.TempDir(), "backup.tgz")
-	if err := s.Export(ctx, sourceDir, archive); err != nil {
+	s.Close()
+	if err := Export(ctx, sourceDir, archive); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
@@ -207,7 +211,7 @@ func TestImportRejectsCorruptArchive(t *testing.T) {
 	}
 }
 
-func writeArchive(t *testing.T, path string, members map[string][]byte) {
+func writeTestArchive(t *testing.T, path string, members map[string][]byte) {
 	t.Helper()
 	out, err := os.Create(path)
 	if err != nil {
@@ -233,7 +237,8 @@ func TestImportRejectsChecksumMismatch(t *testing.T) {
 	sourceDir := t.TempDir()
 	s := buildPopulatedDir(t, sourceDir)
 	archive := filepath.Join(t.TempDir(), "backup.tgz")
-	if err := s.Export(ctx, sourceDir, archive); err != nil {
+	s.Close()
+	if err := Export(ctx, sourceDir, archive); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
@@ -245,7 +250,7 @@ func TestImportRejectsChecksumMismatch(t *testing.T) {
 	members["artifacts/aa"] = []byte("tampered payload")
 
 	tampered := filepath.Join(t.TempDir(), "tampered.tgz")
-	writeArchive(t, tampered, members)
+	writeTestArchive(t, tampered, members)
 
 	targetDir := t.TempDir()
 	err = Import(ctx, tampered, targetDir)
@@ -262,7 +267,8 @@ func TestImportValidatesStagedStoreBeforeReplacingTarget(t *testing.T) {
 	sourceDir := t.TempDir()
 	s := buildPopulatedDir(t, sourceDir)
 	archive := filepath.Join(t.TempDir(), "backup.tgz")
-	if err := s.Export(ctx, sourceDir, archive); err != nil {
+	s.Close()
+	if err := Export(ctx, sourceDir, archive); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
@@ -294,7 +300,7 @@ func TestImportValidatesStagedStoreBeforeReplacingTarget(t *testing.T) {
 	members[manifestMember] = encoded
 
 	crafted := filepath.Join(t.TempDir(), "crafted.tgz")
-	writeArchive(t, crafted, members)
+	writeTestArchive(t, crafted, members)
 
 	err = Import(ctx, crafted, targetDir)
 	if !IsCode(err, CodeGraphInvalid) {
@@ -319,7 +325,8 @@ func TestImportRejectsSchemaVersionDisagreement(t *testing.T) {
 	sourceDir := t.TempDir()
 	s := buildPopulatedDir(t, sourceDir)
 	archive := filepath.Join(t.TempDir(), "backup.tgz")
-	if err := s.Export(ctx, sourceDir, archive); err != nil {
+	s.Close()
+	if err := Export(ctx, sourceDir, archive); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
@@ -348,7 +355,7 @@ func TestImportRejectsSchemaVersionDisagreement(t *testing.T) {
 	members[manifestMember] = encoded
 
 	crafted := filepath.Join(t.TempDir(), "crafted.tgz")
-	writeArchive(t, crafted, members)
+	writeTestArchive(t, crafted, members)
 
 	err = Import(ctx, crafted, targetDir)
 	if !IsCode(err, CodeGraphInvalid) {
@@ -412,7 +419,7 @@ func recraftArchiveWithDB(t *testing.T, archive, outPath string, mutate func(db 
 		t.Fatal(err)
 	}
 	members[manifestMember] = encoded
-	writeArchive(t, outPath, members)
+	writeTestArchive(t, outPath, members)
 }
 
 func TestExportRefusesDivergentSource(t *testing.T) {
@@ -423,7 +430,8 @@ func TestExportRefusesDivergentSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	archive := filepath.Join(t.TempDir(), "backup.tgz")
-	err := s.Export(ctx, sourceDir, archive)
+	s.Close()
+	err := Export(ctx, sourceDir, archive)
 	if !IsCode(err, CodeGraphInvalid) {
 		t.Fatalf("error = %v, want GRAPH_INVALID", err)
 	}
@@ -449,7 +457,7 @@ func TestExportWaitsForDataDirLock(t *testing.T) {
 	archive := filepath.Join(t.TempDir(), "backup.tgz")
 	done := make(chan error, 1)
 	go func() {
-		done <- s.Export(ctx, sourceDir, archive)
+		done <- Export(ctx, sourceDir, archive)
 	}()
 	select {
 	case err := <-done:
@@ -498,7 +506,8 @@ func TestImportRefusesDivergentProjectionArchive(t *testing.T) {
 	sourceDir := t.TempDir()
 	s := buildPopulatedDir(t, sourceDir)
 	archive := filepath.Join(t.TempDir(), "backup.tgz")
-	if err := s.Export(ctx, sourceDir, archive); err != nil {
+	s.Close()
+	if err := Export(ctx, sourceDir, archive); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
@@ -541,7 +550,8 @@ func TestImportRefusesIncompleteSchemaArchive(t *testing.T) {
 	sourceDir := t.TempDir()
 	s := buildPopulatedDir(t, sourceDir)
 	archive := filepath.Join(t.TempDir(), "backup.tgz")
-	if err := s.Export(ctx, sourceDir, archive); err != nil {
+	s.Close()
+	if err := Export(ctx, sourceDir, archive); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
@@ -621,7 +631,8 @@ func TestImportWaitsForDataDirLock(t *testing.T) {
 	sourceDir := t.TempDir()
 	s := buildPopulatedDir(t, sourceDir)
 	archive := filepath.Join(t.TempDir(), "backup.tgz")
-	if err := s.Export(ctx, sourceDir, archive); err != nil {
+	s.Close()
+	if err := Export(ctx, sourceDir, archive); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
@@ -665,7 +676,8 @@ func TestImportCreatesMissingTargetDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	archive := filepath.Join(t.TempDir(), "backup.tgz")
-	if err := s.Export(ctx, sourceDir, archive); err != nil {
+	s.Close()
+	if err := Export(ctx, sourceDir, archive); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
@@ -685,5 +697,209 @@ func TestImportCreatesMissingTargetDirectory(t *testing.T) {
 	}
 	if digest != before {
 		t.Errorf("restored digest %s != source %s", digest, before)
+	}
+}
+
+func TestExportRejectsSymlinkArtifacts(t *testing.T) {
+	ctx := context.Background()
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	secret := "contents of a file outside the data dir"
+	if err := os.WriteFile(outside, []byte(secret), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	s.Close()
+	if err := os.Symlink(outside, filepath.Join(sourceDir, "artifacts", "leak")); err != nil {
+		t.Fatal(err)
+	}
+
+	archive := filepath.Join(t.TempDir(), "backup.tgz")
+	err := Export(ctx, sourceDir, archive)
+	if !IsCode(err, CodeGraphInvalid) {
+		t.Fatalf("error = %v, want GRAPH_INVALID", err)
+	}
+	if _, err := os.Stat(archive); !os.IsNotExist(err) {
+		t.Fatal("export with a symlinked artifact produced an archive")
+	}
+	matches, err := filepath.Glob(filepath.Join(sourceDir, ".export-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range matches {
+		content, rerr := os.ReadFile(m)
+		if rerr == nil && strings.Contains(string(content), secret) {
+			t.Errorf("temporary file %s contains outside content", m)
+		}
+	}
+}
+
+func TestExportRejectsOutputPathCollisions(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	before, err := s.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	for _, collision := range []string{
+		filepath.Join(sourceDir, "proceed.db"),
+		filepath.Join(sourceDir, "proceed.db-wal"),
+		filepath.Join(sourceDir, "proceed.lock"),
+		filepath.Join(sourceDir, "artifacts", "out.tgz"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(collision), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		err := Export(ctx, sourceDir, collision)
+		if !IsCode(err, CodeGraphInvalid) {
+			t.Errorf("output %s: error = %v, want GRAPH_INVALID", collision, err)
+		}
+		if collision == filepath.Join(sourceDir, "artifacts", "out.tgz") {
+			if _, serr := os.Stat(collision); !os.IsNotExist(serr) {
+				t.Errorf("output %s: collision path was created", collision)
+			}
+		}
+	}
+
+	survivor, err := Open(filepath.Join(sourceDir, "proceed.db"))
+	if err != nil {
+		t.Fatalf("live store damaged by refused exports: %v", err)
+	}
+	defer survivor.Close()
+	digest, err := survivor.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest != before {
+		t.Error("live store content changed by refused exports")
+	}
+}
+
+func TestImportWaitsForActiveWriter(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	sourceDigest, err := s.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(t.TempDir(), "backup.tgz")
+	s.Close()
+	if err := Export(ctx, sourceDir, archive); err != nil {
+		t.Fatal(err)
+	}
+
+	targetDir := t.TempDir()
+	target := buildPopulatedDir(t, targetDir)
+	target.Close()
+
+	writer, err := Open(filepath.Join(targetDir, "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inTx := make(chan struct{})
+	releaseTx := make(chan struct{})
+	go func() {
+		_ = writer.withTx(ctx, func(tx *sql.Tx) error {
+			close(inTx)
+			<-releaseTx
+			return nil
+		})
+		writer.Close()
+	}()
+	<-inTx
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Import(ctx, archive, targetDir)
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("import completed while a writer held the store lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseTx)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("import never completed after the writer released the store lock")
+	}
+
+	restored, err := Open(filepath.Join(targetDir, "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	digest, err := restored.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest != sourceDigest {
+		t.Errorf("restored digest %s != source %s", digest, sourceDigest)
+	}
+}
+
+func TestAppendWaitsForImport(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	archive := filepath.Join(t.TempDir(), "backup.tgz")
+	s.Close()
+	if err := Export(ctx, sourceDir, archive); err != nil {
+		t.Fatal(err)
+	}
+
+	targetDir := t.TempDir()
+	target := buildPopulatedDir(t, targetDir)
+	target.Close()
+
+	release, err := acquireDirLock(targetDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appended := make(chan error, 1)
+	go func() {
+		w, err := Open(filepath.Join(targetDir, "proceed.db"))
+		if err != nil {
+			appended <- err
+			return
+		}
+		defer w.Close()
+		events, err := w.Events(ctx, "01HZZZZZZZZZZZZZZZZZZZZZZZ")
+		if err != nil {
+			appended <- err
+			return
+		}
+		_ = events
+		_, err = w.Append(ctx, Event{
+			RunID:         "01HZZZZZZZZZZZZZZZZZZZZZZZ",
+			Sequence:      99,
+			SchemaVersion: eventSchemaVersion,
+			Type:          "checkpoint",
+			OccurredAt:    time.Now().UnixMilli(),
+			ActorType:     "controller",
+			ActorID:       "test",
+			Payload:       `{}`,
+		})
+		appended <- err
+	}()
+	select {
+	case err := <-appended:
+		t.Fatalf("append resolved while import held the exclusive lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-appended:
+	case <-time.After(10 * time.Second):
+		t.Fatal("append never completed after the exclusive lock was released")
 	}
 }

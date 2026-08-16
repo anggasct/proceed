@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -18,13 +19,15 @@ import (
 )
 
 type Store struct {
-	db *sql.DB
+	db       *sql.DB
+	lockPath string
 }
 
 func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
+	lockPath := filepath.Join(filepath.Dir(path), dirLockName)
 	dsn := fmt.Sprintf("file:%s?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=strict(1)&_txlock=immediate", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -42,20 +45,22 @@ func Open(path string) (*Store, error) {
 			"store schema version %d is newer than supported %d", current, storeSchemaVersion))
 	}
 	if current < storeSchemaVersion {
-		backupPath := migrationBackupPath(path)
-		if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
-			return nil, closeOnErr(db, err)
-		}
-		if _, err := db.Exec(fmt.Sprintf("VACUUM INTO '%s'", backupPath)); err != nil {
-			return nil, closeOnErr(db, fmt.Errorf("pre-migration backup: %w", err))
-		}
-		if err := migrateInPlace(ctxBackground(), db); err != nil {
+		if err := withDataDirLock(filepath.Dir(path), func() error {
+			backupPath := migrationBackupPath(path)
+			if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			if _, err := db.Exec(fmt.Sprintf("VACUUM INTO '%s'", backupPath)); err != nil {
+				return fmt.Errorf("pre-migration backup: %w", err)
+			}
+			return migrateInPlace(ctxBackground(), db)
+		}); err != nil {
 			return nil, closeOnErr(db, err)
 		}
 	} else if _, err := db.Exec(schemaDDL); err != nil {
 		return nil, closeOnErr(db, fmt.Errorf("apply schema: %w", err))
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, lockPath: lockPath}, nil
 }
 
 func migrationBackupPath(path string) string {
@@ -184,7 +189,30 @@ func (s *Store) FreezeDefinition(ctx context.Context, sourcePath string, src []b
 	return result, nil
 }
 
+func (s *Store) lockShared() (release func(), err error) {
+	if s.lockPath == "" {
+		return func() {}, nil
+	}
+	f, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		f.Close()
+	}, nil
+}
+
 func (s *Store) withTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	release, err := s.lockShared()
+	if err != nil {
+		return err
+	}
+	defer release()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err

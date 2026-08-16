@@ -35,8 +35,12 @@ type exportManifest struct {
 	Artifacts     []archiveEntry `json:"artifacts"`
 }
 
+func openNoFollow(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+}
+
 func sha256File(path string) (string, int64, error) {
-	f, err := os.Open(path)
+	f, err := openNoFollow(path)
 	if err != nil {
 		return "", 0, err
 	}
@@ -49,44 +53,34 @@ func sha256File(path string) (string, int64, error) {
 	return hex.EncodeToString(h.Sum(nil)), n, nil
 }
 
-func (s *Store) verifyCurrent(ctx context.Context) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+func withinDir(path, dir string) bool {
+	rel, err := filepath.Rel(dir, path)
 	if err != nil {
-		return err
+		return false
 	}
-	defer func() { _ = tx.Rollback() }()
-	report, err := rebuildProjectionsTx(ctx, tx)
-	if err != nil {
-		return err
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+func checkExportOutputPath(absOut, absData string) error {
+	dbPath := filepath.Join(absData, dbMember)
+	lockPath := filepath.Join(absData, dirLockName)
+	collisions := []string{
+		dbPath, dbPath + "-wal", dbPath + "-shm", dbPath + "-journal", lockPath,
 	}
-	if report.Diverged {
-		return storeErr(CodeGraphInvalid, "store projections diverge from the event stream; refusing to export a divergent store")
+	for _, c := range collisions {
+		if absOut == c {
+			return storeErr(CodeGraphInvalid, "output path %s collides with a live store file", absOut)
+		}
+	}
+	if withinDir(absOut, filepath.Join(absData, "artifacts")) {
+		return storeErr(CodeGraphInvalid, "output path %s is inside the artifact tree", absOut)
 	}
 	return nil
 }
 
-func (s *Store) Export(ctx context.Context, dataDir, output string) error {
-	return withDataDirLock(dataDir, func() error {
-		return s.exportLocked(ctx, dataDir, output)
-	})
-}
-
-func (s *Store) exportLocked(ctx context.Context, dataDir, output string) error {
-	if err := s.verifyCurrent(ctx); err != nil {
-		return err
-	}
-	snapshot := output + ".snapshot"
-	if err := os.Remove(snapshot); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	quoted := strings.ReplaceAll(snapshot, "'", "''")
-	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("VACUUM INTO '%s'", quoted)); err != nil {
-		return fmt.Errorf("snapshot store: %w", err)
-	}
-	defer os.Remove(snapshot)
-
+func collectArtifacts(absData string) ([]archiveEntry, error) {
 	var artifacts []archiveEntry
-	artifactRoot := filepath.Join(dataDir, "artifacts")
+	artifactRoot := filepath.Join(absData, "artifacts")
 	err := filepath.WalkDir(artifactRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			if os.IsNotExist(err) && path == artifactRoot {
@@ -97,7 +91,15 @@ func (s *Store) exportLocked(ctx context.Context, dataDir, output string) error 
 		if d.IsDir() {
 			return nil
 		}
-		rel, err := filepath.Rel(dataDir, path)
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return storeErr(CodeGraphInvalid,
+				"artifact %s is not a regular file (mode %s); refusing to follow it", path, info.Mode())
+		}
+		rel, err := filepath.Rel(absData, path)
 		if err != nil {
 			return err
 		}
@@ -109,28 +111,24 @@ func (s *Store) exportLocked(ctx context.Context, dataDir, output string) error 
 		return nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	dbDigest, dbSize, err := sha256File(snapshot)
-	if err != nil {
-		return err
-	}
-	manifest := exportManifest{
-		SchemaVersion: storeSchemaVersion,
-		DB:            archiveEntry{Path: dbMember, SHA256: dbDigest, SizeBytes: dbSize},
-		Artifacts:     artifacts,
-	}
+	return artifacts, nil
+}
 
-	out, err := os.Create(output)
+func writeArchive(output string, manifest *exportManifest, absData, snapshotPath string) (err error) {
+	tmp, err := os.CreateTemp(filepath.Dir(output), ".export-*.tgz")
 	if err != nil {
 		return err
 	}
-	defer out.Close()
-	gz := gzip.NewWriter(out)
-	defer gz.Close()
+	tmpName := tmp.Name()
+	defer func() {
+		if err != nil {
+			os.Remove(tmpName)
+		}
+	}()
+	gz := gzip.NewWriter(tmp)
 	tw := tar.NewWriter(gz)
-	defer tw.Close()
-
 	writeMember := func(name string, content io.Reader, size int64) error {
 		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: size}); err != nil {
 			return err
@@ -138,19 +136,18 @@ func (s *Store) exportLocked(ctx context.Context, dataDir, output string) error 
 		_, err := io.Copy(tw, content)
 		return err
 	}
-
-	dbFile, err := os.Open(snapshot)
+	dbFile, err := openNoFollow(snapshotPath)
 	if err != nil {
 		return err
 	}
 	defer dbFile.Close()
-	if err := writeMember(dbMember, dbFile, dbSize); err != nil {
+	if err := writeMember(dbMember, dbFile, manifest.DB.SizeBytes); err != nil {
 		return err
 	}
-	for _, a := range artifacts {
-		f, err := os.Open(filepath.Join(dataDir, filepath.FromSlash(a.Path)))
-		if err != nil {
-			return err
+	for _, a := range manifest.Artifacts {
+		f, ferr := openNoFollow(filepath.Join(absData, filepath.FromSlash(a.Path)))
+		if ferr != nil {
+			return ferr
 		}
 		err = writeMember(a.Path, f, a.SizeBytes)
 		f.Close()
@@ -165,7 +162,93 @@ func (s *Store) exportLocked(ctx context.Context, dataDir, output string) error 
 	if err := writeMember(manifestMember, strings.NewReader(string(encoded)), int64(len(encoded))); err != nil {
 		return err
 	}
-	return nil
+	if err := tw.Close(); err != nil {
+		return err
+	}
+	if err := gz.Close(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, output)
+}
+
+func Export(ctx context.Context, dataDir, output string) error {
+	absOut, err := filepath.Abs(output)
+	if err != nil {
+		return err
+	}
+	absData, err := filepath.Abs(dataDir)
+	if err != nil {
+		return err
+	}
+	if err := checkExportOutputPath(absOut, absData); err != nil {
+		return err
+	}
+	return withDataDirLock(absData, func() error {
+		dbPath := filepath.Join(absData, dbMember)
+		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+			return storeErr(CodeGraphInvalid, "no store found in %s", dataDir)
+		}
+		db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+		var version int
+		if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+			return storeErr(CodeGraphInvalid, "source store unreadable: %v", err)
+		}
+		if version > storeSchemaVersion {
+			return storeErr(CodeGraphInvalid, "source store schema version %d is newer than supported %d",
+				version, storeSchemaVersion)
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		report, err := rebuildProjectionsTx(ctx, tx)
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if report.Diverged {
+			_ = tx.Rollback()
+			return storeErr(CodeGraphInvalid, "store projections diverge from the event stream; refusing to export a divergent store")
+		}
+		if err := tx.Rollback(); err != nil {
+			return err
+		}
+
+		snap, err := os.CreateTemp(absData, ".export-snapshot-*.db")
+		if err != nil {
+			return err
+		}
+		snapshotPath := snap.Name()
+		snap.Close()
+		os.Remove(snapshotPath)
+		defer os.Remove(snapshotPath)
+		quoted := strings.ReplaceAll(snapshotPath, "'", "''")
+		if _, err := db.ExecContext(ctx, fmt.Sprintf("VACUUM INTO '%s'", quoted)); err != nil {
+			return fmt.Errorf("snapshot store: %w", err)
+		}
+
+		artifacts, err := collectArtifacts(absData)
+		if err != nil {
+			return err
+		}
+		dbDigest, dbSize, err := sha256File(snapshotPath)
+		if err != nil {
+			return err
+		}
+		manifest := exportManifest{
+			SchemaVersion: storeSchemaVersion,
+			DB:            archiveEntry{Path: dbMember, SHA256: dbDigest, SizeBytes: dbSize},
+			Artifacts:     artifacts,
+		}
+		return writeArchive(absOut, &manifest, absData, snapshotPath)
+	})
 }
 
 func readArchiveMembers(path string) (map[string][]byte, error) {

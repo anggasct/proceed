@@ -141,3 +141,30 @@ func TestStoreUsageErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestStoreExportOutputCollisionCLI(t *testing.T) {
+	dataDir := t.TempDir()
+	buildCLIStore(t, dataDir)
+	before := cliDigest(t, dataDir)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"store", "export", "--data-dir", dataDir, "--output", filepath.Join(dataDir, "proceed.db")}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 (stderr %q)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "GRAPH_INVALID") {
+		t.Errorf("stderr = %q, want GRAPH_INVALID", stderr.String())
+	}
+	if after := cliDigest(t, dataDir); after != before {
+		t.Error("live store digest changed after refused collision export")
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "proceed.db")+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM event").Scan(&n); err != nil {
+		t.Fatalf("store database corrupted by refused export: %v", err)
+	}
+}

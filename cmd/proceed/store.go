@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"path/filepath"
 	"strings"
 
 	"proceed/internal/store"
@@ -83,12 +82,7 @@ func runStoreExport(args []string, stdout io.Writer) error {
 	if output == "" {
 		return &usageErr{msg: "--output is required"}
 	}
-	st, err := store.Open(filepath.Join(dataDir, "proceed.db"))
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	if err := st.Export(context.Background(), dataDir, output); err != nil {
+	if err := store.Export(context.Background(), dataDir, output); err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "exported %s\n", output)
