@@ -20,6 +20,7 @@ const (
 	RuleNodeType         = "E111"
 	RuleAcyclicTraversal = "E112"
 	RuleArtifactEdge     = "E113"
+	RuleEdgeLegality     = "E114"
 )
 
 var nodeTypeSet = map[string]bool{
@@ -29,6 +30,10 @@ var nodeTypeSet = map[string]bool{
 
 var executableTypeSet = map[string]bool{
 	"task": true, "model": true, "agent": true, "tool": true,
+}
+
+var matrixExecutableTypeSet = map[string]bool{
+	"task": true, "model": true, "agent": true, "tool": true, "verifier": true,
 }
 
 var edgeTypeSet = map[string]bool{
@@ -344,8 +349,10 @@ func (v *validator) edgePass() {
 		v.errf(RuleSinkTerminal, "edges", "edges may be empty only if a single terminal node exists")
 	}
 	exists := map[string]bool{}
+	nodeType := map[string]string{}
 	for i := range v.doc.Nodes {
 		exists[v.doc.Nodes[i].ID] = true
+		nodeType[v.doc.Nodes[i].ID] = v.doc.Nodes[i].Type
 	}
 	for i := range v.doc.Edges {
 		e := &v.doc.Edges[i]
@@ -379,6 +386,9 @@ func (v *validator) edgePass() {
 		if e.From != "" && e.From == e.To && v.nodeByType(e.From, "verifier") {
 			v.errf(RuleSelfVerifier, path, "verifier node %q must not have an edge routing to itself", e.From)
 		}
+		if exists[e.From] && exists[e.To] && nodeTypeSet[nodeType[e.From]] && nodeTypeSet[nodeType[e.To]] {
+			v.edgeLegality(e, nodeType[e.From], nodeType[e.To], path)
+		}
 	}
 }
 
@@ -389,6 +399,28 @@ func (v *validator) nodeByType(id, nodeType string) bool {
 		}
 	}
 	return false
+}
+
+func (v *validator) edgeLegality(e *Edge, fromType, toType, path string) {
+	desc := e.From + " -> " + e.To
+	switch e.Type {
+	case "verifies":
+		if fromType != "verifier" {
+			v.errf(RuleEdgeLegality, path, "verifies edge %q must originate from a verifier node (got %s)", desc, fromType)
+		}
+	case "approves":
+		if fromType != "gate" {
+			v.errf(RuleEdgeLegality, path, "approves edge %q must originate from a gate node (got %s)", desc, fromType)
+		}
+	case "routes_to":
+		if fromType == "gate" {
+			v.errf(RuleEdgeLegality, path, "routes_to edge %q must not originate from a gate node", desc)
+		}
+	case "depends_on", "produces", "consumes":
+		if !matrixExecutableTypeSet[fromType] || !matrixExecutableTypeSet[toType] {
+			v.errf(RuleEdgeLegality, path, "%s edge %q requires executable endpoints (%s -> %s)", e.Type, desc, fromType, toType)
+		}
+	}
 }
 
 func (v *validator) sinkPass() {
