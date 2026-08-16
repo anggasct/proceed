@@ -49,7 +49,32 @@ func sha256File(path string) (string, int64, error) {
 	return hex.EncodeToString(h.Sum(nil)), n, nil
 }
 
+func (s *Store) verifyCurrent(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	report, err := rebuildProjectionsTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if report.Diverged {
+		return storeErr(CodeGraphInvalid, "store projections diverge from the event stream; refusing to export a divergent store")
+	}
+	return nil
+}
+
 func (s *Store) Export(ctx context.Context, dataDir, output string) error {
+	return withDataDirLock(dataDir, func() error {
+		return s.exportLocked(ctx, dataDir, output)
+	})
+}
+
+func (s *Store) exportLocked(ctx context.Context, dataDir, output string) error {
+	if err := s.verifyCurrent(ctx); err != nil {
+		return err
+	}
 	snapshot := output + ".snapshot"
 	if err := os.Remove(snapshot); err != nil && !os.IsNotExist(err) {
 		return err

@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -156,6 +158,50 @@ func TestAppendUnknownRunRejected(t *testing.T) {
 	}
 }
 
+var knownEventTypes = map[string]bool{
+	"run_started":           true,
+	"node_started":          true,
+	"node_finished":         true,
+	"node_failed":           true,
+	"node_uncertain":        true,
+	"node_cancel_requested": true,
+	"node_skipped":          true,
+	"artifact_published":    true,
+	"edge_traversed":        true,
+	"decision_recorded":     true,
+	"effect_intent":         true,
+	"effect_receipt":        true,
+	"approval_requested":    true,
+	"approval_granted":      true,
+	"approval_denied":       true,
+	"approval_expired":      true,
+	"evaluation_failed":     true,
+	"run_completed":         true,
+	"run_failed":            true,
+	"run_cancelled":         true,
+}
+
+func TestProjectedEventTypesMatchVocabulary(t *testing.T) {
+	projected := map[string]bool{}
+	for typ := range projectedHandlers {
+		projected[typ] = true
+	}
+	for typ := range projected {
+		if !knownEventTypes[typ] {
+			t.Errorf("store projects event type %q that is not in the shipped vocabulary", typ)
+		}
+	}
+	for _, typ := range []string{"run_started", "node_started", "node_finished", "node_failed",
+		"node_uncertain", "node_cancel_requested", "node_skipped", "artifact_published",
+		"edge_traversed", "decision_recorded", "effect_intent", "effect_receipt",
+		"approval_requested", "approval_granted", "approval_denied", "evaluation_failed",
+		"run_completed", "run_failed", "run_cancelled"} {
+		if !projected[typ] {
+			t.Errorf("vocabulary event type %q has no projection handler", typ)
+		}
+	}
+}
+
 func TestAppendRejectsMismatchedPayloadDigest(t *testing.T) {
 	s := openTestStore(t)
 	runID := seededRun(t, s)
@@ -256,24 +302,6 @@ func TestAppendMonotonicUnderConcurrency(t *testing.T) {
 	}
 }
 
-func TestOpenRejectsNewerSchema(t *testing.T) {
-	dir := t.TempDir()
-	path := dir + "/proceed.db"
-	s, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", storeSchemaVersion+1)); err != nil {
-		t.Fatal(err)
-	}
-	s.Close()
-
-	_, err = Open(path)
-	if !IsCode(err, CodeGraphInvalid) {
-		t.Fatalf("newer schema error = %v, want GRAPH_INVALID", err)
-	}
-}
-
 func TestOpenUpgradesOlderBaseline(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/proceed.db"
@@ -298,8 +326,92 @@ func TestOpenUpgradesOlderBaseline(t *testing.T) {
 	if v != storeSchemaVersion {
 		t.Errorf("user_version = %d, want %d", v, storeSchemaVersion)
 	}
+	backup := migrationBackupPath(path)
+	if _, err := os.Stat(backup); err != nil {
+		t.Fatalf("pre-migration backup missing: %v", err)
+	}
+	bk, err := sql.Open("sqlite", "file:"+backup+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bk.Close()
+	var bv int
+	if err := bk.QueryRow("PRAGMA user_version").Scan(&bv); err != nil {
+		t.Fatal(err)
+	}
+	if bv != 1 {
+		t.Errorf("backup user_version = %d, want 1 (pre-migration state)", bv)
+	}
 	var n int
 	if err := s2.db.QueryRow("SELECT COUNT(*) FROM event").Scan(&n); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOpenMigrationRollbackOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/proceed.db"
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := readFixture(t, "../../internal/compiler/testdata/customer-research.yaml")
+	doc := compileFixture(t, src)
+	frozen, err := s.FreezeDefinition(context.Background(), "a.yaml", src, doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateRun(context.Background(), frozen.GraphVersionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("PRAGMA user_version = 1"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	orig := schemaDDL
+	schemaDDL = "CREATE TABLE broken (this is not valid sql);"
+	_, err = Open(path)
+	if err == nil {
+		t.Fatal("migration with invalid DDL must fail")
+	}
+	schemaDDL = orig
+
+	s3, err := Open(path)
+	if err != nil {
+		t.Fatalf("store unusable after failed migration: %v", err)
+	}
+	defer s3.Close()
+	var v int
+	if err := s3.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	if v != storeSchemaVersion {
+		t.Errorf("user_version = %d after retry, want %d (retry completes the migration)", v, storeSchemaVersion)
+	}
+	var runs int
+	if err := s3.db.QueryRow("SELECT COUNT(*) FROM graph_run").Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 1 {
+		t.Errorf("graph_run rows = %d after failed migration, want 1 (original data intact)", runs)
+	}
+}
+
+func TestOpenRejectsNewerSchema(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/proceed.db"
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", storeSchemaVersion+1)); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	_, err = Open(path)
+	if !IsCode(err, CodeGraphInvalid) {
+		t.Fatalf("newer schema error = %v, want GRAPH_INVALID", err)
 	}
 }

@@ -415,6 +415,84 @@ func recraftArchiveWithDB(t *testing.T, archive, outPath string, mutate func(db 
 	writeArchive(t, outPath, members)
 }
 
+func TestExportRefusesDivergentSource(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	if _, err := s.db.Exec("UPDATE run_node SET attempt_count = 47 WHERE rowid = 1"); err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(t.TempDir(), "backup.tgz")
+	err := s.Export(ctx, sourceDir, archive)
+	if !IsCode(err, CodeGraphInvalid) {
+		t.Fatalf("error = %v, want GRAPH_INVALID", err)
+	}
+	if _, err := os.Stat(archive); !os.IsNotExist(err) {
+		t.Error("divergent export produced an archive file")
+	}
+	if _, err := os.Stat(archive + ".snapshot"); !os.IsNotExist(err) {
+		t.Error("divergent export left a snapshot file behind")
+	}
+	s.Close()
+}
+
+func TestExportWaitsForDataDirLock(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	defer s.Close()
+
+	release, err := acquireDirLock(sourceDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(t.TempDir(), "backup.tgz")
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Export(ctx, sourceDir, archive)
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("export completed while the data dir lock was held: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "artifacts", "aa"), []byte("mutated after lock"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("export never completed after the lock was released")
+	}
+	content, err := os.ReadFile(filepath.Join(sourceDir, "artifacts", "aa"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "mutated after lock" {
+		t.Fatalf("artifact mutated under export: %q", content)
+	}
+	members, err := readArchiveMembers(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest exportManifest
+	if err := json.Unmarshal(members[manifestMember], &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Artifacts) != 1 || manifest.Artifacts[0].SHA256 != sha256Hex([]byte("mutated after lock")) {
+		t.Errorf("archive captured a stale artifact state: %+v", manifest.Artifacts)
+	}
+	if string(members["artifacts/aa"]) != "mutated after lock" {
+		t.Error("archived artifact content does not match the post-lock state")
+	}
+}
+
 func TestImportRefusesDivergentProjectionArchive(t *testing.T) {
 	ctx := context.Background()
 	sourceDir := t.TempDir()

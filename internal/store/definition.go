@@ -41,15 +41,51 @@ func Open(path string) (*Store, error) {
 		return nil, closeOnErr(db, storeErr(CodeGraphInvalid,
 			"store schema version %d is newer than supported %d", current, storeSchemaVersion))
 	}
-	if _, err := db.Exec(schemaDDL); err != nil {
-		return nil, closeOnErr(db, fmt.Errorf("apply schema: %w", err))
-	}
 	if current < storeSchemaVersion {
-		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", storeSchemaVersion)); err != nil {
+		backupPath := migrationBackupPath(path)
+		if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
 			return nil, closeOnErr(db, err)
 		}
+		if _, err := db.Exec(fmt.Sprintf("VACUUM INTO '%s'", backupPath)); err != nil {
+			return nil, closeOnErr(db, fmt.Errorf("pre-migration backup: %w", err))
+		}
+		if err := migrateInPlace(ctxBackground(), db); err != nil {
+			return nil, closeOnErr(db, err)
+		}
+	} else if _, err := db.Exec(schemaDDL); err != nil {
+		return nil, closeOnErr(db, fmt.Errorf("apply schema: %w", err))
 	}
 	return &Store{db: db}, nil
+}
+
+func migrationBackupPath(path string) string {
+	return path + fmt.Sprintf(".pre-schema-%d.bak", storeSchemaVersion)
+}
+
+func ctxBackground() context.Context { return context.Background() }
+
+func migrateInPlace(ctx context.Context, db *sql.DB) error {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, schemaDDL); err != nil {
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return fmt.Errorf("apply schema: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", storeSchemaVersion)); err != nil {
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return err
+	}
+	return nil
 }
 
 func closeOnErr(db *sql.DB, err error) error {

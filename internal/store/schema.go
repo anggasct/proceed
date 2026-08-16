@@ -2,7 +2,7 @@ package store
 
 const storeSchemaVersion = 2
 
-const schemaDDL = `
+var schemaDDL = `
 CREATE TABLE IF NOT EXISTS graph (
   id   TEXT PRIMARY KEY,
   name TEXT NOT NULL UNIQUE COLLATE NOCASE
