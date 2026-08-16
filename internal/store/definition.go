@@ -53,14 +53,7 @@ func Open(path string) (*Store, error) {
 			if locked >= storeSchemaVersion {
 				return nil
 			}
-			backupPath := migrationBackupPath(path)
-			if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
-				return err
-			}
-			if _, err := db.Exec(fmt.Sprintf("VACUUM INTO '%s'", backupPath)); err != nil {
-				return fmt.Errorf("pre-migration backup: %w", err)
-			}
-			return migrateInPlace(ctxBackground(), db)
+			return migrateUnderLock(ctxBackground(), db, path)
 		}); err != nil {
 			return nil, closeOnErr(db, err)
 		}
@@ -68,6 +61,17 @@ func Open(path string) (*Store, error) {
 		return nil, closeOnErr(db, fmt.Errorf("apply schema: %w", err))
 	}
 	return &Store{db: db, lockPath: lockPath}, nil
+}
+
+func migrateUnderLock(ctx context.Context, db *sql.DB, path string) error {
+	backupPath := migrationBackupPath(path)
+	if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if _, err := db.Exec(fmt.Sprintf("VACUUM INTO '%s'", backupPath)); err != nil {
+		return fmt.Errorf("pre-migration backup: %w", err)
+	}
+	return migrateInPlace(ctx, db)
 }
 
 func migrationBackupPath(path string) string {

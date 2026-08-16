@@ -127,6 +127,99 @@ func TestExportManifestCarriesChecksums(t *testing.T) {
 	}
 }
 
+func TestImportTargetExistingFileNotTouched(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	s.Close()
+	archive := filepath.Join(t.TempDir(), "backup.tgz")
+	if err := Export(ctx, sourceDir, archive); err != nil {
+		t.Fatal(err)
+	}
+
+	targetFile := filepath.Join(t.TempDir(), "not-a-dir")
+	content := []byte("unrelated file content")
+	if err := os.WriteFile(targetFile, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Import(ctx, archive, targetFile)
+	if !IsCode(err, CodeGraphInvalid) {
+		t.Fatalf("error = %v, want GRAPH_INVALID", err)
+	}
+	got, err := os.ReadFile(targetFile)
+	if err != nil {
+		t.Fatalf("target file was removed by refused import: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Errorf("target file mutated by refused import: %q", got)
+	}
+}
+
+func TestImportActiveLeaseRefusalLeavesNoLock(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	s.Close()
+	archive := filepath.Join(t.TempDir(), "backup.tgz")
+	if err := Export(ctx, sourceDir, archive); err != nil {
+		t.Fatal(err)
+	}
+
+	targetDir := t.TempDir()
+	target := buildPopulatedDir(t, targetDir)
+	now := time.Now().UnixMilli()
+	if _, err := target.db.Exec(
+		`INSERT INTO controller_lease (store_id, owner_id, mode, heartbeat_at, lease_expires_at)
+VALUES ('default', 'controller-1', 'run', ?, ?)`, now, now+60000); err != nil {
+		t.Fatal(err)
+	}
+	target.Close()
+	if err := os.Remove(filepath.Join(targetDir, dirLockName)); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Import(ctx, archive, targetDir)
+	if !IsCode(err, CodeStoreBusy) {
+		t.Fatalf("error = %v, want STORE_BUSY", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(targetDir, dirLockName)); !os.IsNotExist(statErr) {
+		t.Errorf("active-lease refusal must not leave a lock file behind (stat err = %v)", statErr)
+	}
+}
+
+func TestExportMigratesOlderStore(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	if _, err := s.db.Exec("PRAGMA user_version = 1"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	archive := filepath.Join(t.TempDir(), "older.tgz")
+	if err := Export(ctx, sourceDir, archive); err != nil {
+		t.Fatalf("export of older store must migrate and succeed: %v", err)
+	}
+
+	members, err := readArchiveMembers(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest exportManifest
+	if err := json.Unmarshal(members[manifestMember], &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest.SchemaVersion != storeSchemaVersion {
+		t.Fatalf("manifest schema version = %d, want %d", manifest.SchemaVersion, storeSchemaVersion)
+	}
+
+	target := filepath.Join(t.TempDir(), "restored")
+	if err := Import(ctx, archive, target); err != nil {
+		t.Fatalf("archive exported from migrated older store must import: %v", err)
+	}
+}
+
 func TestImportRefusesActiveLease(t *testing.T) {
 	ctx := context.Background()
 	sourceDir := t.TempDir()
@@ -610,7 +703,7 @@ func TestExportWaitsForDataDirLock(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(sourceDir, "artifacts", "aa"), []byte("mutated after lock"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := release(); err != nil {
+	if err := release.release(); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -751,7 +844,7 @@ func TestDataDirLockMutualExclusion(t *testing.T) {
 		t.Fatal("second lock holder entered while the first still holds the lock")
 	case <-time.After(100 * time.Millisecond):
 	}
-	if err := release(); err != nil {
+	if err := release.release(); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -794,7 +887,7 @@ func TestImportWaitsForDataDirLock(t *testing.T) {
 		t.Fatalf("import completed while the data dir lock was held: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
-	if err := release(); err != nil {
+	if err := release.release(); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -1037,7 +1130,7 @@ func TestAppendWaitsForImport(t *testing.T) {
 		t.Fatalf("append resolved while import held the exclusive lock: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
-	if err := release(); err != nil {
+	if err := release.release(); err != nil {
 		t.Fatal(err)
 	}
 	select {

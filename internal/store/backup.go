@@ -224,6 +224,18 @@ func Export(ctx context.Context, dataDir, output string) error {
 			return storeErr(CodeGraphInvalid, "source store schema version %d is newer than supported %d",
 				version, storeSchemaVersion)
 		}
+		if version < storeSchemaVersion {
+			if err := migrateUnderLock(ctx, db, dbPath); err != nil {
+				return err
+			}
+			if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+				return storeErr(CodeGraphInvalid, "source store unreadable after migration: %v", err)
+			}
+			if version != storeSchemaVersion {
+				return storeErr(CodeGraphInvalid,
+					"source store still at schema version %d after migration; refusing to export", version)
+			}
+		}
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -345,28 +357,65 @@ func targetHasActiveLease(dbPath string, now int64) (bool, error) {
 
 const dirLockName = "proceed.lock"
 
-func acquireDirLock(dataDir string) (release func() error, err error) {
+type dirLock struct {
+	f       *os.File
+	created bool
+}
+
+func (l *dirLock) release() error {
+	if l == nil || l.f == nil {
+		return nil
+	}
+	err := l.f.Close()
+	l.f = nil
+	return err
+}
+
+func acquireDirLock(dataDir string) (*dirLock, error) {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(filepath.Join(dataDir, dirLockName), os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return nil, err
+	lockPath := filepath.Join(dataDir, dirLockName)
+	for attempt := 0; attempt < 8; attempt++ {
+		created := false
+		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
+		if err == nil {
+			created = true
+		} else if os.IsExist(err) {
+			f, err = os.OpenFile(lockPath, os.O_RDWR, 0o644)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+			f.Close()
+			return nil, err
+		}
+		var live os.FileInfo
+		live, err = os.Stat(lockPath)
+		held, statErr := f.Stat()
+		if err != nil || statErr != nil || !os.SameFile(live, held) {
+			f.Close()
+			continue
+		}
+		return &dirLock{f: f, created: created}, nil
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		f.Close()
-		return nil, err
-	}
-	return f.Close, nil
+	return nil, storeErr(CodeGraphInvalid, "could not acquire a stable data dir lock in %s", dataDir)
 }
 
 func withDataDirLock(dataDir string, fn func() error) error {
-	release, err := acquireDirLock(dataDir)
+	lock, err := acquireDirLock(dataDir)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = release() }()
-	return fn()
+	fnErr := fn()
+	if fnErr != nil && lock.created {
+		os.Remove(filepath.Join(dataDir, dirLockName))
+	}
+	if relErr := lock.release(); relErr != nil && fnErr == nil {
+		return relErr
+	}
+	return fnErr
 }
 
 func validArtifactPath(p string) bool {
@@ -406,6 +455,9 @@ func Import(ctx context.Context, archive, dataDir string) error {
 		}
 	}
 
+	if info, err := os.Stat(dataDir); err == nil && !info.IsDir() {
+		return storeErr(CodeGraphInvalid, "target path %s exists and is not a directory", dataDir)
+	}
 	freshTarget := !dirExists(dataDir)
 	err = withDataDirLock(dataDir, func() error {
 		dbPath := filepath.Join(dataDir, dbMember)
