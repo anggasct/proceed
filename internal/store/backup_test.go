@@ -903,3 +903,60 @@ func TestAppendWaitsForImport(t *testing.T) {
 		t.Fatal("append never completed after the exclusive lock was released")
 	}
 }
+
+func TestImportRejectsReservedArtifactNames(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	archive := filepath.Join(t.TempDir(), "backup.tgz")
+	s.Close()
+	if err := Export(ctx, sourceDir, archive); err != nil {
+		t.Fatal(err)
+	}
+
+	targetDir := t.TempDir()
+	target := buildPopulatedDir(t, targetDir)
+	before, err := target.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.Close()
+
+	members, err := readArchiveMembers(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest exportManifest
+	if err := json.Unmarshal(members[manifestMember], &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.Artifacts = append(manifest.Artifacts, archiveEntry{
+		Path:      "proceed.db",
+		SHA256:    sha256Hex(members[manifest.DB.Path]),
+		SizeBytes: int64(len(members[manifest.DB.Path])),
+	})
+	encoded, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members[manifestMember] = encoded
+	crafted := filepath.Join(t.TempDir(), "reserved.tgz")
+	writeTestArchive(t, crafted, members)
+
+	err = Import(ctx, crafted, targetDir)
+	if !IsCode(err, CodeGraphInvalid) {
+		t.Fatalf("error = %v, want GRAPH_INVALID", err)
+	}
+	survivor, err := Open(filepath.Join(targetDir, "proceed.db"))
+	if err != nil {
+		t.Fatalf("target store damaged by refused import: %v", err)
+	}
+	defer survivor.Close()
+	digest, err := survivor.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest != before {
+		t.Error("target store content changed by refused import")
+	}
+}

@@ -591,7 +591,16 @@ func formatValue(v any) string {
 }
 
 func (s *Store) ProjectionDigest(ctx context.Context) (string, error) {
-	return projectionDigestTx(ctx, s.db)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+	digest, err := projectionDigestTx(ctx, tx)
+	if err != nil {
+		return "", err
+	}
+	return digest, nil
 }
 
 func (s *Store) RebuildProjections(ctx context.Context) (RebuildReport, error) {

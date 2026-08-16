@@ -46,6 +46,13 @@ func Open(path string) (*Store, error) {
 	}
 	if current < storeSchemaVersion {
 		if err := withDataDirLock(filepath.Dir(path), func() error {
+			var locked int
+			if err := db.QueryRow("PRAGMA user_version").Scan(&locked); err != nil {
+				return err
+			}
+			if locked >= storeSchemaVersion {
+				return nil
+			}
 			backupPath := migrationBackupPath(path)
 			if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
 				return err

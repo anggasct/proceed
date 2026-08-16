@@ -362,10 +362,17 @@ func Import(ctx context.Context, archive, dataDir string) error {
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		return storeErr(CodeGraphInvalid, "corrupt archive: bad manifest: %v", err)
 	}
+	reservedArtifactNames := map[string]bool{
+		dbMember: true, manifestMember: true, dirLockName: true,
+	}
 	if err := verifyMember(members, manifest.DB, "store"); err != nil {
 		return err
 	}
 	for _, a := range manifest.Artifacts {
+		if reservedArtifactNames[a.Path] {
+			return storeErr(CodeGraphInvalid,
+				"corrupt archive: artifact %q uses a reserved name", a.Path)
+		}
 		if err := verifyMember(members, a, "artifact"); err != nil {
 			return err
 		}

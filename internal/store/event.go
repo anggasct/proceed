@@ -134,7 +134,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ev.ActorType, ev.ActorID, nullable(ev.CausationID), nullable(ev.CorrelationID),
 		nullable(ev.IdempotencyKey), ev.PayloadDigest, ev.Payload); err != nil {
 		if strings.Contains(err.Error(), "FOREIGN KEY constraint failed") {
-			return storeErr(CodeGraphInvalid, "run %s does not exist", ev.RunID)
+			return storeErr(CodeGraphInvalid,
+				"run %s does not exist or causation event %s does not exist", ev.RunID, ev.CausationID)
 		}
 		return err
 	}

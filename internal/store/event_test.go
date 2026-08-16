@@ -415,3 +415,74 @@ func TestOpenRejectsNewerSchema(t *testing.T) {
 		t.Fatalf("newer schema error = %v, want GRAPH_INVALID", err)
 	}
 }
+
+func TestConcurrentOpenMigratesOnce(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/proceed.db"
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := readFixture(t, "../../internal/compiler/testdata/customer-research.yaml")
+	doc := compileFixture(t, src)
+	frozen, err := s.FreezeDefinition(context.Background(), "a.yaml", src, doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateRun(context.Background(), frozen.GraphVersionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("PRAGMA user_version = 1"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	const openers = 8
+	errs := make(chan error, openers)
+	for i := 0; i < openers; i++ {
+		go func() {
+			st, err := Open(path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			errs <- st.Close()
+		}()
+	}
+	for i := 0; i < openers; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent open failed: %v", err)
+		}
+	}
+
+	backup := migrationBackupPath(path)
+	bk, err := sql.Open("sqlite", "file:"+backup+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bk.Close()
+	var bv int
+	if err := bk.QueryRow("PRAGMA user_version").Scan(&bv); err != nil {
+		t.Fatal(err)
+	}
+	if bv != 1 {
+		t.Errorf("pre-migration backup user_version = %d, want 1 (backup must capture pre-migration state)", bv)
+	}
+
+	final, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer final.Close()
+	var v int
+	var runs int
+	if err := final.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	if err := final.db.QueryRow("SELECT COUNT(*) FROM graph_run").Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if v != storeSchemaVersion || runs != 1 {
+		t.Errorf("final store = v%d runs=%d, want v%d runs=1", v, runs, storeSchemaVersion)
+	}
+}
