@@ -562,7 +562,51 @@ func verifyStagedProjections(ctx context.Context, staging string) error {
 	return verifyErr
 }
 
+func rejectSymlinkedComponents(dataDir string, manifest *exportManifest) error {
+	paths := []string{filepath.Join(dataDir, dbMember)}
+	for _, a := range manifest.Artifacts {
+		paths = append(paths, filepath.Join(dataDir, filepath.FromSlash(a.Path)))
+	}
+	for _, p := range paths {
+		if err := rejectSymlinkedPath(dataDir, p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func rejectSymlinkedPath(root, full string) error {
+	rel, err := filepath.Rel(root, full)
+	if err != nil {
+		return err
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	current := root
+	for i := 0; i < len(parts)-1; i++ {
+		current = filepath.Join(current, parts[i])
+		info, err := os.Lstat(current)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return storeErr(CodeGraphInvalid,
+				"target path %q contains a symlink (%s); refusing to restore through symlinks", rel, parts[i])
+		}
+		if !info.IsDir() {
+			return storeErr(CodeGraphInvalid,
+				"target path %q traverses non-directory %s", rel, parts[i])
+		}
+	}
+	return nil
+}
+
 func commitRestore(staging, dataDir, dbPath string, manifest *exportManifest) error {
+	if err := rejectSymlinkedComponents(dataDir, manifest); err != nil {
+		return err
+	}
 	busy, err := targetHasActiveLease(dbPath, time.Now().UnixMilli())
 	if err != nil {
 		return err

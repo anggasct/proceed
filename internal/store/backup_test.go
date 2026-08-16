@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -468,6 +469,100 @@ func recraftArchiveWithGarbageDB(t *testing.T, archive, outPath string) {
 	}
 	members[manifestMember] = encoded
 	writeTestArchive(t, outPath, members)
+}
+
+func TestImportRejectsSymlinkedTargetParent(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	s.Close()
+	archive := filepath.Join(t.TempDir(), "backup.tgz")
+	if err := Export(ctx, sourceDir, archive); err != nil {
+		t.Fatal(err)
+	}
+
+	outside := t.TempDir()
+	targetDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(targetDir, "artifacts-parent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(targetDir, "artifacts")); err != nil {
+		t.Fatal(err)
+	}
+
+	before, err := snapshotDirExcluding(targetDir, dirLockName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outsideBefore, err := snapshotDir(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = Import(ctx, archive, targetDir)
+	if !IsCode(err, CodeGraphInvalid) {
+		t.Fatalf("error = %v, want GRAPH_INVALID", err)
+	}
+	after, err := snapshotDirExcluding(targetDir, dirLockName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Error("target state changed by refused symlinked import")
+	}
+	outsideAfter, err := snapshotDir(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outsideAfter != outsideBefore {
+		t.Error("import wrote outside dataDir through the symlink")
+	}
+}
+
+func snapshotDirExcluding(dir, skip string) (string, error) {
+	var names []string
+	err := filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+		if rel == skip || strings.HasPrefix(rel, skip+string(filepath.Separator)) {
+			if info.IsDir() && rel != skip {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		names = append(names, rel)
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	sort.Strings(names)
+	return strings.Join(names, "\n"), nil
+}
+
+func snapshotDir(dir string) (string, error) {
+	var names []string
+	err := filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+		names = append(names, rel)
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	sort.Strings(names)
+	return strings.Join(names, "\n"), nil
 }
 
 func TestExportRefusesDivergentSource(t *testing.T) {
