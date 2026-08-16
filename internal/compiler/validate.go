@@ -187,17 +187,17 @@ func (v *validator) executorFields(e *Executor, path string) {
 }
 
 func (v *validator) capabilityFields(c *Capability, path string) {
-	if c.Filesystem != "" && !filesystemSet[c.Filesystem] {
+	if c.HasFilesystem && !filesystemSet[c.Filesystem] {
 		v.errf(RuleParse, joinPath(path, "filesystem"),
 			"filesystem must be one of none, workspace-read, workspace-write, declared-paths")
 	}
-	if c.Process != "" && !processSet[c.Process] {
+	if c.HasProcess && !processSet[c.Process] {
 		v.errf(RuleParse, joinPath(path, "process"), "process must be one of none, declared-command")
 	}
-	if c.Human != "" && !humanSet[c.Human] {
+	if c.HasHuman && !humanSet[c.Human] {
 		v.errf(RuleParse, joinPath(path, "human"), "human must be one of none, approval-scope")
 	}
-	if c.SecretsLiteral != "" && c.SecretsLiteral != "none" {
+	if c.SecretsScalar && c.SecretsLiteral != "none" {
 		v.errf(RuleParse, joinPath(path, "secrets"), "secrets must be none or a list of named references")
 	}
 	for i, name := range c.Secrets {

@@ -55,11 +55,15 @@ type Executor struct {
 
 type Capability struct {
 	Filesystem     string
+	HasFilesystem  bool
 	Network        *Network
 	Process        string
+	HasProcess     bool
+	SecretsScalar  bool
 	SecretsLiteral string
 	Secrets        []string
 	Human          string
+	HasHuman       bool
 	Extras         map[string]yaml.Node
 }
 
@@ -341,7 +345,7 @@ func (p *parser) executor(n *yaml.Node, path string) *Executor {
 	case kindNode == nil:
 		p.errf(RuleUnknownField, joinPath(path, "kind"), `missing required field "kind"`)
 		return e
-	case kindNode.Kind != yaml.ScalarNode || kindNode.Tag == "!!null":
+	case kindNode.Kind != yaml.ScalarNode || kindNode.Tag != "!!str":
 		p.errf(RuleParse, joinPath(path, "kind"), "expected string")
 		return e
 	}
@@ -390,7 +394,7 @@ func (p *parser) executor(n *yaml.Node, path string) *Executor {
 }
 
 func (p *parser) command(n *yaml.Node, path string) []string {
-	if n.Kind == yaml.ScalarNode && n.Tag != "!!null" {
+	if n.Kind == yaml.ScalarNode && n.Tag == "!!str" {
 		return []string{n.Value}
 	}
 	return p.strings(n, path)
@@ -402,8 +406,12 @@ func (p *parser) headers(n *yaml.Node, path string) map[string]string {
 	}
 	out := make(map[string]string, len(n.Content)/2)
 	for i := 0; i+1 < len(n.Content); i += 2 {
-		key := n.Content[i].Value
-		out[key] = p.str(n.Content[i+1], joinPath(path, key))
+		key := n.Content[i]
+		if key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
+			p.errf(RuleParse, path, "header names must be strings")
+			continue
+		}
+		out[key.Value] = p.str(n.Content[i+1], joinPath(path, key.Value))
 	}
 	return out
 }
@@ -422,18 +430,22 @@ func (p *parser) capability(n *yaml.Node, path string) *Capability {
 		switch f.name {
 		case "filesystem":
 			c.Filesystem = p.str(f.value, loc)
+			c.HasFilesystem = true
 		case "network":
 			c.Network = p.network(f.value, loc)
 		case "process":
 			c.Process = p.str(f.value, loc)
+			c.HasProcess = true
 		case "secrets":
-			if f.value.Kind == yaml.ScalarNode && f.value.Tag != "!!null" {
+			if f.value.Kind == yaml.ScalarNode && f.value.Tag == "!!str" {
+				c.SecretsScalar = true
 				c.SecretsLiteral = f.value.Value
 			} else {
 				c.Secrets = p.strings(f.value, loc)
 			}
 		case "human":
 			c.Human = p.str(f.value, loc)
+			c.HasHuman = true
 		}
 	}
 	return c
@@ -523,7 +535,7 @@ func (p *parser) sequence(n *yaml.Node, path string) []*yaml.Node {
 }
 
 func (p *parser) str(n *yaml.Node, path string) string {
-	if n.Kind != yaml.ScalarNode || n.Tag == "!!null" {
+	if n.Kind != yaml.ScalarNode || n.Tag != "!!str" {
 		p.errf(RuleParse, path, "expected string")
 		return ""
 	}
@@ -531,7 +543,7 @@ func (p *parser) str(n *yaml.Node, path string) string {
 }
 
 func (p *parser) strPresent(n *yaml.Node, path string) (string, bool) {
-	if n.Kind != yaml.ScalarNode || n.Tag == "!!null" {
+	if n.Kind != yaml.ScalarNode || n.Tag != "!!str" {
 		p.errf(RuleParse, path, "expected string")
 		return "", false
 	}
