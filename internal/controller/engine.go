@@ -2,7 +2,9 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -219,6 +221,14 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 	leaseToken := ulid.Make().String()
 	leaseExpiry := time.Now().Add(c.cfg.LeaseTTL).UnixMilli()
 
+	claimed, err := c.claimNode(ctx, runID, n.NodeKey)
+	if err != nil {
+		return err
+	}
+	if !claimed {
+		return nil
+	}
+
 	if err := c.beginAttempt(ctx, runID, n, kind, contract, opKey, leaseToken, leaseExpiry); err != nil {
 		return err
 	}
@@ -316,6 +326,64 @@ func (c *Controller) nodeCancelled(ctx context.Context, runID, nodeKey string) b
 		return false
 	}
 	return count > 0
+}
+
+func (c *Controller) claimNode(ctx context.Context, runID, nodeKey string) (bool, error) {
+	err := c.store.WithTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+UPDATE run_node SET status = 'leased'
+WHERE run_id = ? AND node_key = ? AND status IN ('eligible', 'running')`,
+			runID, nodeKey)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			return nil
+		}
+		var exists int
+		if err := tx.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM run_node WHERE run_id = ? AND node_key = ?", runID, nodeKey).
+			Scan(&exists); err != nil {
+			return err
+		}
+		if exists > 0 {
+			return errNodeAlreadyClaimed
+		}
+		res, err = tx.ExecContext(ctx, `
+INSERT INTO run_node (id, run_id, node_key, status, attempt_count)
+VALUES (?, ?, ?, 'leased', 0)
+ON CONFLICT(run_id, node_key) DO NOTHING`,
+			derivedNodeID(runID, nodeKey), runID, nodeKey)
+		if err != nil {
+			return err
+		}
+		m, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if m == 0 {
+			return errNodeAlreadyClaimed
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, errNodeAlreadyClaimed) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+var errNodeAlreadyClaimed = errors.New("node already claimed by another execution")
+
+func derivedNodeID(runID, nodeKey string) string {
+	h := sha256.Sum256([]byte(runID + "\x00" + nodeKey))
+	return hex.EncodeToString(h[:])[:26]
 }
 
 func (c *Controller) beginAttempt(ctx context.Context, runID string, n runnableNode, kind executor.Kind, contract executor.Contract, opKey, leaseToken string, leaseExpiry int64) error {

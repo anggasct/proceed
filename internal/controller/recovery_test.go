@@ -166,7 +166,12 @@ edges: []
 			return nil, executor.ErrUncertain
 		}),
 	}
-	c := newController(t, st, crashPool)
+	cfg := DefaultConfig()
+	cfg.LeaseTTL = 40 * time.Millisecond
+	c, err := New(st, cfg, crashPool)
+	if err != nil {
+		t.Fatal(err)
+	}
 	runID, err := c.Run(ctx, RunInput{GraphVersionID: frozen.GraphVersionID})
 	if err != nil {
 		t.Fatal(err)
@@ -175,13 +180,9 @@ edges: []
 		t.Fatal(err)
 	}
 	c.releaseLease(ctx)
+	time.Sleep(60 * time.Millisecond)
 	if nodeStatus(t, st, runID, "work") != "uncertain" {
 		t.Fatalf("node = %q, want uncertain after crash", nodeStatus(t, st, runID, "work"))
-	}
-	if _, err := st.DB().ExecContext(ctx, `
-UPDATE node_attempt SET lease_expires_at = 1
-WHERE run_node_id = (SELECT id FROM run_node WHERE run_id = ? AND node_key = 'work')`, runID); err != nil {
-		t.Fatal(err)
 	}
 
 	recovered := recoverController(t, st, map[executor.Kind]executor.Executor{

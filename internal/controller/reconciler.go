@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"database/sql"
+	"sync"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -25,10 +26,30 @@ func (c *Controller) Step(ctx context.Context, runID string) (bool, error) {
 	if len(nodes) == 0 {
 		return false, c.tryCompleteRun(ctx, runID, run.graphVersionID)
 	}
+	sem := make(chan struct{}, c.cfg.MaxConcurrent)
+	var wg sync.WaitGroup
+	var firstErr error
+	var errMu sync.Mutex
 	for _, n := range nodes {
-		if err := c.executeNode(ctx, runID, run.graphVersionID, run.digest, n); err != nil {
-			return false, err
-		}
+		n := n
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			err := c.executeNode(ctx, runID, run.graphVersionID, run.digest, n)
+			if err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return false, firstErr
 	}
 	return true, nil
 }

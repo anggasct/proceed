@@ -105,6 +105,28 @@ FROM run_node WHERE run_id = ?`, runID)
 				return err
 			}
 		}
+
+		var active int
+		if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM run_node WHERE run_id = ?
+  AND status IN ('pending','eligible','leased','running','uncertain','waiting','reconciling','cancel_requested')`,
+			runID).Scan(&active); err != nil {
+			return err
+		}
+		if active == 0 {
+			if _, err := c.appendWithin(ctx, tx, &store.Event{
+				EventID:       ulid.Make().String(),
+				RunID:         runID,
+				SchemaVersion: "proceed/v1",
+				Type:          "run_cancelled",
+				OccurredAt:    nowMs,
+				ActorType:     "controller",
+				ActorID:       c.cfg.OwnerID,
+				Payload:       payloadJSON(map[string]any{}),
+			}); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 }

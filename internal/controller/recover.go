@@ -83,6 +83,15 @@ func (c *Controller) reconcileNode(ctx context.Context, runID, nodeKey string) e
 	if err != nil {
 		return err
 	}
+	var opKey string
+	var attemptNo int64
+	if err := c.store.DB().QueryRowContext(ctx, `
+SELECT na.operation_key, na.attempt_no FROM node_attempt na
+JOIN run_node rn ON rn.id = na.run_node_id
+WHERE rn.run_id = ? AND rn.node_key = ?
+ORDER BY na.attempt_no DESC LIMIT 1`, runID, nodeKey).Scan(&opKey, &attemptNo); err != nil {
+		return err
+	}
 	kind, _, err := c.contractFor(nodeConfigForKey(c, ctx, runID, run.graphVersionID, nodeKey))
 	if err != nil {
 		return err
@@ -96,9 +105,12 @@ func (c *Controller) reconcileNode(ctx context.Context, runID, nodeKey string) e
 		return c.waitingNode(ctx, runID, nodeKey)
 	}
 	req := &executor.Request{
-		RunID:          runID,
-		GraphVersionID: run.graphVersionID,
-		NodeKey:        nodeKey,
+		RunID:            runID,
+		GraphVersionID:   run.graphVersionID,
+		DefinitionDigest: run.digest,
+		NodeKey:          nodeKey,
+		AttemptNo:        attemptNo,
+		OperationKey:     opKey,
 	}
 	state, rerr := recon.Reconcile(ctx, req)
 	if rerr != nil || state == executor.EffectUnknown {
@@ -107,10 +119,11 @@ func (c *Controller) reconcileNode(ctx context.Context, runID, nodeKey string) e
 	if state == executor.EffectConfirmed {
 		return c.appendEvent(ctx, runID, "node_finished", map[string]any{
 			"node_key":   nodeKey,
+			"attempt_no": attemptNo,
 			"reconciled": true,
 		})
 	}
-	return c.requeuedNode(ctx, runID, nodeKey, 0)
+	return c.requeuedNode(ctx, runID, nodeKey, attemptNo)
 }
 
 func nodeConfigForKey(c *Controller, ctx context.Context, runID, graphVersionID, nodeKey string) string {

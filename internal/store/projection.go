@@ -262,7 +262,7 @@ ON CONFLICT(run_id, node_key) DO UPDATE SET
   status = 'running',
   attempt_count = MAX(run_node.attempt_count, excluded.attempt_count),
   started_at = COALESCE(run_node.started_at, excluded.started_at)`,
-		ev.EventID, ev.RunID, p.NodeKey, attemptNo, ev.OccurredAt); err != nil {
+		derivedNodeID(ev.RunID, p.NodeKey), ev.RunID, p.NodeKey, attemptNo, ev.OccurredAt); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
