@@ -34,27 +34,64 @@ func (c *Controller) Step(ctx context.Context, runID string) (bool, error) {
 }
 
 func (c *Controller) Drain(ctx context.Context, runID string) error {
-	for {
-		if err := c.heartbeat(ctx); err != nil {
+	hbCtx, stopHB := context.WithCancel(context.Background())
+	defer stopHB()
+	hbErr := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(c.cfg.HeartbeatPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-hbCtx.Done():
+				return
+			case <-ticker.C:
+				if err := c.heartbeat(hbCtx); err != nil {
+					hbErr <- err
+					return
+				}
+			}
+		}
+	}()
+
+	settle := func(err error) error {
+		stopHB()
+		if err != nil {
+			c.releaseLease(context.Background())
 			return err
+		}
+		status := runStatusOf(c, context.Background(), runID)
+		if status != "running" {
+			c.releaseLease(context.Background())
+		}
+		return nil
+	}
+
+	for {
+		select {
+		case err := <-hbErr:
+			return settle(err)
+		default:
+		}
+		if err := c.heartbeat(ctx); err != nil {
+			return settle(err)
 		}
 		progressed, err := c.Step(ctx, runID)
 		if err != nil {
-			return err
+			return settle(err)
 		}
 		if !progressed {
-			return nil
-		}
-		check := c.store.DB().QueryRowContext(ctx,
-			"SELECT status FROM graph_run WHERE id = ?", runID)
-		var status string
-		if err := check.Scan(&status); err != nil {
-			return err
-		}
-		if status != "running" {
-			return nil
+			return settle(nil)
 		}
 	}
+}
+
+func runStatusOf(c *Controller, ctx context.Context, runID string) string {
+	var status string
+	if err := c.store.DB().QueryRowContext(ctx,
+		"SELECT status FROM graph_run WHERE id = ?", runID).Scan(&status); err != nil {
+		return ""
+	}
+	return status
 }
 
 type runInfo struct {
@@ -75,52 +112,31 @@ func (c *Controller) loadRun(ctx context.Context, runID string) (runInfo, error)
 }
 
 func (c *Controller) tryCompleteRun(ctx context.Context, runID, graphVersionID string) error {
-	var counts struct {
-		pending     int
-		eligible    int
-		leased      int
-		running     int
-		uncertain   int
-		waiting     int
-		cancelReq   int
-		reconciling int
-		succeeded   int
-		failed      int
-		cancelled   int
-		skipped     int
-	}
 	row := c.store.DB().QueryRowContext(ctx, `
 SELECT
-  COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0),
-  COALESCE(SUM(CASE WHEN status = 'eligible' THEN 1 ELSE 0 END), 0),
-  COALESCE(SUM(CASE WHEN status = 'leased' THEN 1 ELSE 0 END), 0),
-  COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0),
-  COALESCE(SUM(CASE WHEN status = 'uncertain' THEN 1 ELSE 0 END), 0),
-  COALESCE(SUM(CASE WHEN status = 'waiting' THEN 1 ELSE 0 END), 0),
-  COALESCE(SUM(CASE WHEN status = 'cancel_requested' THEN 1 ELSE 0 END), 0),
-  COALESCE(SUM(CASE WHEN status = 'reconciling' THEN 1 ELSE 0 END), 0),
-  COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN status IN ('pending','eligible','leased','running','uncertain','waiting','reconciling','cancel_requested') THEN 1 ELSE 0 END), 0),
   COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0),
   COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0),
-  COALESCE(SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END), 0)
-FROM run_node WHERE run_id = ?`, runID)
-	if err := row.Scan(&counts.pending, &counts.eligible, &counts.leased, &counts.running,
-		&counts.uncertain, &counts.waiting, &counts.cancelReq, &counts.reconciling,
-		&counts.succeeded, &counts.failed, &counts.cancelled, &counts.skipped); err != nil {
+  COALESCE(SUM(CASE WHEN status IN ('succeeded','skipped') THEN 1 ELSE 0 END), 0),
+  (SELECT COUNT(*) FROM graph_node WHERE graph_version_id = ?)
+FROM run_node WHERE run_id = ?`, graphVersionID, runID)
+	var active, failed, cancelled, done, defTotal int
+	if err := row.Scan(&active, &failed, &cancelled, &done, &defTotal); err != nil {
 		return err
 	}
 
 	var terminalEvent string
 	switch {
-	case counts.failed > 0:
+	case failed > 0:
 		terminalEvent = "run_failed"
-	case counts.cancelled > 0 || counts.cancelReq > 0:
-		terminalEvent = "run_cancelled"
-	case counts.uncertain > 0 || counts.waiting > 0 || counts.reconciling > 0 ||
-		counts.pending > 0 || counts.eligible > 0 || counts.leased > 0 || counts.running > 0:
+	case active > 0:
 		return nil
-	default:
+	case cancelled > 0:
+		terminalEvent = "run_cancelled"
+	case done == defTotal && defTotal > 0:
 		terminalEvent = "run_completed"
+	default:
+		return nil
 	}
 
 	nowMs := time.Now().UnixMilli()
@@ -131,7 +147,6 @@ FROM run_node WHERE run_id = ?`, runID)
 			SchemaVersion: "proceed/v1",
 			Type:          terminalEvent,
 			OccurredAt:    nowMs,
-			RecordedAt:    nowMs,
 			ActorType:     "controller",
 			ActorID:       c.cfg.OwnerID,
 			Payload:       payloadJSON(map[string]any{}),

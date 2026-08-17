@@ -178,6 +178,11 @@ edges: []
 	if nodeStatus(t, st, runID, "work") != "uncertain" {
 		t.Fatalf("node = %q, want uncertain after crash", nodeStatus(t, st, runID, "work"))
 	}
+	if _, err := st.DB().ExecContext(ctx, `
+UPDATE node_attempt SET lease_expires_at = 1
+WHERE run_node_id = (SELECT id FROM run_node WHERE run_id = ? AND node_key = 'work')`, runID); err != nil {
+		t.Fatal(err)
+	}
 
 	recovered := recoverController(t, st, map[executor.Kind]executor.Executor{
 		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {

@@ -3,36 +3,40 @@ package controller
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"time"
 
 	"proceed/internal/executor"
-	"proceed/internal/store"
 )
 
+func (c *Controller) contractFor(config string) (executor.Kind, executor.Contract, error) {
+	_, kind, contract, err := c.parseNodeConfig(config)
+	return kind, contract, err
+}
+
 func (c *Controller) Recover(ctx context.Context, runID string) error {
-	run, err := c.loadRun(ctx, runID)
-	if err != nil {
-		return err
-	}
+	nowMs := time.Now().UnixMilli()
 	rows, err := c.store.DB().QueryContext(ctx, `
-SELECT rn.node_key, rn.attempt_count + 1, gn.config
+SELECT rn.node_key, rn.status, gn.config,
+       (SELECT na.lease_expires_at FROM node_attempt na
+         WHERE na.run_node_id = rn.id ORDER BY na.attempt_no DESC LIMIT 1)
 FROM run_node rn
-JOIN graph_node gn ON gn.node_key = rn.node_key AND gn.graph_version_id = ?
-WHERE rn.run_id = ? AND rn.status IN ('uncertain', 'leased', 'running')`,
-		run.graphVersionID, runID)
+JOIN graph_node gn ON gn.node_key = rn.node_key AND gn.graph_version_id = (
+  SELECT graph_version_id FROM graph_run WHERE id = ?
+)
+WHERE rn.run_id = ? AND rn.status IN ('uncertain', 'leased', 'running')`, runID, runID)
 	if err != nil {
 		return err
 	}
-	type uncertain struct {
-		key     string
-		attempt int64
-		config  string
+	type candidate struct {
+		key    string
+		config string
+		expiry sql.NullInt64
 	}
-	var list []uncertain
+	var list []candidate
 	for rows.Next() {
-		var u uncertain
-		if err := rows.Scan(&u.key, &u.attempt, &u.config); err != nil {
+		var u candidate
+		var status string
+		if err := rows.Scan(&u.key, &status, &u.config, &u.expiry); err != nil {
 			rows.Close()
 			return err
 		}
@@ -44,105 +48,77 @@ WHERE rn.run_id = ? AND rn.status IN ('uncertain', 'leased', 'running')`,
 	}
 
 	for _, u := range list {
-		if err := c.recoverNode(ctx, runID, run.graphVersionID, run.digest, u.key, u.attempt, u.config); err != nil {
+		if u.expiry.Valid && u.expiry.Int64 > nowMs {
+			continue
+		}
+		if err := c.recoverNode(ctx, runID, u.key, u.config); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *Controller) recoverNode(ctx context.Context, runID, graphVersionID, digest, nodeKey string, nextAttempt int64, config string) error {
+func (c *Controller) recoverNode(ctx context.Context, runID, nodeKey, config string) error {
 	_, contract, err := c.contractFor(config)
 	if err != nil {
 		return err
 	}
 	switch contract {
 	case executor.Pure, executor.Idempotent:
-		_, err := c.store.DB().ExecContext(ctx,
-			"UPDATE run_node SET status = 'eligible' WHERE run_id = ? AND node_key = ?", runID, nodeKey)
-		return err
+		return c.requeuedNode(ctx, runID, nodeKey, 0)
 	case executor.Reconcilable:
-		return c.reconcileNode(ctx, runID, graphVersionID, digest, nodeKey, nextAttempt, config)
+		return c.reconcileNode(ctx, runID, nodeKey)
 	default:
-		_, err := c.store.DB().ExecContext(ctx, `
-UPDATE run_node SET status = 'waiting' WHERE run_id = ? AND node_key = ? AND status = 'uncertain'`,
-			runID, nodeKey)
-		return err
+		return c.waitingNode(ctx, runID, nodeKey)
 	}
 }
 
-func (c *Controller) reconcileNode(ctx context.Context, runID, graphVersionID, digest, nodeKey string, nextAttempt int64, config string) error {
-	kind, _, err := c.contractFor(config)
+func (c *Controller) reconcileNode(ctx context.Context, runID, nodeKey string) error {
+	if err := c.appendEvent(ctx, runID, "node_reconciling", map[string]any{
+		"node_key": nodeKey,
+	}); err != nil {
+		return err
+	}
+	run, err := c.loadRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	kind, _, err := c.contractFor(nodeConfigForKey(c, ctx, runID, run.graphVersionID, nodeKey))
 	if err != nil {
 		return err
 	}
 	ex, ok := c.pool[kind]
 	if !ok {
-		return c.escalateNode(ctx, runID, nodeKey, "no executor for reconcile")
+		return c.waitingNode(ctx, runID, nodeKey)
 	}
 	recon, ok := ex.(executor.Reconciler)
 	if !ok {
-		return c.escalateNode(ctx, runID, nodeKey, "executor does not support reconcile")
-	}
-	_, err = c.store.DB().ExecContext(ctx,
-		"UPDATE run_node SET status = 'reconciling' WHERE run_id = ? AND node_key = ?", runID, nodeKey)
-	if err != nil {
-		return err
+		return c.waitingNode(ctx, runID, nodeKey)
 	}
 	req := &executor.Request{
-		RunID:            runID,
-		GraphVersionID:   graphVersionID,
-		DefinitionDigest: digest,
-		NodeKey:          nodeKey,
-		AttemptNo:        nextAttempt,
-		OperationKey:     OperationKey(runID, digest, nodeKey, nextAttempt-1),
+		RunID:          runID,
+		GraphVersionID: run.graphVersionID,
+		NodeKey:        nodeKey,
 	}
 	state, rerr := recon.Reconcile(ctx, req)
 	if rerr != nil || state == executor.EffectUnknown {
-		return c.escalateNode(ctx, runID, nodeKey, "reconcile returned unknown")
+		return c.waitingNode(ctx, runID, nodeKey)
 	}
 	if state == executor.EffectConfirmed {
-		return c.completeFromReconcile(ctx, runID, graphVersionID, nodeKey, nextAttempt-1)
+		return c.appendEvent(ctx, runID, "node_finished", map[string]any{
+			"node_key":   nodeKey,
+			"reconciled": true,
+		})
 	}
-	_, err = c.store.DB().ExecContext(ctx,
-		"UPDATE run_node SET status = 'eligible' WHERE run_id = ? AND node_key = ?", runID, nodeKey)
-	return err
+	return c.requeuedNode(ctx, runID, nodeKey, 0)
 }
 
-func (c *Controller) completeFromReconcile(ctx context.Context, runID, graphVersionID, nodeKey string, attemptNo int64) error {
-	nowMs := time.Now().UnixMilli()
-	return c.store.WithTx(ctx, func(tx *sql.Tx) error {
-		ev := store.Event{
-			RunID:         runID,
-			SchemaVersion: "proceed/v1",
-			Type:          "node_finished",
-			OccurredAt:    nowMs,
-			RecordedAt:    nowMs,
-			ActorType:     "controller",
-			ActorID:       c.cfg.OwnerID,
-			Payload: payloadJSON(map[string]any{
-				"node_key":   nodeKey,
-				"attempt_no": attemptNo,
-				"reconciled": true,
-			}),
-		}
-		if _, err := c.appendWithin(ctx, tx, &ev); err != nil {
-			return err
-		}
-		return markEligibleAfter(ctx, tx, runID, graphVersionID, nowMs)
-	})
+func nodeConfigForKey(c *Controller, ctx context.Context, runID, graphVersionID, nodeKey string) string {
+	var config string
+	if err := c.store.DB().QueryRowContext(ctx,
+		"SELECT config FROM graph_node WHERE graph_version_id = ? AND node_key = ?",
+		graphVersionID, nodeKey).Scan(&config); err != nil {
+		return ""
+	}
+	return config
 }
-
-func (c *Controller) escalateNode(ctx context.Context, runID, nodeKey, reason string) error {
-	_, err := c.store.DB().ExecContext(ctx,
-		"UPDATE run_node SET status = 'waiting' WHERE run_id = ? AND node_key = ?", runID, nodeKey)
-	return err
-}
-
-func (c *Controller) contractFor(config string) (executor.Kind, executor.Contract, error) {
-	_, kind, contract, err := c.parseNodeConfig(config)
-	return kind, contract, err
-}
-
-var _ = errors.Is
-var _ = sql.ErrNoRows

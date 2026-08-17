@@ -76,6 +76,8 @@ type nodeStartedPayload struct {
 	Executor           string `json:"executor"`
 	SideEffectContract string `json:"side_effect_contract"`
 	OperationKey       string `json:"operation_key"`
+	LeaseToken         string `json:"lease_token,omitempty"`
+	LeaseExpiresAt     int64  `json:"lease_expires_at,omitempty"`
 }
 
 type nodeTerminalPayload struct {
@@ -191,6 +193,29 @@ func runNodeID(ctx context.Context, tx *sql.Tx, runID, nodeKey string) (string, 
 	return id, err
 }
 
+func ensureRunNode(ctx context.Context, tx *sql.Tx, runID, nodeKey string) (string, error) {
+	id, err := runNodeID(ctx, tx, runID, nodeKey)
+	if err == nil {
+		return id, nil
+	}
+	if se, ok := AsStoreError(err); !ok || se.Code != CodeGraphInvalid {
+		return "", err
+	}
+	id = derivedNodeID(runID, nodeKey)
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO run_node (id, run_id, node_key, status, attempt_count)
+VALUES (?, ?, ?, 'pending', 0) ON CONFLICT(run_id, node_key) DO NOTHING`,
+		id, runID, nodeKey); err != nil {
+		return "", err
+	}
+	return runNodeID(ctx, tx, runID, nodeKey)
+}
+
+func derivedNodeID(runID, nodeKey string) string {
+	sum := sha256.Sum256([]byte(runID + "\x00" + nodeKey))
+	return hex.EncodeToString(sum[:])[:26]
+}
+
 func applyProjections(ctx context.Context, tx *sql.Tx, ev *Event) error {
 	handler, ok := projectedHandlers[ev.Type]
 	if !ok {
@@ -254,10 +279,22 @@ UPDATE graph_run SET started_at = ? WHERE id = ? AND started_at IS NULL`,
 	}
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO node_attempt (id, run_node_id, attempt_no, operation_key, executor,
-                          side_effect_contract, status, started_at)
-VALUES (?, ?, ?, ?, ?, ?, 'running', ?) ON CONFLICT(id) DO NOTHING`,
-		ev.EventID, nodeID, attemptNo, p.OperationKey, p.Executor, p.SideEffectContract, ev.OccurredAt)
+                          side_effect_contract, lease_token, lease_expires_at, status, started_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
+ON CONFLICT(run_node_id, attempt_no) DO UPDATE SET
+  lease_token = COALESCE(excluded.lease_token, node_attempt.lease_token),
+  lease_expires_at = COALESCE(excluded.lease_expires_at, node_attempt.lease_expires_at),
+  status = 'running', started_at = COALESCE(node_attempt.started_at, excluded.started_at)`,
+		ev.EventID, nodeID, attemptNo, p.OperationKey, p.Executor, p.SideEffectContract,
+		nullableOr(p.LeaseToken), nullableInt(p.LeaseExpiresAt), ev.OccurredAt)
 	return err
+}
+
+func nullableInt(v int64) any {
+	if v == 0 {
+		return nil
+	}
+	return v
 }
 
 func onNodeTerminal(ctx context.Context, tx *sql.Tx, ev *Event) error {
@@ -318,12 +355,92 @@ func onNodeSkipped(ctx context.Context, tx *sql.Tx, ev *Event) error {
 	if err := decodePayload(ev, &p); err != nil {
 		return err
 	}
-	nodeID, err := runNodeID(ctx, tx, ev.RunID, p.NodeKey)
+	nodeID, err := ensureRunNode(ctx, tx, ev.RunID, p.NodeKey)
 	if err != nil {
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `
 UPDATE run_node SET status = 'skipped', finished_at = ? WHERE id = ?`, ev.OccurredAt, nodeID)
+	return err
+}
+
+func onNodeCancelled(ctx context.Context, tx *sql.Tx, ev *Event) error {
+	var p nodeTerminalPayload
+	if err := decodePayload(ev, &p); err != nil {
+		return err
+	}
+	nodeID, err := ensureRunNode(ctx, tx, ev.RunID, p.NodeKey)
+	if err != nil {
+		return err
+	}
+	if p.AttemptNo > 0 {
+		if _, err := tx.ExecContext(ctx, `
+UPDATE node_attempt SET status = 'cancelled', finished_at = COALESCE(?, finished_at)
+WHERE run_node_id = ? AND attempt_no = ?`, ev.OccurredAt, nodeID, p.AttemptNo); err != nil {
+			return err
+		}
+	}
+	_, err = tx.ExecContext(ctx, `
+UPDATE run_node SET status = 'cancelled', finished_at = ? WHERE id = ?`, ev.OccurredAt, nodeID)
+	return err
+}
+
+func onNodeRequeued(ctx context.Context, tx *sql.Tx, ev *Event) error {
+	var p nodeTerminalPayload
+	if err := decodePayload(ev, &p); err != nil {
+		return err
+	}
+	nodeID, err := ensureRunNode(ctx, tx, ev.RunID, p.NodeKey)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, "UPDATE run_node SET status = 'eligible', finished_at = NULL WHERE id = ?", nodeID)
+	return err
+}
+
+func onNodeWaiting(ctx context.Context, tx *sql.Tx, ev *Event) error {
+	var p nodeTerminalPayload
+	if err := decodePayload(ev, &p); err != nil {
+		return err
+	}
+	nodeID, err := ensureRunNode(ctx, tx, ev.RunID, p.NodeKey)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, "UPDATE run_node SET status = 'waiting' WHERE id = ?", nodeID)
+	return err
+}
+
+func onNodeReconciling(ctx context.Context, tx *sql.Tx, ev *Event) error {
+	var p nodeTerminalPayload
+	if err := decodePayload(ev, &p); err != nil {
+		return err
+	}
+	nodeID, err := ensureRunNode(ctx, tx, ev.RunID, p.NodeKey)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, "UPDATE run_node SET status = 'reconciling' WHERE id = ?", nodeID)
+	return err
+}
+
+func onNodeAttemptFailed(ctx context.Context, tx *sql.Tx, ev *Event) error {
+	var p nodeTerminalPayload
+	if err := decodePayload(ev, &p); err != nil {
+		return err
+	}
+	nodeID, err := runNodeID(ctx, tx, ev.RunID, p.NodeKey)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE node_attempt SET status = 'failed', finished_at = ?, result = COALESCE(?, result)
+WHERE run_node_id = ? AND attempt_no = ?`,
+		ev.OccurredAt, nullableOr(rawOr(p.Result, "")), nodeID, p.AttemptNo); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx,
+		"UPDATE run_node SET status = 'eligible' WHERE id = ? AND status IN ('running','leased')", nodeID)
 	return err
 }
 
@@ -672,6 +789,11 @@ var projectedHandlers = map[string]projectionHandler{
 	"node_uncertain":        onNodeTerminal,
 	"node_cancel_requested": onNodeCancelRequested,
 	"node_skipped":          onNodeSkipped,
+	"node_cancelled":        onNodeCancelled,
+	"node_requeued":         onNodeRequeued,
+	"node_waiting":          onNodeWaiting,
+	"node_reconciling":      onNodeReconciling,
+	"node_attempt_failed":   onNodeAttemptFailed,
 	"edge_traversed":        onEdgeTraversed,
 	"artifact_published":    onArtifactPublished,
 	"evaluation_failed":     onEvaluationFailed,

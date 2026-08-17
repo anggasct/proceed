@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -39,6 +40,38 @@ type Controller struct {
 	store *store.Store
 	cfg   Config
 	pool  map[executor.Kind]executor.Executor
+
+	inflightMu sync.Mutex
+	inflight   map[string]context.CancelFunc
+}
+
+func (c *Controller) trackInflight(runID, nodeKey string, cancel context.CancelFunc) {
+	c.inflightMu.Lock()
+	defer c.inflightMu.Unlock()
+	if c.inflight == nil {
+		c.inflight = map[string]context.CancelFunc{}
+	}
+	c.inflight[inflightKey(runID, nodeKey)] = cancel
+}
+
+func (c *Controller) untrackInflight(runID, nodeKey string) {
+	c.inflightMu.Lock()
+	defer c.inflightMu.Unlock()
+	delete(c.inflight, inflightKey(runID, nodeKey))
+}
+
+func (c *Controller) cancelInflightRun(runID string) {
+	c.inflightMu.Lock()
+	defer c.inflightMu.Unlock()
+	for key, cancel := range c.inflight {
+		if strings.HasPrefix(key, runID+"\x00") {
+			cancel()
+		}
+	}
+}
+
+func inflightKey(runID, nodeKey string) string {
+	return runID + "\x00" + nodeKey
 }
 
 func New(st *store.Store, cfg Config, pool map[executor.Kind]executor.Executor) (*Controller, error) {

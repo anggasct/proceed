@@ -70,24 +70,44 @@ ORDER BY gn.node_key`, runID, graphVersionID)
 	}
 
 	edgeRows, err := c.store.DB().QueryContext(ctx, `
-SELECT ge.to_node_key, ge.from_node_key FROM graph_edge ge
-WHERE ge.graph_version_id = ? AND ge.type IN ('depends_on','produces','consumes')`,
-		graphVersionID)
+SELECT ge.id, ge.to_node_key, ge.from_node_key, ge.type FROM graph_edge ge
+WHERE ge.graph_version_id = ?`, graphVersionID)
 	if err != nil {
 		return nil, err
 	}
-	type dep struct{ to, from string }
-	var deps []dep
+	type edge struct {
+		id, to, from, typ string
+	}
+	var edges []edge
 	for edgeRows.Next() {
-		var d dep
-		if err := edgeRows.Scan(&d.to, &d.from); err != nil {
+		var e edge
+		if err := edgeRows.Scan(&e.id, &e.to, &e.from, &e.typ); err != nil {
 			edgeRows.Close()
 			return nil, err
 		}
-		deps = append(deps, d)
+		edges = append(edges, e)
 	}
 	edgeRows.Close()
 	if err := edgeRows.Err(); err != nil {
+		return nil, err
+	}
+
+	traversed := map[string]bool{}
+	travRows, err := c.store.DB().QueryContext(ctx,
+		"SELECT edge_id FROM run_edge WHERE run_id = ?", runID)
+	if err != nil {
+		return nil, err
+	}
+	for travRows.Next() {
+		var id string
+		if err := travRows.Scan(&id); err != nil {
+			travRows.Close()
+			return nil, err
+		}
+		traversed[id] = true
+	}
+	travRows.Close()
+	if err := travRows.Err(); err != nil {
 		return nil, err
 	}
 
@@ -107,9 +127,21 @@ WHERE ge.graph_version_id = ? AND ge.type IN ('depends_on','produces','consumes'
 			continue
 		}
 		ready := true
-		for _, dp := range deps {
-			if dp.to == key && !done(dp.from) {
-				ready = false
+		for _, e := range edges {
+			if e.to != key {
+				continue
+			}
+			switch e.typ {
+			case "depends_on", "produces", "consumes":
+				if !done(e.from) {
+					ready = false
+				}
+			case "routes_to":
+				if !traversed[e.id] {
+					ready = false
+				}
+			}
+			if !ready {
 				break
 			}
 		}
@@ -184,8 +216,10 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 	}
 
 	opKey := OperationKey(runID, digest, n.NodeKey, n.AttemptNo)
+	leaseToken := ulid.Make().String()
+	leaseExpiry := time.Now().Add(c.cfg.LeaseTTL).UnixMilli()
 
-	if err := c.beginAttempt(ctx, runID, n, kind, contract, opKey); err != nil {
+	if err := c.beginAttempt(ctx, runID, n, kind, contract, opKey, leaseToken, leaseExpiry); err != nil {
 		return err
 	}
 
@@ -205,7 +239,11 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 	}
 
 	execCtx, cancelExec := context.WithCancel(ctx)
-	defer cancelExec()
+	c.trackInflight(runID, n.NodeKey, cancelExec)
+	defer func() {
+		c.untrackInflight(runID, n.NodeKey)
+		cancelExec()
+	}()
 	var execErr error
 	var result *executor.Result
 	done := make(chan struct{})
@@ -247,17 +285,40 @@ watch:
 		if errors.Is(execErr, executor.ErrUncertain) {
 			return c.uncertainNode(ctx, runID, n.NodeKey, n.AttemptNo, execErr)
 		}
+		if errors.Is(execErr, executor.ErrCancelled) {
+			return c.cancelledNode(ctx, runID, n.NodeKey, n.AttemptNo)
+		}
 		return c.recordAttemptFailure(ctx, runID, graphVersionID, digest, n, execErr)
+	}
+	if result == nil {
+		result = &executor.Result{}
 	}
 
 	if err := c.leaseValid(ctx); err != nil {
 		return c.uncertainNode(ctx, runID, n.NodeKey, n.AttemptNo, errLeaseLost)
 	}
 
-	return c.commitNodeSuccess(ctx, runID, graphVersionID, digest, n, result, opKey)
+	if c.nodeCancelled(ctx, runID, n.NodeKey) {
+		return c.cancelledNode(ctx, runID, n.NodeKey, n.AttemptNo)
+	}
+
+	if err := c.commitNodeSuccess(ctx, runID, graphVersionID, digest, n, result, opKey); err != nil {
+		return err
+	}
+	return c.routeFrom(ctx, runID, graphVersionID, n, result)
 }
 
-func (c *Controller) beginAttempt(ctx context.Context, runID string, n runnableNode, kind executor.Kind, contract executor.Contract, opKey string) error {
+func (c *Controller) nodeCancelled(ctx context.Context, runID, nodeKey string) bool {
+	var count int
+	if err := c.store.DB().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM run_node WHERE run_id = ? AND node_key = ? AND status IN ('cancel_requested','cancelled')",
+		runID, nodeKey).Scan(&count); err != nil {
+		return false
+	}
+	return count > 0
+}
+
+func (c *Controller) beginAttempt(ctx context.Context, runID string, n runnableNode, kind executor.Kind, contract executor.Contract, opKey, leaseToken string, leaseExpiry int64) error {
 	nowMs := time.Now().UnixMilli()
 	return c.store.WithTx(ctx, func(tx *sql.Tx) error {
 		ev := store.Event{
@@ -276,6 +337,8 @@ func (c *Controller) beginAttempt(ctx context.Context, runID string, n runnableN
 				"executor":             string(kind),
 				"side_effect_contract": string(contract),
 				"operation_key":        opKey,
+				"lease_token":          leaseToken,
+				"lease_expires_at":     leaseExpiry,
 			}),
 		}
 		_, err := c.appendWithin(ctx, tx, &ev)
