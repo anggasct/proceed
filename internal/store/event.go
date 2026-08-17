@@ -122,6 +122,18 @@ func (s *Store) Append(ctx context.Context, ev Event) (Event, error) {
 	return ev, nil
 }
 
+// AppendTx validates and appends an event inside an existing transaction,
+// assigning the next per-run sequence. Idempotency keys are honored.
+func (s *Store) AppendTx(ctx context.Context, tx *sql.Tx, ev *Event) error {
+	var maxSeq int64
+	if err := tx.QueryRowContext(ctx,
+		"SELECT COALESCE(MAX(sequence), 0) FROM event WHERE run_id = ?", ev.RunID).Scan(&maxSeq); err != nil {
+		return err
+	}
+	ev.Sequence = maxSeq + 1
+	return appendEventTx(ctx, tx, ev)
+}
+
 func appendEventTx(ctx context.Context, tx *sql.Tx, ev *Event) error {
 	if ev.IdempotencyKey != "" {
 		var existing string

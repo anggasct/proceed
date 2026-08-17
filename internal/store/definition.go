@@ -237,6 +237,12 @@ func (s *Store) withTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	return tx.Commit()
 }
 
+func (s *Store) WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	return s.withTx(ctx, fn)
+}
+
+func (s *Store) DB() *sql.DB { return s.db }
+
 func ensureGraph(ctx context.Context, tx *sql.Tx, name string) (string, error) {
 	var id string
 	err := tx.QueryRowContext(ctx, "SELECT id FROM graph WHERE name = ? COLLATE NOCASE", name).Scan(&id)
