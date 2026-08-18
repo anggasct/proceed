@@ -386,13 +386,26 @@ UPDATE run_node SET status = 'cancelled', finished_at = ? WHERE id = ?`, ev.Occu
 }
 
 func onNodeRequeued(ctx context.Context, tx *sql.Tx, ev *Event) error {
-	var p nodeTerminalPayload
+	var p struct {
+		NodeKey       string `json:"node_key"`
+		AttemptNo     int64  `json:"attempt_no"`
+		ResumeAttempt bool   `json:"resume_attempt"`
+	}
 	if err := decodePayload(ev, &p); err != nil {
 		return err
 	}
 	nodeID, err := ensureRunNode(ctx, tx, ev.RunID, p.NodeKey)
 	if err != nil {
 		return err
+	}
+	if p.ResumeAttempt && p.AttemptNo > 0 {
+		if _, err := tx.ExecContext(ctx, `
+UPDATE run_node SET status = 'eligible', finished_at = NULL,
+  attempt_count = ? - 1
+WHERE id = ?`, p.AttemptNo, nodeID); err != nil {
+			return err
+		}
+		return nil
 	}
 	_, err = tx.ExecContext(ctx, "UPDATE run_node SET status = 'eligible', finished_at = NULL WHERE id = ?", nodeID)
 	return err

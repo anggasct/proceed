@@ -55,6 +55,9 @@ func (c *Controller) Step(ctx context.Context, runID string) (bool, error) {
 }
 
 func (c *Controller) Drain(ctx context.Context, runID string) error {
+	if err := c.acquireLease(ctx, time.Now()); err != nil {
+		return err
+	}
 	hbCtx, stopHB := context.WithCancel(context.Background())
 	defer stopHB()
 	hbErr := make(chan error, 1)
@@ -133,7 +136,18 @@ func (c *Controller) loadRun(ctx context.Context, runID string) (runInfo, error)
 }
 
 func (c *Controller) tryCompleteRun(ctx context.Context, runID, graphVersionID string) error {
-	row := c.store.DB().QueryRowContext(ctx, `
+	nowMs := time.Now().UnixMilli()
+	return c.store.WithTx(ctx, func(tx *sql.Tx) error {
+		var status string
+		if err := tx.QueryRowContext(ctx,
+			"SELECT status FROM graph_run WHERE id = ?", runID).Scan(&status); err != nil {
+			return err
+		}
+		if status != "running" {
+			return nil
+		}
+
+		row := tx.QueryRowContext(ctx, `
 SELECT
   COALESCE(SUM(CASE WHEN status IN ('pending','eligible','leased','running','uncertain','waiting','reconciling','cancel_requested') THEN 1 ELSE 0 END), 0),
   COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0),
@@ -141,27 +155,35 @@ SELECT
   COALESCE(SUM(CASE WHEN status IN ('succeeded','skipped') THEN 1 ELSE 0 END), 0),
   (SELECT COUNT(*) FROM graph_node WHERE graph_version_id = ?)
 FROM run_node WHERE run_id = ?`, graphVersionID, runID)
-	var active, failed, cancelled, done, defTotal int
-	if err := row.Scan(&active, &failed, &cancelled, &done, &defTotal); err != nil {
-		return err
-	}
+		var active, failed, cancelled, done, defTotal int
+		if err := row.Scan(&active, &failed, &cancelled, &done, &defTotal); err != nil {
+			return err
+		}
 
-	var terminalEvent string
-	switch {
-	case failed > 0:
-		terminalEvent = "run_failed"
-	case active > 0:
-		return nil
-	case cancelled > 0:
-		terminalEvent = "run_cancelled"
-	case done == defTotal && defTotal > 0:
-		terminalEvent = "run_completed"
-	default:
-		return nil
-	}
+		var terminalEvent string
+		switch {
+		case failed > 0:
+			terminalEvent = "run_failed"
+		case active > 0:
+			return nil
+		case cancelled > 0:
+			terminalEvent = "run_cancelled"
+		case done == defTotal && defTotal > 0:
+			terminalEvent = "run_completed"
+		default:
+			return nil
+		}
 
-	nowMs := time.Now().UnixMilli()
-	return c.store.WithTx(ctx, func(tx *sql.Tx) error {
+		var alreadyTerminal int
+		if err := tx.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM event WHERE run_id = ? AND type IN ('run_completed','run_failed','run_cancelled')",
+			runID).Scan(&alreadyTerminal); err != nil {
+			return err
+		}
+		if alreadyTerminal > 0 {
+			return nil
+		}
+
 		ev := store.Event{
 			EventID:       ulid.Make().String(),
 			RunID:         runID,

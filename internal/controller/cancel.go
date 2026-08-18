@@ -24,7 +24,7 @@ func (c *Controller) CancelRun(ctx context.Context, runID string) error {
 	nowMs := time.Now().UnixMilli()
 	return c.store.WithTx(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `
-SELECT node_key,
+SELECT node_key, status,
   CASE WHEN status IN ('running','leased','uncertain','cancel_requested') THEN 1 ELSE 0 END
 FROM run_node WHERE run_id = ?`, runID)
 		if err != nil {
@@ -33,26 +33,34 @@ FROM run_node WHERE run_id = ?`, runID)
 		type entry struct {
 			key      string
 			inflight bool
+			terminal bool
 		}
 		var entries []entry
+		started := map[string]bool{}
 		for rows.Next() {
 			var e entry
+			var status string
 			var flag int
-			if err := rows.Scan(&e.key, &flag); err != nil {
+			if err := rows.Scan(&e.key, &status, &flag); err != nil {
 				rows.Close()
 				return err
 			}
 			e.inflight = flag == 1
-			entries = append(entries, e)
+			switch status {
+			case "succeeded", "failed", "skipped", "cancelled":
+				e.terminal = true
+			}
+			started[e.key] = true
+			if !e.terminal {
+				entries = append(entries, e)
+			}
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
 			return err
 		}
 
-		started := map[string]bool{}
 		for _, e := range entries {
-			started[e.key] = true
 			typ := "node_cancelled"
 			if e.inflight {
 				typ = "node_cancel_requested"

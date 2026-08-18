@@ -78,13 +78,6 @@ func (c *Controller) recordAttemptFailure(ctx context.Context, runID, graphVersi
 	return c.requeuedNode(ctx, runID, n.NodeKey, n.AttemptNo)
 }
 
-func (c *Controller) executeNonExecutable(ctx context.Context, runID, graphVersionID, digest string, n runnableNode, kind executor.Kind, contract executor.Contract) error {
-	if n.NodeType == "gate" {
-		return c.waitingNode(ctx, runID, n.NodeKey)
-	}
-	return c.commitNodeSuccess(ctx, runID, graphVersionID, digest, n, &executor.Result{}, "")
-}
-
 func (c *Controller) commitNodeSuccess(ctx context.Context, runID, graphVersionID, digest string, n runnableNode, result *executor.Result, opKey string) error {
 	nowMs := time.Now().UnixMilli()
 	return c.store.WithTx(ctx, func(tx *sql.Tx) error {

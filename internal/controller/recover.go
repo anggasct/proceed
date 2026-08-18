@@ -64,13 +64,31 @@ func (c *Controller) recoverNode(ctx context.Context, runID, nodeKey, config str
 		return err
 	}
 	switch contract {
-	case executor.Pure, executor.Idempotent:
+	case executor.Pure:
 		return c.requeuedNode(ctx, runID, nodeKey, 0)
+	case executor.Idempotent:
+		return c.resumeIdempotentAttempt(ctx, runID, nodeKey)
 	case executor.Reconcilable:
 		return c.reconcileNode(ctx, runID, nodeKey)
 	default:
 		return c.waitingNode(ctx, runID, nodeKey)
 	}
+}
+
+func (c *Controller) resumeIdempotentAttempt(ctx context.Context, runID, nodeKey string) error {
+	var attemptNo int64
+	if err := c.store.DB().QueryRowContext(ctx, `
+SELECT na.attempt_no FROM node_attempt na
+JOIN run_node rn ON rn.id = na.run_node_id
+WHERE rn.run_id = ? AND rn.node_key = ?
+ORDER BY na.attempt_no DESC LIMIT 1`, runID, nodeKey).Scan(&attemptNo); err != nil {
+		return err
+	}
+	return c.appendEvent(ctx, runID, "node_requeued", map[string]any{
+		"node_key":       nodeKey,
+		"attempt_no":     attemptNo,
+		"resume_attempt": true,
+	})
 }
 
 func (c *Controller) reconcileNode(ctx context.Context, runID, nodeKey string) error {

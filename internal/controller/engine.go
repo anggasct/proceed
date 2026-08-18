@@ -2,9 +2,7 @@ package controller
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -201,7 +199,24 @@ func retryPolicy(cfg map[string]any) (maxAttempts, backoffMs int64) {
 	return maxAttempts, backoffMs
 }
 
+func (c *Controller) claimNonExecutable(ctx context.Context, runID, nodeKey string) error {
+	return c.appendEvent(ctx, runID, "node_started", map[string]any{
+		"node_key":   nodeKey,
+		"attempt_no": 1,
+	})
+}
+
 func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, digest string, n runnableNode) error {
+	if n.NodeType == "router" || n.NodeType == "gate" {
+		if err := c.claimNonExecutable(ctx, runID, n.NodeKey); err != nil {
+			return err
+		}
+		if n.NodeType == "gate" {
+			return c.waitingNode(ctx, runID, n.NodeKey)
+		}
+		return c.commitNodeSuccess(ctx, runID, graphVersionID, digest, n, &executor.Result{}, "")
+	}
+
 	var cfg map[string]any
 	if err := json.Unmarshal([]byte(n.Config), &cfg); err != nil {
 		return fmt.Errorf("node %s config: %w", n.NodeKey, err)
@@ -213,25 +228,22 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 	maxAttempts, backoffMs := retryPolicy(cfg)
 	n.MaxAttempts, n.BackoffMs = maxAttempts, backoffMs
 
-	if n.NodeType == "router" || n.NodeType == "gate" {
-		return c.executeNonExecutable(ctx, runID, graphVersionID, digest, n, kind, contract)
-	}
-
 	opKey := OperationKey(runID, digest, n.NodeKey, n.AttemptNo)
 	leaseToken := ulid.Make().String()
 	leaseExpiry := time.Now().Add(c.cfg.LeaseTTL).UnixMilli()
 
-	claimed, err := c.claimNode(ctx, runID, n.NodeKey)
+	claimed, execCtx, cancelExec, err := c.beginClaimedAttempt(ctx, runID, n, kind, contract, opKey, leaseToken, leaseExpiry)
 	if err != nil {
 		return err
 	}
 	if !claimed {
 		return nil
 	}
-
-	if err := c.beginAttempt(ctx, runID, n, kind, contract, opKey, leaseToken, leaseExpiry); err != nil {
-		return err
-	}
+	c.trackInflight(runID, n.NodeKey, cancelExec)
+	defer func() {
+		c.untrackInflight(runID, n.NodeKey)
+		cancelExec()
+	}()
 
 	cancelChan := make(chan struct{})
 	req := &executor.Request{
@@ -248,12 +260,6 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 		req.TimeoutMs = int64(v)
 	}
 
-	execCtx, cancelExec := context.WithCancel(ctx)
-	c.trackInflight(runID, n.NodeKey, cancelExec)
-	defer func() {
-		c.untrackInflight(runID, n.NodeKey)
-		cancelExec()
-	}()
 	var execErr error
 	var result *executor.Result
 	done := make(chan struct{})
@@ -328,67 +334,30 @@ func (c *Controller) nodeCancelled(ctx context.Context, runID, nodeKey string) b
 	return count > 0
 }
 
-func (c *Controller) claimNode(ctx context.Context, runID, nodeKey string) (bool, error) {
+func (c *Controller) beginClaimedAttempt(ctx context.Context, runID string, n runnableNode, kind executor.Kind, contract executor.Contract, opKey, leaseToken string, leaseExpiry int64) (bool, context.Context, context.CancelFunc, error) {
+	execCtx, cancelExec := context.WithCancel(ctx)
+	nowMs := time.Now().UnixMilli()
+	var claimed bool
 	err := c.store.WithTx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `
-UPDATE run_node SET status = 'leased'
-WHERE run_id = ? AND node_key = ? AND status IN ('eligible', 'running')`,
-			runID, nodeKey)
-		if err != nil {
+		claimed = false
+		var current sql.NullString
+		err := tx.QueryRowContext(ctx,
+			"SELECT status FROM run_node WHERE run_id = ? AND node_key = ?", runID, n.NodeKey).Scan(&current)
+		if err != nil && err != sql.ErrNoRows {
 			return err
 		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if n > 0 {
+		if err == nil && (!current.Valid || (current.String != "eligible" && current.String != "running")) {
 			return nil
 		}
-		var exists int
+		var cancelledCount int
 		if err := tx.QueryRowContext(ctx,
-			"SELECT COUNT(*) FROM run_node WHERE run_id = ? AND node_key = ?", runID, nodeKey).
-			Scan(&exists); err != nil {
+			"SELECT COUNT(*) FROM run_node WHERE run_id = ? AND node_key = ? AND status IN ('cancel_requested','cancelled')",
+			runID, n.NodeKey).Scan(&cancelledCount); err != nil {
 			return err
 		}
-		if exists > 0 {
-			return errNodeAlreadyClaimed
+		if cancelledCount > 0 {
+			return nil
 		}
-		res, err = tx.ExecContext(ctx, `
-INSERT INTO run_node (id, run_id, node_key, status, attempt_count)
-VALUES (?, ?, ?, 'leased', 0)
-ON CONFLICT(run_id, node_key) DO NOTHING`,
-			derivedNodeID(runID, nodeKey), runID, nodeKey)
-		if err != nil {
-			return err
-		}
-		m, err := res.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if m == 0 {
-			return errNodeAlreadyClaimed
-		}
-		return nil
-	})
-	if err != nil {
-		if errors.Is(err, errNodeAlreadyClaimed) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
-}
-
-var errNodeAlreadyClaimed = errors.New("node already claimed by another execution")
-
-func derivedNodeID(runID, nodeKey string) string {
-	h := sha256.Sum256([]byte(runID + "\x00" + nodeKey))
-	return hex.EncodeToString(h[:])[:26]
-}
-
-func (c *Controller) beginAttempt(ctx context.Context, runID string, n runnableNode, kind executor.Kind, contract executor.Contract, opKey, leaseToken string, leaseExpiry int64) error {
-	nowMs := time.Now().UnixMilli()
-	return c.store.WithTx(ctx, func(tx *sql.Tx) error {
 		ev := store.Event{
 			EventID:       ulid.Make().String(),
 			RunID:         runID,
@@ -409,7 +378,15 @@ func (c *Controller) beginAttempt(ctx context.Context, runID string, n runnableN
 				"lease_expires_at":     leaseExpiry,
 			}),
 		}
-		_, err := c.appendWithin(ctx, tx, &ev)
-		return err
+		if _, err := c.appendWithin(ctx, tx, &ev); err != nil {
+			return err
+		}
+		claimed = true
+		return nil
 	})
+	if err != nil {
+		cancelExec()
+		return false, nil, nil, err
+	}
+	return claimed, execCtx, cancelExec, nil
 }
