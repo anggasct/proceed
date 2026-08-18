@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 
 	"proceed/internal/executor"
@@ -23,7 +24,7 @@ FROM run_node rn
 JOIN graph_node gn ON gn.node_key = rn.node_key AND gn.graph_version_id = (
   SELECT graph_version_id FROM graph_run WHERE id = ?
 )
-	WHERE rn.run_id = ? AND rn.status IN ('uncertain', 'leased', 'running', 'cancel_requested')`, runID, runID)
+	WHERE rn.run_id = ? AND rn.status IN ('uncertain', 'leased', 'running', 'reconciling', 'cancel_requested')`, runID, runID)
 	if err != nil {
 		return err
 	}
@@ -131,10 +132,6 @@ func (c *Controller) reconcileNode(ctx context.Context, runID, nodeKey string) e
 	if !ok {
 		return c.waitingNode(ctx, runID, nodeKey)
 	}
-	recon, ok := ex.(executor.Reconciler)
-	if !ok {
-		return c.waitingNode(ctx, runID, nodeKey)
-	}
 	req := &executor.Request{
 		RunID:            runID,
 		GraphVersionID:   run.graphVersionID,
@@ -143,26 +140,38 @@ func (c *Controller) reconcileNode(ctx context.Context, runID, nodeKey string) e
 		AttemptNo:        attemptNo,
 		OperationKey:     opKey,
 	}
-	state, rerr := recon.Reconcile(ctx, req)
+	result, state, rerr := reconcileEffect(ctx, ex, req)
+	if errors.Is(rerr, executor.ErrNotReconcilable) {
+		return c.waitingNode(ctx, runID, nodeKey)
+	}
 	if rerr != nil || state == executor.EffectUnknown {
+		if c.nodeCancelRequested(ctx, runID, nodeKey) {
+			return nil
+		}
 		return c.waitingNode(ctx, runID, nodeKey)
 	}
 	if state == executor.EffectConfirmed {
-		return c.appendEvent(ctx, runID, "node_finished", map[string]any{
-			"node_key":   nodeKey,
-			"attempt_no": attemptNo,
-			"reconciled": true,
-		})
+		return c.commitNodeSuccess(ctx, runID, run.graphVersionID, run.digest,
+			runnableNode{NodeKey: nodeKey, AttemptNo: attemptNo}, result, opKey)
+	}
+	if c.nodeCancelRequested(ctx, runID, nodeKey) {
+		return c.cancelledNode(ctx, runID, nodeKey, attemptNo)
 	}
 	return c.requeuedNode(ctx, runID, nodeKey, attemptNo)
 }
 
-func (c *Controller) reconcileCancelledNode(ctx context.Context, runID, nodeKey string, attemptNo int64) error {
-	if err := c.appendEvent(ctx, runID, "node_reconciling", map[string]any{
-		"node_key": nodeKey,
-	}); err != nil {
-		return err
+func reconcileEffect(ctx context.Context, ex executor.Executor, req *executor.Request) (*executor.Result, executor.EffectState, error) {
+	if recon, ok := ex.(executor.ResultReconciler); ok {
+		return recon.ReconcileResult(ctx, req)
 	}
+	if recon, ok := ex.(executor.Reconciler); ok {
+		state, err := recon.Reconcile(ctx, req)
+		return nil, state, err
+	}
+	return nil, executor.EffectUnknown, executor.ErrNotReconcilable
+}
+
+func (c *Controller) reconcileCancelledNode(ctx context.Context, runID, nodeKey string, attemptNo int64) error {
 	run, err := c.loadRun(ctx, runID)
 	if err != nil {
 		return err
@@ -182,11 +191,7 @@ func (c *Controller) reconcileCancelledNode(ctx context.Context, runID, nodeKey 
 	if !ok {
 		return c.waitingNode(ctx, runID, nodeKey)
 	}
-	recon, ok := ex.(executor.Reconciler)
-	if !ok {
-		return c.waitingNode(ctx, runID, nodeKey)
-	}
-	state, rerr := recon.Reconcile(ctx, &executor.Request{
+	_, state, rerr := reconcileEffect(ctx, ex, &executor.Request{
 		RunID:            runID,
 		GraphVersionID:   run.graphVersionID,
 		DefinitionDigest: run.digest,
@@ -194,7 +199,13 @@ func (c *Controller) reconcileCancelledNode(ctx context.Context, runID, nodeKey 
 		AttemptNo:        attemptNo,
 		OperationKey:     opKey,
 	})
+	if errors.Is(rerr, executor.ErrNotReconcilable) {
+		return c.waitingNode(ctx, runID, nodeKey)
+	}
 	if rerr != nil || state == executor.EffectUnknown {
+		if c.nodeCancelRequested(ctx, runID, nodeKey) {
+			return nil
+		}
 		return c.waitingNode(ctx, runID, nodeKey)
 	}
 	return c.cancelledNode(ctx, runID, nodeKey, attemptNo)

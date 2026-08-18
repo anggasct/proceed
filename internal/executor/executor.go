@@ -63,6 +63,10 @@ type Reconciler interface {
 	Reconcile(ctx context.Context, req *Request) (EffectState, error)
 }
 
+type ResultReconciler interface {
+	ReconcileResult(ctx context.Context, req *Request) (*Result, EffectState, error)
+}
+
 type EffectState string
 
 const (

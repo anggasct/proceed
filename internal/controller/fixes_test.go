@@ -68,6 +68,9 @@ edges: []
 	if err := c.CancelRun(ctx, runID); err != nil {
 		t.Fatal(err)
 	}
+	if err := c.CancelRun(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case err := <-drained:
 		if err != nil {
@@ -101,6 +104,76 @@ edges: []
 		t.Error("node_finished recorded after cancellation — executor outcome overrode durable cancel")
 	}
 
+	assertReplayStable(t, st)
+}
+
+func TestCancellationSignalsRequestChannel(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	frozen := compileAndFreeze(t, st, `schema: proceed/v1
+name: request-cancel
+nodes:
+  - id: work
+    type: task
+    executor: { kind: shell, command: [bin/w] }
+    contract: pure
+    terminal: true
+edges: []
+`)
+	p := map[executor.Kind]executor.Executor{
+		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			<-req.Cancellation
+			return nil, executor.ErrCancelled
+		}),
+	}
+	c := newController(t, st, p)
+	runID, err := c.Run(ctx, RunInput{GraphVersionID: frozen.GraphVersionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	drained := make(chan error, 1)
+	go func() { drained <- c.Drain(ctx, runID) }()
+	for {
+		var attempts int
+		if err := st.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM node_attempt").Scan(&attempts); err != nil {
+			t.Fatal(err)
+		}
+		if attempts > 0 {
+			break
+		}
+		select {
+		case err := <-drained:
+			t.Fatalf("drain finished before cancellation: %v", err)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	if err := c.CancelRun(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-drained:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("drain did not observe Request.Cancellation")
+	}
+	if s := runStatus(t, st, runID); s != "cancelled" {
+		t.Fatalf("run = %q, want cancelled", s)
+	}
+	events, err := st.Events(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requests int
+	for _, event := range events {
+		if event.Type == "node_cancel_requested" {
+			requests++
+		}
+	}
+	if requests != 1 {
+		t.Fatalf("node_cancel_requested events = %d, want 1", requests)
+	}
 	assertReplayStable(t, st)
 }
 

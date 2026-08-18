@@ -51,15 +51,39 @@ func (c *Controller) cancelledNode(ctx context.Context, runID, nodeKey string, a
 }
 
 func (c *Controller) requeuedNode(ctx context.Context, runID, nodeKey string, attemptNo int64) error {
-	return c.appendEvent(ctx, runID, "node_requeued", map[string]any{
+	return c.appendNodeTransition(ctx, runID, nodeKey, "node_requeued", map[string]any{
 		"node_key":   nodeKey,
 		"attempt_no": attemptNo,
 	})
 }
 
 func (c *Controller) waitingNode(ctx context.Context, runID, nodeKey string) error {
-	return c.appendEvent(ctx, runID, "node_waiting", map[string]any{
+	return c.appendNodeTransition(ctx, runID, nodeKey, "node_waiting", map[string]any{
 		"node_key": nodeKey,
+	})
+}
+
+func (c *Controller) appendNodeTransition(ctx context.Context, runID, nodeKey, typ string, payload map[string]any) error {
+	return c.store.WithTx(ctx, func(tx *sql.Tx) error {
+		var status string
+		if err := tx.QueryRowContext(ctx,
+			"SELECT status FROM run_node WHERE run_id = ? AND node_key = ?", runID, nodeKey).Scan(&status); err != nil {
+			return err
+		}
+		if status == "cancel_requested" || status == "cancelled" {
+			return nil
+		}
+		_, err := c.appendWithin(ctx, tx, &store.Event{
+			EventID:       ulid.Make().String(),
+			RunID:         runID,
+			SchemaVersion: "proceed/v1",
+			Type:          typ,
+			OccurredAt:    time.Now().UnixMilli(),
+			ActorType:     "controller",
+			ActorID:       c.cfg.OwnerID,
+			Payload:       payloadJSON(payload),
+		})
+		return err
 	})
 }
 
@@ -79,6 +103,7 @@ func (c *Controller) recordAttemptFailure(ctx context.Context, runID, graphVersi
 }
 
 func (c *Controller) commitNodeSuccess(ctx context.Context, runID, graphVersionID, digest string, n runnableNode, result *executor.Result, opKey string) error {
+	routeKnown := result != nil
 	if result == nil {
 		result = &executor.Result{}
 	}
@@ -95,7 +120,7 @@ func (c *Controller) commitNodeSuccess(ctx context.Context, runID, graphVersionI
 		}
 		if status == "cancel_requested" {
 			terminalType = "node_cancelled"
-		} else if status != "running" {
+		} else if status != "running" && status != "reconciling" {
 			return nil
 		}
 		ev := store.Event{
@@ -121,11 +146,11 @@ func (c *Controller) commitNodeSuccess(ctx context.Context, runID, graphVersionI
 		if terminalType == "node_cancelled" {
 			return nil
 		}
-		return c.routeFromTx(ctx, tx, runID, graphVersionID, n, result, nowMs)
+		return c.routeFromTx(ctx, tx, runID, graphVersionID, n, result, routeKnown, nowMs)
 	})
 }
 
-func (c *Controller) routeFromTx(ctx context.Context, tx *sql.Tx, runID, graphVersionID string, n runnableNode, result *executor.Result, nowMs int64) error {
+func (c *Controller) routeFromTx(ctx context.Context, tx *sql.Tx, runID, graphVersionID string, n runnableNode, result *executor.Result, routeKnown bool, nowMs int64) error {
 	rows, err := tx.QueryContext(ctx, `
 SELECT id, to_node_key, type, condition FROM graph_edge
 WHERE graph_version_id = ? AND from_node_key = ? ORDER BY id`, graphVersionID, n.NodeKey)
@@ -171,6 +196,9 @@ WHERE graph_version_id = ? AND from_node_key = ? ORDER BY id`, graphVersionID, n
 				return err
 			}
 		case "routes_to":
+			if !routeKnown {
+				continue
+			}
 			selected := !e.Cond.Valid || e.Cond.String == "" || result.Route == e.Cond.String
 			if selected {
 				if _, err := c.appendWithin(ctx, tx, &store.Event{

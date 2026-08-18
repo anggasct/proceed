@@ -42,20 +42,25 @@ type Controller struct {
 	pool  map[executor.Kind]executor.Executor
 
 	inflightMu sync.Mutex
-	inflight   map[string]context.CancelFunc
+	inflight   map[string]inflightExecution
 }
 
-func (c *Controller) trackInflight(runID, nodeKey string, cancel context.CancelFunc) bool {
+type inflightExecution struct {
+	cancelContext context.CancelFunc
+	cancelRequest func()
+}
+
+func (c *Controller) trackInflight(runID, nodeKey string, execution inflightExecution) bool {
 	c.inflightMu.Lock()
 	defer c.inflightMu.Unlock()
 	if c.inflight == nil {
-		c.inflight = map[string]context.CancelFunc{}
+		c.inflight = map[string]inflightExecution{}
 	}
 	key := inflightKey(runID, nodeKey)
 	if _, exists := c.inflight[key]; exists {
 		return false
 	}
-	c.inflight[key] = cancel
+	c.inflight[key] = execution
 	return true
 }
 
@@ -68,9 +73,10 @@ func (c *Controller) untrackInflight(runID, nodeKey string) {
 func (c *Controller) cancelInflightRun(runID string) {
 	c.inflightMu.Lock()
 	defer c.inflightMu.Unlock()
-	for key, cancel := range c.inflight {
+	for key, execution := range c.inflight {
 		if strings.HasPrefix(key, runID+"\x00") {
-			cancel()
+			execution.cancelContext()
+			execution.cancelRequest()
 		}
 	}
 }

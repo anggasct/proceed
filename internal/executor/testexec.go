@@ -102,13 +102,18 @@ func (r *ReconcilableExecutor) Execute(ctx context.Context, req *Request) (*Resu
 }
 
 func (r *ReconcilableExecutor) Reconcile(ctx context.Context, req *Request) (EffectState, error) {
+	_, state, err := r.ReconcileResult(ctx, req)
+	return state, err
+}
+
+func (r *ReconcilableExecutor) ReconcileResult(ctx context.Context, req *Request) (*Result, EffectState, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	state, ok := r.receipts[req.OperationKey]
 	if !ok {
-		return EffectAbsent, nil
+		return &Result{}, EffectAbsent, nil
 	}
-	return state, nil
+	return &Result{}, state, nil
 }
 
 func (r *ReconcilableExecutor) Executed(opKey string) bool {
@@ -122,6 +127,7 @@ var _ Executor = (*AppendFileExecutor)(nil)
 var _ Executor = (*NonReplayableExecutor)(nil)
 var _ Executor = (*ReconcilableExecutor)(nil)
 var _ Reconciler = (*ReconcilableExecutor)(nil)
+var _ ResultReconciler = (*ReconcilableExecutor)(nil)
 
 func WriteMarker(dir string) func(context.Context, *Request) (*Result, error) {
 	return func(ctx context.Context, req *Request) (*Result, error) {

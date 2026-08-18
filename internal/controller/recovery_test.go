@@ -289,6 +289,14 @@ edges: []
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := c.appendEvent(ctx, runID, "node_reconciling", map[string]any{
+		"node_key": "work",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if s := nodeStatus(t, st, runID, "work"); s != "cancel_requested" {
+		t.Fatalf("node = %q after reconcile marker, want cancel_requested", s)
+	}
 	c.releaseLease(ctx)
 
 	recovered := recoverController(t, st, map[executor.Kind]executor.Executor{
@@ -309,4 +317,163 @@ edges: []
 		t.Fatalf("run = %q, want cancelled after restart", s)
 	}
 	assertReplayStable(t, st)
+}
+
+func TestRecoveryReconcilingCompletesRoutes(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	frozen := compileAndFreeze(t, st, `schema: proceed/v1
+name: recon-route
+nodes:
+  - id: effect
+    type: tool
+    executor: { kind: http, method: POST, url: "https://api.example/do" }
+    contract: reconcilable
+    capability:
+      network: { allowlisted_hosts: [api.example] }
+  - id: after
+    type: task
+    executor: { kind: shell, command: [bin/after] }
+    contract: pure
+    terminal: true
+edges:
+  - { from: effect, to: after, type: depends_on }
+`)
+	cfg := DefaultConfig()
+	cfg.LeaseTTL = 40 * time.Millisecond
+	initial, err := New(st, cfg, map[executor.Kind]executor.Executor{
+		"http": executor.NewFuncExecutor("http", executor.Reconcilable, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			return nil, executor.ErrUncertain
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, err := initial.Run(ctx, RunInput{GraphVersionID: frozen.GraphVersionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initial.Drain(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
+	initial.releaseLease(ctx)
+	if err := initial.appendEvent(ctx, runID, "node_reconciling", map[string]any{
+		"node_key": "effect",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(60 * time.Millisecond)
+
+	recovered := recoverController(t, st, map[executor.Kind]executor.Executor{
+		"http": &confirmAllReconciler{},
+		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			return &executor.Result{}, nil
+		}),
+	})
+	if err := recovered.Recover(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
+	var traversals int
+	if err := st.DB().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM run_edge WHERE run_id = ?", runID).Scan(&traversals); err != nil {
+		t.Fatal(err)
+	}
+	if traversals != 1 {
+		t.Fatalf("traversals = %d, want 1 after recovered completion", traversals)
+	}
+	if err := recovered.Drain(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
+	if s := nodeStatus(t, st, runID, "after"); s != "succeeded" {
+		t.Fatalf("downstream node = %q, want succeeded", s)
+	}
+	if s := runStatus(t, st, runID); s != "completed" {
+		t.Fatalf("run = %q, want completed", s)
+	}
+	assertReplayStable(t, st)
+}
+
+func TestRecoveryReconcilingUsesRecoveredRoute(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	frozen := compileAndFreeze(t, st, `schema: proceed/v1
+name: recon-conditional
+nodes:
+  - id: effect
+    type: tool
+    executor: { kind: http, method: POST, url: "https://api.example/classify" }
+    contract: reconcilable
+    capability:
+      network: { allowlisted_hosts: [api.example] }
+  - id: code_path
+    type: task
+    executor: { kind: shell, command: [bin/code] }
+    contract: pure
+    terminal: true
+  - id: docs_path
+    type: task
+    executor: { kind: shell, command: [bin/docs] }
+    contract: pure
+    terminal: true
+edges:
+  - { from: effect, to: code_path, type: routes_to, when: requires_code }
+  - { from: effect, to: docs_path, type: routes_to, when: requires_docs }
+`)
+	cfg := DefaultConfig()
+	cfg.LeaseTTL = 40 * time.Millisecond
+	initial, err := New(st, cfg, map[executor.Kind]executor.Executor{
+		"http": executor.NewFuncExecutor("http", executor.Reconcilable, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			return nil, executor.ErrUncertain
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, err := initial.Run(ctx, RunInput{GraphVersionID: frozen.GraphVersionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initial.Drain(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
+	initial.releaseLease(ctx)
+	if err := initial.appendEvent(ctx, runID, "node_reconciling", map[string]any{
+		"node_key": "effect",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(60 * time.Millisecond)
+
+	recovered := recoverController(t, st, map[executor.Kind]executor.Executor{
+		"http": &routeReconciler{},
+		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			return &executor.Result{}, nil
+		}),
+	})
+	if err := recovered.Recover(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered.Drain(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
+	if s := nodeStatus(t, st, runID, "code_path"); s != "succeeded" {
+		t.Fatalf("selected route = %q, want succeeded", s)
+	}
+	if s := nodeStatus(t, st, runID, "docs_path"); s != "skipped" {
+		t.Fatalf("unselected route = %q, want skipped", s)
+	}
+	if s := runStatus(t, st, runID); s != "completed" {
+		t.Fatalf("run = %q, want completed", s)
+	}
+	assertReplayStable(t, st)
+}
+
+type routeReconciler struct{}
+
+func (*routeReconciler) Kind() executor.Kind { return "http" }
+func (*routeReconciler) Execute(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+	return &executor.Result{}, nil
+}
+func (*routeReconciler) ReconcileResult(ctx context.Context, req *executor.Request) (*executor.Result, executor.EffectState, error) {
+	return &executor.Result{Route: "requires_code"}, executor.EffectConfirmed, nil
 }

@@ -33,13 +33,14 @@ func (c *Controller) CancelRun(ctx context.Context, runID string) error {
 		}
 		rows, err := tx.QueryContext(ctx, `
 SELECT node_key, status,
-  CASE WHEN status IN ('running','leased','uncertain','cancel_requested') THEN 1 ELSE 0 END
+  CASE WHEN status IN ('running','leased','uncertain','reconciling','cancel_requested') THEN 1 ELSE 0 END
 FROM run_node WHERE run_id = ?`, runID)
 		if err != nil {
 			return err
 		}
 		type entry struct {
 			key      string
+			status   string
 			inflight bool
 			terminal bool
 		}
@@ -53,6 +54,7 @@ FROM run_node WHERE run_id = ?`, runID)
 				rows.Close()
 				return err
 			}
+			e.status = status
 			e.inflight = flag == 1
 			switch status {
 			case "succeeded", "failed", "skipped", "cancelled":
@@ -69,6 +71,9 @@ FROM run_node WHERE run_id = ?`, runID)
 		}
 
 		for _, e := range entries {
+			if e.status == "cancel_requested" {
+				continue
+			}
 			typ := "node_cancelled"
 			if e.inflight {
 				typ = "node_cancel_requested"

@@ -314,14 +314,15 @@ func onNodeTerminal(ctx context.Context, tx *sql.Tx, ev *Event) error {
 	if p.AttemptNo > 0 {
 		if _, err := tx.ExecContext(ctx, `
 UPDATE node_attempt SET status = ?, finished_at = COALESCE(?, finished_at), result = COALESCE(?, result)
-WHERE run_node_id = ? AND attempt_no = ?`,
+WHERE run_node_id = ? AND attempt_no = ? AND status <> 'cancelled'`,
 			attemptStatus, finishedAt(ev, ev.Type), nullableOr(rawOr(p.Result, "")), nodeID, p.AttemptNo); err != nil {
 			return err
 		}
 	} else {
 		if _, err := tx.ExecContext(ctx, `
 UPDATE node_attempt SET status = ?, finished_at = COALESCE(?, finished_at), result = COALESCE(?, result)
-WHERE run_node_id = ? AND attempt_no = (SELECT MAX(attempt_no) FROM node_attempt WHERE run_node_id = ?)`,
+WHERE run_node_id = ? AND attempt_no = (SELECT MAX(attempt_no) FROM node_attempt WHERE run_node_id = ?)
+  AND status <> 'cancelled'`,
 			attemptStatus, finishedAt(ev, ev.Type), nullableOr(rawOr(p.Result, "")), nodeID, nodeID); err != nil {
 			return err
 		}
@@ -332,7 +333,8 @@ WHERE run_node_id = ? AND attempt_no = (SELECT MAX(attempt_no) FROM node_attempt
 		"node_uncertain": "uncertain",
 	}[ev.Type]
 	_, err = tx.ExecContext(ctx, `
-UPDATE run_node SET status = ?, finished_at = COALESCE(?, finished_at) WHERE id = ?`,
+UPDATE run_node SET status = ?, finished_at = COALESCE(?, finished_at)
+WHERE id = ? AND status NOT IN ('cancel_requested', 'cancelled')`,
 		nodeStatus, finishedAt(ev, ev.Type), nodeID)
 	return err
 }
@@ -346,7 +348,9 @@ func onNodeCancelRequested(ctx context.Context, tx *sql.Tx, ev *Event) error {
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, "UPDATE run_node SET status = 'cancel_requested' WHERE id = ?", nodeID)
+	_, err = tx.ExecContext(ctx, `
+UPDATE run_node SET status = 'cancel_requested'
+WHERE id = ? AND status NOT IN ('succeeded', 'failed', 'skipped', 'cancelled')`, nodeID)
 	return err
 }
 
@@ -360,7 +364,8 @@ func onNodeSkipped(ctx context.Context, tx *sql.Tx, ev *Event) error {
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `
-UPDATE run_node SET status = 'skipped', finished_at = ? WHERE id = ?`, ev.OccurredAt, nodeID)
+UPDATE run_node SET status = 'skipped', finished_at = ?
+WHERE id = ? AND status NOT IN ('cancel_requested', 'cancelled')`, ev.OccurredAt, nodeID)
 	return err
 }
 
@@ -376,12 +381,14 @@ func onNodeCancelled(ctx context.Context, tx *sql.Tx, ev *Event) error {
 	if p.AttemptNo > 0 {
 		if _, err := tx.ExecContext(ctx, `
 UPDATE node_attempt SET status = 'cancelled', finished_at = COALESCE(?, finished_at)
-WHERE run_node_id = ? AND attempt_no = ?`, ev.OccurredAt, nodeID, p.AttemptNo); err != nil {
+WHERE run_node_id = ? AND attempt_no = ? AND status NOT IN ('succeeded', 'failed', 'cancelled')`,
+			ev.OccurredAt, nodeID, p.AttemptNo); err != nil {
 			return err
 		}
 	}
 	_, err = tx.ExecContext(ctx, `
-UPDATE run_node SET status = 'cancelled', finished_at = ? WHERE id = ?`, ev.OccurredAt, nodeID)
+UPDATE run_node SET status = 'cancelled', finished_at = ?
+WHERE id = ? AND status NOT IN ('succeeded', 'failed', 'skipped', 'cancelled')`, ev.OccurredAt, nodeID)
 	return err
 }
 
@@ -402,12 +409,12 @@ func onNodeRequeued(ctx context.Context, tx *sql.Tx, ev *Event) error {
 		if _, err := tx.ExecContext(ctx, `
 UPDATE run_node SET status = 'eligible', finished_at = NULL,
   attempt_count = ? - 1
-WHERE id = ?`, p.AttemptNo, nodeID); err != nil {
+				WHERE id = ? AND status NOT IN ('cancel_requested', 'cancelled')`, p.AttemptNo, nodeID); err != nil {
 			return err
 		}
 		return nil
 	}
-	_, err = tx.ExecContext(ctx, "UPDATE run_node SET status = 'eligible', finished_at = NULL WHERE id = ?", nodeID)
+	_, err = tx.ExecContext(ctx, "UPDATE run_node SET status = 'eligible', finished_at = NULL WHERE id = ? AND status NOT IN ('cancel_requested', 'cancelled')", nodeID)
 	return err
 }
 
@@ -420,7 +427,7 @@ func onNodeWaiting(ctx context.Context, tx *sql.Tx, ev *Event) error {
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, "UPDATE run_node SET status = 'waiting' WHERE id = ?", nodeID)
+	_, err = tx.ExecContext(ctx, "UPDATE run_node SET status = 'waiting' WHERE id = ? AND status NOT IN ('cancel_requested', 'cancelled')", nodeID)
 	return err
 }
 
@@ -433,7 +440,9 @@ func onNodeReconciling(ctx context.Context, tx *sql.Tx, ev *Event) error {
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, "UPDATE run_node SET status = 'reconciling' WHERE id = ?", nodeID)
+	_, err = tx.ExecContext(ctx, `
+UPDATE run_node SET status = 'reconciling'
+WHERE id = ? AND status NOT IN ('cancel_requested', 'cancelled')`, nodeID)
 	return err
 }
 

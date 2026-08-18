@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -266,8 +267,13 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 	opKey := OperationKey(runID, digest, n.NodeKey, n.AttemptNo)
 	leaseToken := ulid.Make().String()
 	leaseExpiry := time.Now().Add(c.cfg.LeaseTTL).UnixMilli()
+	cancelChan := make(chan struct{})
+	var cancelOnce sync.Once
+	signalRequestCancel := func() {
+		cancelOnce.Do(func() { close(cancelChan) })
+	}
 
-	claimed, execCtx, cancelExec, err := c.beginClaimedAttempt(ctx, runID, n, kind, contract, opKey, leaseToken, leaseExpiry)
+	claimed, execCtx, cancelExec, err := c.beginClaimedAttempt(ctx, runID, n, kind, contract, opKey, leaseToken, leaseExpiry, signalRequestCancel)
 	if err != nil {
 		return err
 	}
@@ -282,7 +288,6 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 		return c.cancelledNode(ctx, runID, n.NodeKey, n.AttemptNo)
 	}
 
-	cancelChan := make(chan struct{})
 	req := &executor.Request{
 		RunID:            runID,
 		GraphVersionID:   graphVersionID,
@@ -320,12 +325,12 @@ watch:
 		case <-timer:
 			timedOut = true
 			cancelExec()
-			close(cancelChan)
+			signalRequestCancel()
 			<-done
 			break watch
 		case <-ctx.Done():
 			cancelExec()
-			close(cancelChan)
+			signalRequestCancel()
 			<-done
 			return errLeaseLost
 		}
@@ -368,9 +373,22 @@ func (c *Controller) nodeCancelled(ctx context.Context, runID, nodeKey string) b
 	return count > 0
 }
 
-func (c *Controller) beginClaimedAttempt(ctx context.Context, runID string, n runnableNode, kind executor.Kind, contract executor.Contract, opKey, leaseToken string, leaseExpiry int64) (bool, context.Context, context.CancelFunc, error) {
+func (c *Controller) nodeCancelRequested(ctx context.Context, runID, nodeKey string) bool {
+	var count int
+	if err := c.store.DB().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM run_node WHERE run_id = ? AND node_key = ? AND status = 'cancel_requested'",
+		runID, nodeKey).Scan(&count); err != nil {
+		return false
+	}
+	return count > 0
+}
+
+func (c *Controller) beginClaimedAttempt(ctx context.Context, runID string, n runnableNode, kind executor.Kind, contract executor.Contract, opKey, leaseToken string, leaseExpiry int64, cancelRequest func()) (bool, context.Context, context.CancelFunc, error) {
 	execCtx, cancelExec := context.WithCancel(ctx)
-	if !c.trackInflight(runID, n.NodeKey, cancelExec) {
+	if !c.trackInflight(runID, n.NodeKey, inflightExecution{
+		cancelContext: cancelExec,
+		cancelRequest: cancelRequest,
+	}) {
 		cancelExec()
 		return false, nil, nil, nil
 	}
