@@ -79,13 +79,30 @@ func (c *Controller) recordAttemptFailure(ctx context.Context, runID, graphVersi
 }
 
 func (c *Controller) commitNodeSuccess(ctx context.Context, runID, graphVersionID, digest string, n runnableNode, result *executor.Result, opKey string) error {
+	if result == nil {
+		result = &executor.Result{}
+	}
 	nowMs := time.Now().UnixMilli()
 	return c.store.WithTx(ctx, func(tx *sql.Tx) error {
+		var status string
+		if err := tx.QueryRowContext(ctx,
+			"SELECT status FROM run_node WHERE run_id = ? AND node_key = ?", runID, n.NodeKey).Scan(&status); err != nil {
+			return err
+		}
+		terminalType := "node_finished"
+		if status == "cancelled" {
+			return nil
+		}
+		if status == "cancel_requested" {
+			terminalType = "node_cancelled"
+		} else if status != "running" {
+			return nil
+		}
 		ev := store.Event{
 			EventID:       ulid.Make().String(),
 			RunID:         runID,
 			SchemaVersion: "proceed/v1",
-			Type:          "node_finished",
+			Type:          terminalType,
 			OccurredAt:    nowMs,
 			RecordedAt:    nowMs,
 			ActorType:     "controller",
@@ -98,13 +115,18 @@ func (c *Controller) commitNodeSuccess(ctx context.Context, runID, graphVersionI
 				"route":      result.Route,
 			}),
 		}
-		_, err := c.appendWithin(ctx, tx, &ev)
-		return err
+		if _, err := c.appendWithin(ctx, tx, &ev); err != nil {
+			return err
+		}
+		if terminalType == "node_cancelled" {
+			return nil
+		}
+		return c.routeFromTx(ctx, tx, runID, graphVersionID, n, result, nowMs)
 	})
 }
 
-func (c *Controller) routeFrom(ctx context.Context, runID, graphVersionID string, n runnableNode, result *executor.Result) error {
-	rows, err := c.store.DB().QueryContext(ctx, `
+func (c *Controller) routeFromTx(ctx context.Context, tx *sql.Tx, runID, graphVersionID string, n runnableNode, result *executor.Result, nowMs int64) error {
+	rows, err := tx.QueryContext(ctx, `
 SELECT id, to_node_key, type, condition FROM graph_edge
 WHERE graph_version_id = ? AND from_node_key = ? ORDER BY id`, graphVersionID, n.NodeKey)
 	if err != nil {
@@ -130,12 +152,27 @@ WHERE graph_version_id = ? AND from_node_key = ? ORDER BY id`, graphVersionID, n
 		return err
 	}
 
-	nowMs := time.Now().UnixMilli()
-	return c.store.WithTx(ctx, func(tx *sql.Tx) error {
-		var skipped []string
-		for _, e := range edges {
-			switch e.Type {
-			case "depends_on", "produces", "consumes":
+	var skipped []string
+	for _, e := range edges {
+		switch e.Type {
+		case "depends_on", "produces", "consumes":
+			if _, err := c.appendWithin(ctx, tx, &store.Event{
+				EventID:       ulid.Make().String(),
+				RunID:         runID,
+				SchemaVersion: "proceed/v1",
+				Type:          "edge_traversed",
+				OccurredAt:    nowMs,
+				ActorType:     "controller",
+				ActorID:       c.cfg.OwnerID,
+				Payload: payloadJSON(map[string]any{
+					"edge_id": e.ID,
+				}),
+			}); err != nil {
+				return err
+			}
+		case "routes_to":
+			selected := !e.Cond.Valid || e.Cond.String == "" || result.Route == e.Cond.String
+			if selected {
 				if _, err := c.appendWithin(ctx, tx, &store.Event{
 					EventID:       ulid.Make().String(),
 					RunID:         runID,
@@ -146,62 +183,44 @@ WHERE graph_version_id = ? AND from_node_key = ? ORDER BY id`, graphVersionID, n
 					ActorID:       c.cfg.OwnerID,
 					Payload: payloadJSON(map[string]any{
 						"edge_id": e.ID,
+						"route":   e.Cond.String,
 					}),
 				}); err != nil {
 					return err
 				}
-			case "routes_to":
-				selected := !e.Cond.Valid || e.Cond.String == "" || result.Route == e.Cond.String
-				if selected {
-					if _, err := c.appendWithin(ctx, tx, &store.Event{
-						EventID:       ulid.Make().String(),
-						RunID:         runID,
-						SchemaVersion: "proceed/v1",
-						Type:          "edge_traversed",
-						OccurredAt:    nowMs,
-						ActorType:     "controller",
-						ActorID:       c.cfg.OwnerID,
-						Payload: payloadJSON(map[string]any{
-							"edge_id": e.ID,
-							"route":   e.Cond.String,
-						}),
-					}); err != nil {
-						return err
-					}
-				} else if c.onlyIncomingEdge(ctx, tx, runID, graphVersionID, e.To, e.ID) {
-					skipped = append(skipped, e.To)
-				}
+			} else if c.onlyIncomingEdge(ctx, tx, graphVersionID, e.To, e.ID) {
+				skipped = append(skipped, e.To)
 			}
 		}
-		for _, key := range skipped {
-			var exists int
-			if err := tx.QueryRowContext(ctx,
-				"SELECT COUNT(*) FROM run_node WHERE run_id = ? AND node_key = ?", runID, key).Scan(&exists); err != nil {
-				return err
-			}
-			if exists > 0 {
-				continue
-			}
-			if _, err := c.appendWithin(ctx, tx, &store.Event{
-				EventID:       ulid.Make().String(),
-				RunID:         runID,
-				SchemaVersion: "proceed/v1",
-				Type:          "node_skipped",
-				OccurredAt:    nowMs,
-				ActorType:     "controller",
-				ActorID:       c.cfg.OwnerID,
-				Payload: payloadJSON(map[string]any{
-					"node_key": key,
-				}),
-			}); err != nil {
-				return err
-			}
+	}
+	for _, key := range skipped {
+		var exists int
+		if err := tx.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM run_node WHERE run_id = ? AND node_key = ?", runID, key).Scan(&exists); err != nil {
+			return err
 		}
-		return nil
-	})
+		if exists > 0 {
+			continue
+		}
+		if _, err := c.appendWithin(ctx, tx, &store.Event{
+			EventID:       ulid.Make().String(),
+			RunID:         runID,
+			SchemaVersion: "proceed/v1",
+			Type:          "node_skipped",
+			OccurredAt:    nowMs,
+			ActorType:     "controller",
+			ActorID:       c.cfg.OwnerID,
+			Payload: payloadJSON(map[string]any{
+				"node_key": key,
+			}),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (c *Controller) onlyIncomingEdge(ctx context.Context, tx *sql.Tx, runID, graphVersionID, nodeKey, edgeID string) bool {
+func (c *Controller) onlyIncomingEdge(ctx context.Context, tx *sql.Tx, graphVersionID, nodeKey, edgeID string) bool {
 	var count int
 	if err := tx.QueryRowContext(ctx, `
 SELECT COUNT(*) FROM graph_edge WHERE graph_version_id = ? AND to_node_key = ? AND id <> ?`,

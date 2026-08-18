@@ -23,6 +23,14 @@ func (c *Controller) CancelRun(ctx context.Context, runID string) error {
 
 	nowMs := time.Now().UnixMilli()
 	return c.store.WithTx(ctx, func(tx *sql.Tx) error {
+		var status string
+		if err := tx.QueryRowContext(ctx,
+			"SELECT status FROM graph_run WHERE id = ?", runID).Scan(&status); err != nil {
+			return err
+		}
+		if status != "running" {
+			return nil
+		}
 		rows, err := tx.QueryContext(ctx, `
 SELECT node_key, status,
   CASE WHEN status IN ('running','leased','uncertain','cancel_requested') THEN 1 ELSE 0 END

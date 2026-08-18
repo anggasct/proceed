@@ -45,13 +45,18 @@ type Controller struct {
 	inflight   map[string]context.CancelFunc
 }
 
-func (c *Controller) trackInflight(runID, nodeKey string, cancel context.CancelFunc) {
+func (c *Controller) trackInflight(runID, nodeKey string, cancel context.CancelFunc) bool {
 	c.inflightMu.Lock()
 	defer c.inflightMu.Unlock()
 	if c.inflight == nil {
 		c.inflight = map[string]context.CancelFunc{}
 	}
-	c.inflight[inflightKey(runID, nodeKey)] = cancel
+	key := inflightKey(runID, nodeKey)
+	if _, exists := c.inflight[key]; exists {
+		return false
+	}
+	c.inflight[key] = cancel
+	return true
 }
 
 func (c *Controller) untrackInflight(runID, nodeKey string) {

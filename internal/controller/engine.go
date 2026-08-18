@@ -199,17 +199,52 @@ func retryPolicy(cfg map[string]any) (maxAttempts, backoffMs int64) {
 	return maxAttempts, backoffMs
 }
 
-func (c *Controller) claimNonExecutable(ctx context.Context, runID, nodeKey string) error {
-	return c.appendEvent(ctx, runID, "node_started", map[string]any{
-		"node_key":   nodeKey,
-		"attempt_no": 1,
+func (c *Controller) claimNonExecutable(ctx context.Context, runID, nodeKey string) (bool, error) {
+	var claimed bool
+	err := c.store.WithTx(ctx, func(tx *sql.Tx) error {
+		var status string
+		err := tx.QueryRowContext(ctx,
+			"SELECT status FROM run_node WHERE run_id = ? AND node_key = ?", runID, nodeKey).
+			Scan(&status)
+		if err == nil {
+			if status != "eligible" {
+				return nil
+			}
+		} else if err != sql.ErrNoRows {
+			return err
+		}
+		_, err = c.appendWithin(ctx, tx, &store.Event{
+			EventID:       ulid.Make().String(),
+			RunID:         runID,
+			SchemaVersion: "proceed/v1",
+			Type:          "node_started",
+			OccurredAt:    time.Now().UnixMilli(),
+			ActorType:     "controller",
+			ActorID:       c.cfg.OwnerID,
+			Payload: payloadJSON(map[string]any{
+				"node_key":   nodeKey,
+				"attempt_no": 1,
+			}),
+		})
+		if err == nil {
+			claimed = true
+		}
+		return err
 	})
+	return claimed, err
 }
 
 func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, digest string, n runnableNode) error {
 	if n.NodeType == "router" || n.NodeType == "gate" {
-		if err := c.claimNonExecutable(ctx, runID, n.NodeKey); err != nil {
+		claimed, err := c.claimNonExecutable(ctx, runID, n.NodeKey)
+		if err != nil {
 			return err
+		}
+		if !claimed {
+			return nil
+		}
+		if c.nodeCancelled(ctx, runID, n.NodeKey) {
+			return c.cancelledNode(ctx, runID, n.NodeKey, n.AttemptNo)
 		}
 		if n.NodeType == "gate" {
 			return c.waitingNode(ctx, runID, n.NodeKey)
@@ -239,11 +274,13 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 	if !claimed {
 		return nil
 	}
-	c.trackInflight(runID, n.NodeKey, cancelExec)
 	defer func() {
 		c.untrackInflight(runID, n.NodeKey)
 		cancelExec()
 	}()
+	if execCtx.Err() != nil || c.nodeCancelled(ctx, runID, n.NodeKey) {
+		return c.cancelledNode(ctx, runID, n.NodeKey, n.AttemptNo)
+	}
 
 	cancelChan := make(chan struct{})
 	req := &executor.Request{
@@ -318,10 +355,7 @@ watch:
 		return c.cancelledNode(ctx, runID, n.NodeKey, n.AttemptNo)
 	}
 
-	if err := c.commitNodeSuccess(ctx, runID, graphVersionID, digest, n, result, opKey); err != nil {
-		return err
-	}
-	return c.routeFrom(ctx, runID, graphVersionID, n, result)
+	return c.commitNodeSuccess(ctx, runID, graphVersionID, digest, n, result, opKey)
 }
 
 func (c *Controller) nodeCancelled(ctx context.Context, runID, nodeKey string) bool {
@@ -336,6 +370,10 @@ func (c *Controller) nodeCancelled(ctx context.Context, runID, nodeKey string) b
 
 func (c *Controller) beginClaimedAttempt(ctx context.Context, runID string, n runnableNode, kind executor.Kind, contract executor.Contract, opKey, leaseToken string, leaseExpiry int64) (bool, context.Context, context.CancelFunc, error) {
 	execCtx, cancelExec := context.WithCancel(ctx)
+	if !c.trackInflight(runID, n.NodeKey, cancelExec) {
+		cancelExec()
+		return false, nil, nil, nil
+	}
 	nowMs := time.Now().UnixMilli()
 	var claimed bool
 	err := c.store.WithTx(ctx, func(tx *sql.Tx) error {
@@ -346,16 +384,7 @@ func (c *Controller) beginClaimedAttempt(ctx context.Context, runID string, n ru
 		if err != nil && err != sql.ErrNoRows {
 			return err
 		}
-		if err == nil && (!current.Valid || (current.String != "eligible" && current.String != "running")) {
-			return nil
-		}
-		var cancelledCount int
-		if err := tx.QueryRowContext(ctx,
-			"SELECT COUNT(*) FROM run_node WHERE run_id = ? AND node_key = ? AND status IN ('cancel_requested','cancelled')",
-			runID, n.NodeKey).Scan(&cancelledCount); err != nil {
-			return err
-		}
-		if cancelledCount > 0 {
+		if err == nil && (!current.Valid || current.String != "eligible") {
 			return nil
 		}
 		ev := store.Event{
@@ -385,8 +414,14 @@ func (c *Controller) beginClaimedAttempt(ctx context.Context, runID string, n ru
 		return nil
 	})
 	if err != nil {
+		c.untrackInflight(runID, n.NodeKey)
 		cancelExec()
 		return false, nil, nil, err
+	}
+	if !claimed {
+		c.untrackInflight(runID, n.NodeKey)
+		cancelExec()
+		return false, nil, nil, nil
 	}
 	return claimed, execCtx, cancelExec, nil
 }

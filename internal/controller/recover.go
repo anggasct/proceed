@@ -23,20 +23,20 @@ FROM run_node rn
 JOIN graph_node gn ON gn.node_key = rn.node_key AND gn.graph_version_id = (
   SELECT graph_version_id FROM graph_run WHERE id = ?
 )
-WHERE rn.run_id = ? AND rn.status IN ('uncertain', 'leased', 'running')`, runID, runID)
+	WHERE rn.run_id = ? AND rn.status IN ('uncertain', 'leased', 'running', 'cancel_requested')`, runID, runID)
 	if err != nil {
 		return err
 	}
 	type candidate struct {
 		key    string
+		status string
 		config string
 		expiry sql.NullInt64
 	}
 	var list []candidate
 	for rows.Next() {
 		var u candidate
-		var status string
-		if err := rows.Scan(&u.key, &status, &u.config, &u.expiry); err != nil {
+		if err := rows.Scan(&u.key, &u.status, &u.config, &u.expiry); err != nil {
 			rows.Close()
 			return err
 		}
@@ -51,17 +51,20 @@ WHERE rn.run_id = ? AND rn.status IN ('uncertain', 'leased', 'running')`, runID,
 		if u.expiry.Valid && u.expiry.Int64 > nowMs {
 			continue
 		}
-		if err := c.recoverNode(ctx, runID, u.key, u.config); err != nil {
+		if err := c.recoverNode(ctx, runID, u.key, u.config, u.status); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *Controller) recoverNode(ctx context.Context, runID, nodeKey, config string) error {
+func (c *Controller) recoverNode(ctx context.Context, runID, nodeKey, config, status string) error {
 	_, contract, err := c.contractFor(config)
 	if err != nil {
 		return err
+	}
+	if status == "cancel_requested" {
+		return c.recoverCancelledNode(ctx, runID, nodeKey, contract)
 	}
 	switch contract {
 	case executor.Pure:
@@ -70,6 +73,21 @@ func (c *Controller) recoverNode(ctx context.Context, runID, nodeKey, config str
 		return c.resumeIdempotentAttempt(ctx, runID, nodeKey)
 	case executor.Reconcilable:
 		return c.reconcileNode(ctx, runID, nodeKey)
+	default:
+		return c.waitingNode(ctx, runID, nodeKey)
+	}
+}
+
+func (c *Controller) recoverCancelledNode(ctx context.Context, runID, nodeKey string, contract executor.Contract) error {
+	_, attemptNo, err := c.latestAttempt(ctx, runID, nodeKey)
+	if err != nil {
+		return err
+	}
+	switch contract {
+	case executor.Pure:
+		return c.cancelledNode(ctx, runID, nodeKey, attemptNo)
+	case executor.Reconcilable:
+		return c.reconcileCancelledNode(ctx, runID, nodeKey, attemptNo)
 	default:
 		return c.waitingNode(ctx, runID, nodeKey)
 	}
@@ -101,13 +119,8 @@ func (c *Controller) reconcileNode(ctx context.Context, runID, nodeKey string) e
 	if err != nil {
 		return err
 	}
-	var opKey string
-	var attemptNo int64
-	if err := c.store.DB().QueryRowContext(ctx, `
-SELECT na.operation_key, na.attempt_no FROM node_attempt na
-JOIN run_node rn ON rn.id = na.run_node_id
-WHERE rn.run_id = ? AND rn.node_key = ?
-ORDER BY na.attempt_no DESC LIMIT 1`, runID, nodeKey).Scan(&opKey, &attemptNo); err != nil {
+	opKey, attemptNo, err := c.latestAttempt(ctx, runID, nodeKey)
+	if err != nil {
 		return err
 	}
 	kind, _, err := c.contractFor(nodeConfigForKey(c, ctx, runID, run.graphVersionID, nodeKey))
@@ -142,6 +155,60 @@ ORDER BY na.attempt_no DESC LIMIT 1`, runID, nodeKey).Scan(&opKey, &attemptNo); 
 		})
 	}
 	return c.requeuedNode(ctx, runID, nodeKey, attemptNo)
+}
+
+func (c *Controller) reconcileCancelledNode(ctx context.Context, runID, nodeKey string, attemptNo int64) error {
+	if err := c.appendEvent(ctx, runID, "node_reconciling", map[string]any{
+		"node_key": nodeKey,
+	}); err != nil {
+		return err
+	}
+	run, err := c.loadRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	opKey, storedAttemptNo, err := c.latestAttempt(ctx, runID, nodeKey)
+	if err != nil {
+		return err
+	}
+	if storedAttemptNo > 0 {
+		attemptNo = storedAttemptNo
+	}
+	kind, _, err := c.contractFor(nodeConfigForKey(c, ctx, runID, run.graphVersionID, nodeKey))
+	if err != nil {
+		return err
+	}
+	ex, ok := c.pool[kind]
+	if !ok {
+		return c.waitingNode(ctx, runID, nodeKey)
+	}
+	recon, ok := ex.(executor.Reconciler)
+	if !ok {
+		return c.waitingNode(ctx, runID, nodeKey)
+	}
+	state, rerr := recon.Reconcile(ctx, &executor.Request{
+		RunID:            runID,
+		GraphVersionID:   run.graphVersionID,
+		DefinitionDigest: run.digest,
+		NodeKey:          nodeKey,
+		AttemptNo:        attemptNo,
+		OperationKey:     opKey,
+	})
+	if rerr != nil || state == executor.EffectUnknown {
+		return c.waitingNode(ctx, runID, nodeKey)
+	}
+	return c.cancelledNode(ctx, runID, nodeKey, attemptNo)
+}
+
+func (c *Controller) latestAttempt(ctx context.Context, runID, nodeKey string) (string, int64, error) {
+	var opKey string
+	var attemptNo int64
+	err := c.store.DB().QueryRowContext(ctx, `
+SELECT na.operation_key, na.attempt_no FROM node_attempt na
+JOIN run_node rn ON rn.id = na.run_node_id
+WHERE rn.run_id = ? AND rn.node_key = ?
+ORDER BY na.attempt_no DESC LIMIT 1`, runID, nodeKey).Scan(&opKey, &attemptNo)
+	return opKey, attemptNo, err
 }
 
 func nodeConfigForKey(c *Controller, ctx context.Context, runID, graphVersionID, nodeKey string) string {

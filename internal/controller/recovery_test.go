@@ -245,3 +245,68 @@ func TestRecoveryFanOutPartialSurvives(t *testing.T) {
 		t.Errorf("run = %q, want failed", runStatus(t, st, runID))
 	}
 }
+
+func TestRecoveryCancelRequestedPureNode(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	frozen := compileAndFreeze(t, st, `schema: proceed/v1
+name: cancelled
+nodes:
+  - id: work
+    type: task
+    executor: { kind: shell, command: [bin/w] }
+    contract: pure
+    terminal: true
+edges: []
+`)
+	cfg := DefaultConfig()
+	cfg.LeaseTTL = time.Second
+	c, err := New(st, cfg, map[executor.Kind]executor.Executor{
+		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			return &executor.Result{}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, err := c.Run(ctx, RunInput{GraphVersionID: frozen.GraphVersionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.appendEvent(ctx, runID, "node_started", map[string]any{
+		"node_key":             "work",
+		"attempt_no":           1,
+		"executor":             "shell",
+		"side_effect_contract": "pure",
+		"operation_key":        OperationKey(runID, frozen.Digest, "work", 1),
+		"lease_token":          "expired-token",
+		"lease_expires_at":     time.Now().Add(-time.Second).UnixMilli(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.appendEvent(ctx, runID, "node_cancel_requested", map[string]any{
+		"node_key": "work",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	c.releaseLease(ctx)
+
+	recovered := recoverController(t, st, map[executor.Kind]executor.Executor{
+		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			return &executor.Result{}, nil
+		}),
+	})
+	if err := recovered.Recover(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
+	if s := nodeStatus(t, st, runID, "work"); s != "cancelled" {
+		t.Fatalf("node = %q, want cancelled after restart", s)
+	}
+	if err := recovered.Drain(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
+	if s := runStatus(t, st, runID); s != "cancelled" {
+		t.Fatalf("run = %q, want cancelled after restart", s)
+	}
+	assertReplayStable(t, st)
+}
