@@ -122,6 +122,34 @@ func (s *Store) Append(ctx context.Context, ev Event) (Event, error) {
 	return ev, nil
 }
 
+// AppendTx canonicalizes, validates, and appends an event inside an existing
+// transaction, assigning the next per-run sequence. Idempotency keys are honored.
+func (s *Store) AppendTx(ctx context.Context, tx *sql.Tx, ev *Event) error {
+	now := time.Now().UnixMilli()
+	if ev.EventID == "" {
+		ev.EventID = ulid.Make().String()
+	}
+	var maxSeq int64
+	if err := tx.QueryRowContext(ctx,
+		"SELECT COALESCE(MAX(sequence), 0) FROM event WHERE run_id = ?", ev.RunID).Scan(&maxSeq); err != nil {
+		return err
+	}
+	ev.Sequence = maxSeq + 1
+	if err := ev.validate(now); err != nil {
+		return err
+	}
+	canonical, cerr := canonicalJSON(ev.Payload)
+	if cerr != nil {
+		return storeErr(CodeGraphInvalid, "event payload must be a single valid JSON value: %v", cerr)
+	}
+	ev.Payload = canonical
+	ev.PayloadDigest = payloadDigest(ev.Payload)
+	if ev.RecordedAt == 0 {
+		ev.RecordedAt = now
+	}
+	return appendEventTx(ctx, tx, ev)
+}
+
 func appendEventTx(ctx context.Context, tx *sql.Tx, ev *Event) error {
 	if ev.IdempotencyKey != "" {
 		var existing string

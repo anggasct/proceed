@@ -24,6 +24,10 @@ func storeErr(code, format string, args ...any) *Error {
 	return &Error{Code: code, Msg: fmt.Sprintf(format, args...)}
 }
 
+func NewCodeError(code, format string, args ...any) *Error {
+	return storeErr(code, format, args...)
+}
+
 func AsStoreError(err error) (*Error, bool) {
 	var e *Error
 	if errors.As(err, &e) {
