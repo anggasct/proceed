@@ -3,6 +3,8 @@ package executor
 import (
 	"context"
 	"errors"
+
+	"proceed/internal/capability"
 )
 
 type Contract string
@@ -24,21 +26,53 @@ const (
 )
 
 type Request struct {
-	RunID            string
-	GraphVersionID   string
-	DefinitionDigest string
-	NodeKey          string
-	AttemptNo        int64
-	OperationKey     string
-	Config           map[string]any
-	TimeoutMs        int64
-	Cancellation     chan struct{}
+	RunID             string
+	GraphVersionID    string
+	DefinitionDigest  string
+	NodeKey           string
+	AttemptNo         int64
+	OperationKey      string
+	Config            map[string]any
+	DeclaredCommand   []string
+	TimeoutMs         int64
+	Cancellation      <-chan struct{}
+	Capability        capability.Profile
+	WorkspaceRoot     string
+	Inputs            []ArtifactRef
+	Secrets           SecretResolver
+	ArtifactPublisher ArtifactPublisher
 }
 
 type Result struct {
-	Output  map[string]any
-	Route   string
-	Effects []Effect
+	Output    map[string]any
+	Route     string
+	Artifacts []ArtifactRef
+	Effects   []Effect
+}
+
+type ArtifactInput struct {
+	Name      string
+	MediaType string
+	Content   []byte
+	Truncated bool
+}
+
+type ArtifactRef struct {
+	ID          string
+	Name        string
+	Path        string
+	ContentHash string
+	MediaType   string
+	SizeBytes   int64
+	Truncated   bool
+}
+
+type SecretResolver interface {
+	Resolve(ctx context.Context, name string) ([]byte, error)
+}
+
+type ArtifactPublisher interface {
+	Publish(ctx context.Context, input ArtifactInput) (ArtifactRef, error)
 }
 
 type Effect struct {
@@ -48,15 +82,19 @@ type Effect struct {
 }
 
 var (
-	ErrTimeout         = errors.New("executor timeout")
-	ErrCancelled       = errors.New("executor cancelled")
-	ErrUncertain       = errors.New("executor effect uncertain")
-	ErrNotReconcilable = errors.New("executor does not support reconcile")
+	ErrTimeout         = errors.New("NODE_TIMEOUT")
+	ErrCancelled       = errors.New("RUN_CANCELLED")
+	ErrUncertain       = errors.New("EFFECT_UNCERTAIN")
+	ErrNotReconcilable = errors.New("EFFECT_UNCERTAIN")
 )
 
 type Executor interface {
 	Kind() Kind
 	Execute(ctx context.Context, req *Request) (*Result, error)
+}
+
+type Admitter interface {
+	Admit(ctx context.Context, req *Request) error
 }
 
 type Reconciler interface {

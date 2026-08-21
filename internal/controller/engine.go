@@ -6,11 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/oklog/ulid/v2"
 
+	"proceed/internal/capability"
 	"proceed/internal/executor"
 	"proceed/internal/store"
 )
@@ -263,6 +266,22 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 	}
 	maxAttempts, backoffMs := retryPolicy(cfg)
 	n.MaxAttempts, n.BackoffMs = maxAttempts, backoffMs
+	var profile capability.Profile
+	var workspaceRoot string
+	var artifactSink executor.ArtifactPublisher
+	if kind == executor.Shell {
+		if _, hasProfile := cfg["capability"]; hasProfile {
+			profile, err = capability.FromConfig(cfg)
+			if err != nil {
+				return c.failNode(ctx, runID, n.NodeKey, n.AttemptNo, err)
+			}
+		}
+		workspaceRoot, err = c.prepareWorkspace(runID)
+		if err != nil {
+			return c.failNode(ctx, runID, n.NodeKey, n.AttemptNo, err)
+		}
+		artifactSink = &artifactPublisher{dataDir: c.store.DataDir()}
+	}
 
 	opKey := OperationKey(runID, digest, n.NodeKey, n.AttemptNo)
 	leaseToken := ulid.Make().String()
@@ -272,8 +291,30 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 	signalRequestCancel := func() {
 		cancelOnce.Do(func() { close(cancelChan) })
 	}
+	req := &executor.Request{
+		RunID:             runID,
+		GraphVersionID:    graphVersionID,
+		DefinitionDigest:  digest,
+		NodeKey:           n.NodeKey,
+		AttemptNo:         n.AttemptNo,
+		OperationKey:      opKey,
+		Config:            cfg,
+		Cancellation:      cancelChan,
+		Capability:        profile,
+		WorkspaceRoot:     workspaceRoot,
+		Secrets:           c.cfg.Secrets,
+		ArtifactPublisher: artifactSink,
+	}
+	if v, ok := cfg["timeout_ms"].(float64); ok && int64(v) > 0 {
+		req.TimeoutMs = int64(v)
+	}
+	if admitter, ok := ex.(executor.Admitter); ok {
+		if err := admitter.Admit(ctx, req); err != nil {
+			return c.failNode(ctx, runID, n.NodeKey, n.AttemptNo, err)
+		}
+	}
 
-	claimed, execCtx, cancelExec, err := c.beginClaimedAttempt(ctx, runID, n, kind, contract, opKey, leaseToken, leaseExpiry, signalRequestCancel)
+	claimed, execCtx, cancelExec, err := c.beginClaimedAttempt(ctx, runID, digest, n, kind, contract, profile, opKey, leaseToken, leaseExpiry, signalRequestCancel)
 	if err != nil {
 		return err
 	}
@@ -286,20 +327,6 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 	}()
 	if execCtx.Err() != nil || c.nodeCancelled(ctx, runID, n.NodeKey) {
 		return c.cancelledNode(ctx, runID, n.NodeKey, n.AttemptNo)
-	}
-
-	req := &executor.Request{
-		RunID:            runID,
-		GraphVersionID:   graphVersionID,
-		DefinitionDigest: digest,
-		NodeKey:          n.NodeKey,
-		AttemptNo:        n.AttemptNo,
-		OperationKey:     opKey,
-		Config:           cfg,
-		Cancellation:     cancelChan,
-	}
-	if v, ok := cfg["timeout_ms"].(float64); ok && int64(v) > 0 {
-		req.TimeoutMs = int64(v)
 	}
 
 	var execErr error
@@ -340,6 +367,9 @@ watch:
 		execErr = executor.ErrTimeout
 	}
 	if execErr != nil {
+		if err := c.persistArtifacts(ctx, runID, n.NodeKey, opKey, resultArtifacts(result)); err != nil {
+			return err
+		}
 		if errors.Is(execErr, executor.ErrUncertain) {
 			return c.uncertainNode(ctx, runID, n.NodeKey, n.AttemptNo, execErr)
 		}
@@ -363,6 +393,21 @@ watch:
 	return c.commitNodeSuccess(ctx, runID, graphVersionID, digest, n, result, opKey)
 }
 
+func resultArtifacts(result *executor.Result) []executor.ArtifactRef {
+	if result == nil {
+		return nil
+	}
+	return result.Artifacts
+}
+
+func (c *Controller) prepareWorkspace(runID string) (string, error) {
+	root := filepath.Join(c.store.DataDir(), "workspaces", runID)
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", err
+	}
+	return root, nil
+}
+
 func (c *Controller) nodeCancelled(ctx context.Context, runID, nodeKey string) bool {
 	var count int
 	if err := c.store.DB().QueryRowContext(ctx,
@@ -383,7 +428,7 @@ func (c *Controller) nodeCancelRequested(ctx context.Context, runID, nodeKey str
 	return count > 0
 }
 
-func (c *Controller) beginClaimedAttempt(ctx context.Context, runID string, n runnableNode, kind executor.Kind, contract executor.Contract, opKey, leaseToken string, leaseExpiry int64, cancelRequest func()) (bool, context.Context, context.CancelFunc, error) {
+func (c *Controller) beginClaimedAttempt(ctx context.Context, runID, digest string, n runnableNode, kind executor.Kind, contract executor.Contract, profile capability.Profile, opKey, leaseToken string, leaseExpiry int64, cancelRequest func()) (bool, context.Context, context.CancelFunc, error) {
 	execCtx, cancelExec := context.WithCancel(ctx)
 	if !c.trackInflight(runID, n.NodeKey, inflightExecution{
 		cancelContext: cancelExec,
@@ -404,6 +449,30 @@ func (c *Controller) beginClaimedAttempt(ctx context.Context, runID string, n ru
 		}
 		if err == nil && (!current.Valid || current.String != "eligible") {
 			return nil
+		}
+		if kind == executor.Shell && profile.Process != "" {
+			if _, err := c.appendWithin(ctx, tx, &store.Event{
+				EventID:       ulid.Make().String(),
+				RunID:         runID,
+				SchemaVersion: "proceed/v1",
+				Type:          "capability_approved",
+				OccurredAt:    nowMs,
+				RecordedAt:    nowMs,
+				ActorType:     "controller",
+				ActorID:       c.cfg.OwnerID,
+				CorrelationID: opKey,
+				Payload: payloadJSON(map[string]any{
+					"definition_digest": digest,
+					"node_key":          n.NodeKey,
+					"filesystem":        profile.Filesystem.Mode,
+					"paths":             profile.Filesystem.Paths,
+					"process":           profile.Process,
+					"network":           profile.Network,
+					"secrets":           profile.Secrets,
+				}),
+			}); err != nil {
+				return err
+			}
 		}
 		ev := store.Event{
 			EventID:       ulid.Make().String(),

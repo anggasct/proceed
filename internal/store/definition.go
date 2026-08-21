@@ -20,6 +20,7 @@ import (
 
 type Store struct {
 	db       *sql.DB
+	dataDir  string
 	lockPath string
 }
 
@@ -60,7 +61,7 @@ func Open(path string) (*Store, error) {
 	} else if _, err := db.Exec(schemaDDL); err != nil {
 		return nil, closeOnErr(db, fmt.Errorf("apply schema: %w", err))
 	}
-	return &Store{db: db, lockPath: lockPath}, nil
+	return &Store{db: db, dataDir: filepath.Dir(path), lockPath: lockPath}, nil
 }
 
 func migrateUnderLock(ctx context.Context, db *sql.DB, path string) error {
@@ -242,6 +243,8 @@ func (s *Store) WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 }
 
 func (s *Store) DB() *sql.DB { return s.db }
+
+func (s *Store) DataDir() string { return s.dataDir }
 
 func ensureGraph(ctx context.Context, tx *sql.Tx, name string) (string, error) {
 	var id string
