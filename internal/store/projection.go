@@ -81,9 +81,12 @@ type nodeStartedPayload struct {
 }
 
 type nodeTerminalPayload struct {
-	NodeKey   string          `json:"node_key"`
-	AttemptNo int64           `json:"attempt_no"`
-	Result    json.RawMessage `json:"result"`
+	NodeKey            string          `json:"node_key"`
+	AttemptNo          int64           `json:"attempt_no"`
+	Executor           string          `json:"executor"`
+	SideEffectContract string          `json:"side_effect_contract"`
+	OperationKey       string          `json:"operation_key"`
+	Result             json.RawMessage `json:"result"`
 }
 
 type edgeTraversedPayload struct {
@@ -302,7 +305,7 @@ func onNodeTerminal(ctx context.Context, tx *sql.Tx, ev *Event) error {
 	if err := decodePayload(ev, &p); err != nil {
 		return err
 	}
-	nodeID, err := runNodeID(ctx, tx, ev.RunID, p.NodeKey)
+	nodeID, err := ensureRunNode(ctx, tx, ev.RunID, p.NodeKey)
 	if err != nil {
 		return err
 	}
@@ -312,6 +315,25 @@ func onNodeTerminal(ctx context.Context, tx *sql.Tx, ev *Event) error {
 		"node_uncertain": "uncertain",
 	}[ev.Type]
 	if p.AttemptNo > 0 {
+		var attempts int
+		if err := tx.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM node_attempt WHERE run_node_id = ? AND attempt_no = ?",
+			nodeID, p.AttemptNo).Scan(&attempts); err != nil {
+			return err
+		}
+		if attempts == 0 && p.OperationKey != "" {
+			if p.Executor == "" || p.SideEffectContract == "" {
+				return storeErr(CodeGraphInvalid, "event %s cannot create a rejected attempt without executor metadata", ev.EventID)
+			}
+			if _, err := tx.ExecContext(ctx, `
+INSERT INTO node_attempt (id, run_node_id, attempt_no, operation_key, executor,
+                          side_effect_contract, status, result, finished_at)
+VALUES (?, ?, ?, ?, ?, ?, 'failed', ?, ?)`,
+				ev.EventID, nodeID, p.AttemptNo, p.OperationKey, p.Executor, p.SideEffectContract,
+				nullableOr(rawOr(p.Result, "")), finishedAt(ev, ev.Type)); err != nil {
+				return err
+			}
+		}
 		if _, err := tx.ExecContext(ctx, `
 UPDATE node_attempt SET status = ?, finished_at = COALESCE(?, finished_at), result = COALESCE(?, result)
 WHERE run_node_id = ? AND attempt_no = ? AND status <> 'cancelled'`,
@@ -333,9 +355,9 @@ WHERE run_node_id = ? AND attempt_no = (SELECT MAX(attempt_no) FROM node_attempt
 		"node_uncertain": "uncertain",
 	}[ev.Type]
 	_, err = tx.ExecContext(ctx, `
-UPDATE run_node SET status = ?, finished_at = COALESCE(?, finished_at)
+UPDATE run_node SET status = ?, attempt_count = MAX(attempt_count, ?), finished_at = COALESCE(?, finished_at)
 WHERE id = ? AND status NOT IN ('cancel_requested', 'cancelled')`,
-		nodeStatus, finishedAt(ev, ev.Type), nodeID)
+		nodeStatus, p.AttemptNo, finishedAt(ev, ev.Type), nodeID)
 	return err
 }
 

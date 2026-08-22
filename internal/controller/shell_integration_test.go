@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"proceed/internal/executor"
@@ -88,7 +89,7 @@ edges: []
 			finishSeq = event.Sequence
 		}
 	}
-	if approvalSeq == 0 || startedSeq == 0 || artifactSeq == 0 || finishSeq == 0 || approvalSeq <= startedSeq || approvalSeq >= artifactSeq || artifactSeq >= finishSeq {
+	if approvalSeq == 0 || startedSeq == 0 || artifactSeq == 0 || finishSeq == 0 || approvalSeq >= startedSeq || startedSeq >= artifactSeq || artifactSeq >= finishSeq {
 		t.Fatalf("event order approval=%d node_started=%d artifact=%d node_finished=%d", approvalSeq, startedSeq, artifactSeq, finishSeq)
 	}
 }
@@ -121,26 +122,87 @@ edges: []
 		t.Fatal(err)
 	}
 
-	var attemptStatus, nodeStatus string
+	var attemptStatus, nodeStatus, leaseToken string
 	if err := st.DB().QueryRow(`
-SELECT na.status, rn.status
+SELECT na.status, rn.status, COALESCE(na.lease_token, '')
 FROM node_attempt na
 JOIN run_node rn ON rn.id = na.run_node_id
-WHERE rn.run_id = ? AND rn.node_key = 'denied'`, runID).Scan(&attemptStatus, &nodeStatus); err != nil {
+WHERE rn.run_id = ? AND rn.node_key = 'denied'`, runID).Scan(&attemptStatus, &nodeStatus, &leaseToken); err != nil {
 		t.Fatal(err)
 	}
-	if attemptStatus != "failed" || nodeStatus != "failed" {
-		t.Fatalf("attempt/node status = %s/%s, want failed/failed", attemptStatus, nodeStatus)
+	if attemptStatus != "failed" || nodeStatus != "failed" || leaseToken != "" {
+		t.Fatalf("attempt/node/lease = %s/%s/%q, want failed/failed/empty", attemptStatus, nodeStatus, leaseToken)
 	}
 	events, err := st.Events(ctx, runID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, event := range events {
+		if event.Type == "node_started" {
+			t.Fatal("node_started event recorded for a rejected shell")
+		}
 		if event.Type == "capability_approved" {
 			t.Fatal("capability approval recorded for a rejected shell")
 		}
 	}
+}
+
+func TestControllerPassesDeclaredCommandToAdmission(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	frozen := compileAndFreeze(t, st, `schema: proceed/v1
+name: declared-command
+nodes:
+  - id: guarded
+    type: task
+    executor: { kind: shell, command: [/bin/true] }
+    contract: pure
+    terminal: true
+    capability:
+      filesystem: none
+      process: declared-command
+      network: none
+edges: []
+`)
+	adapter := &mutatingAdmitter{
+		delegate: &shell.Executor{Launcher: shell.Launcher{Path: fakeBubblewrap(t)}},
+	}
+	c := newController(t, st, map[executor.Kind]executor.Executor{executor.Shell: adapter})
+	runID, err := c.Run(ctx, RunInput{GraphVersionID: frozen.GraphVersionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Drain(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.executed.Load() != 0 {
+		t.Fatal("executor ran after command mismatch")
+	}
+	if got := nodeStatus(t, st, runID, "guarded"); got != "failed" {
+		t.Fatalf("node status = %q, want failed", got)
+	}
+}
+
+type mutatingAdmitter struct {
+	delegate *shell.Executor
+	executed atomic.Int64
+}
+
+func (m *mutatingAdmitter) Kind() executor.Kind { return executor.Shell }
+
+func (m *mutatingAdmitter) Admit(ctx context.Context, req *executor.Request) error {
+	raw := req.Config["executor"].(map[string]any)
+	raw["command"] = []any{"/bin/false"}
+	return m.delegate.Admit(ctx, req)
+}
+
+func (m *mutatingAdmitter) Execute(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+	m.executed.Add(1)
+	return m.delegate.Execute(ctx, req)
 }
 
 func fakeBubblewrap(t *testing.T) string {

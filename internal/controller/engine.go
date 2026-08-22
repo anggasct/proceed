@@ -169,6 +169,42 @@ func (c *Controller) parseNodeConfig(config string) (map[string]any, executor.Ki
 	return cfg, kind, contract, nil
 }
 
+func declaredCommand(cfg map[string]any) ([]string, error) {
+	rawExec, ok := cfg["executor"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("node has no executor config")
+	}
+	rawCommand, ok := rawExec["command"]
+	if !ok {
+		return nil, fmt.Errorf("shell executor command is required")
+	}
+	var values []any
+	switch command := rawCommand.(type) {
+	case []any:
+		values = command
+	case []string:
+		result := append([]string(nil), command...)
+		if len(result) == 0 {
+			return nil, fmt.Errorf("shell executor command is required")
+		}
+		return result, nil
+	default:
+		return nil, fmt.Errorf("shell executor command must be an argv list")
+	}
+	result := make([]string, len(values))
+	for i, value := range values {
+		var ok bool
+		result[i], ok = value.(string)
+		if !ok || result[i] == "" {
+			return nil, fmt.Errorf("shell executor command must contain non-empty strings")
+		}
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("shell executor command is required")
+	}
+	return result, nil
+}
+
 func (c *Controller) resolveExecutor(cfg map[string]any) (executor.Executor, executor.Kind, executor.Contract, error) {
 	rawExec, ok := cfg["executor"].(map[string]any)
 	if !ok {
@@ -305,8 +341,24 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 		Secrets:           c.cfg.Secrets,
 		ArtifactPublisher: artifactSink,
 	}
+	if kind == executor.Shell {
+		req.DeclaredCommand, err = declaredCommand(cfg)
+		if err != nil {
+			return c.rejectNode(ctx, runID, n.NodeKey, n.AttemptNo, kind, contract, opKey, err)
+		}
+	}
 	if v, ok := cfg["timeout_ms"].(float64); ok && int64(v) > 0 {
 		req.TimeoutMs = int64(v)
+	}
+	if admitter, ok := ex.(executor.Admitter); ok {
+		if err := admitter.Admit(ctx, req); err != nil {
+			return c.rejectNode(ctx, runID, n.NodeKey, n.AttemptNo, kind, contract, opKey, err)
+		}
+	}
+	if kind == executor.Shell && profile.Process != "" {
+		if err := c.recordCapabilityApproval(ctx, runID, digest, n.NodeKey, opKey, profile); err != nil {
+			return c.rejectNode(ctx, runID, n.NodeKey, n.AttemptNo, kind, contract, opKey, err)
+		}
 	}
 	claimed, execCtx, cancelExec, err := c.beginClaimedAttempt(ctx, runID, n, kind, contract, opKey, leaseToken, leaseExpiry, signalRequestCancel)
 	if err != nil {
@@ -322,17 +374,6 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 	if execCtx.Err() != nil || c.nodeCancelled(ctx, runID, n.NodeKey) {
 		return c.cancelledNode(ctx, runID, n.NodeKey, n.AttemptNo)
 	}
-	if admitter, ok := ex.(executor.Admitter); ok {
-		if err := admitter.Admit(ctx, req); err != nil {
-			return c.failNode(ctx, runID, n.NodeKey, n.AttemptNo, err)
-		}
-	}
-	if kind == executor.Shell && profile.Process != "" {
-		if err := c.recordCapabilityApproval(ctx, runID, digest, n.NodeKey, opKey, profile); err != nil {
-			return c.failNode(ctx, runID, n.NodeKey, n.AttemptNo, err)
-		}
-	}
-
 	var execErr error
 	var result *executor.Result
 	done := make(chan struct{})

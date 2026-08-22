@@ -35,6 +35,19 @@ func (c *Controller) failNode(ctx context.Context, runID, nodeKey string, attemp
 	})
 }
 
+func (c *Controller) rejectNode(ctx context.Context, runID, nodeKey string, attemptNo int64, kind executor.Kind, contract executor.Contract, opKey string, cause error) error {
+	return c.appendEvent(ctx, runID, "node_failed", map[string]any{
+		"node_key":             nodeKey,
+		"attempt_no":           attemptNo,
+		"executor":             string(kind),
+		"side_effect_contract": string(contract),
+		"operation_key":        opKey,
+		"result": map[string]any{
+			"error": trimErr(cause),
+		},
+	})
+}
+
 func (c *Controller) uncertainNode(ctx context.Context, runID, nodeKey string, attemptNo int64, cause error) error {
 	return c.appendEvent(ctx, runID, "node_uncertain", map[string]any{
 		"node_key":   nodeKey,
