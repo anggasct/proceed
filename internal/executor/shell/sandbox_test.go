@@ -70,7 +70,7 @@ func TestNativeSandbox(t *testing.T) {
 		Process:    capability.ProcessDeclaredCommand,
 		Network:    capability.NetworkNone,
 	}
-	cmd, err := NewLauncher("").Command(p, workspace, "", []string{"/bin/sh", "-c", `printf allowed > /workspace/approved/allowed; if cat /workspace/secret.txt >/dev/null 2>&1; then exit 1; fi; if printf blocked > /tmp/escape 2>/dev/null; then exit 1; fi; printf native-sandbox-ok`}, nil)
+	cmd, err := NewLauncher("").Command(p, workspace, "", []string{"/bin/sh", "-c", `printf allowed > /workspace/approved/allowed; if cat /workspace/secret.txt >/dev/null 2>&1; then exit 1; fi; if printf blocked > /tmp/escape 2>/dev/null; then exit 1; fi; if [ ! -x /usr/bin/curl ]; then exit 2; fi; if /usr/bin/curl --connect-timeout 1 --max-time 2 -sS http://1.1.1.1 >/dev/null 2>&1; then exit 1; fi; printf native-sandbox-ok`}, nil)
 	if err != nil {
 		t.Fatalf("Command() error = %v", err)
 	}

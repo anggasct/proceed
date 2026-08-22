@@ -20,7 +20,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Install sandbox dependency
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap curl
 
       - name: Verify sandbox dependency
         run: bwrap --version

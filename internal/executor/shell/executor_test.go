@@ -78,6 +78,41 @@ func TestExecuteRedactsResolvedSecrets(t *testing.T) {
 	}
 }
 
+func TestExecuteRedactsSecretsBeforeOutputLimit(t *testing.T) {
+	secret := "secret-value-longer-than-limit"
+	publisher := &recordingPublisher{}
+	adapter := &Executor{Launcher: Launcher{Path: fakeBubblewrap(t)}, OutputLimit: 12}
+	result, err := adapter.Execute(context.Background(), &executor.Request{
+		Config: map[string]any{
+			"executor": map[string]any{
+				"kind":    "shell",
+				"command": []any{"/bin/sh", "-c", "printf 'prefix-%s' \"$TOKEN\""},
+				"x-proceed-env": map[string]any{
+					"TOKEN": "${token}",
+				},
+			},
+		},
+		Capability: func() capability.Profile {
+			p := testProfile()
+			p.Secrets = []string{"token"}
+			return p
+		}(),
+		WorkspaceRoot:     t.TempDir(),
+		Secrets:           resolver{"token": secret},
+		ArtifactPublisher: publisher,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	stdout := result.Output["stdout"].(string)
+	if strings.Contains(stdout, secret) || strings.Contains(string(publisher.inputs[0].Content), secret) {
+		t.Fatalf("secret leaked across output boundary: stdout=%q artifact=%q", stdout, publisher.inputs[0].Content)
+	}
+	if result.Output["truncated"] != true {
+		t.Fatalf("truncated = %v, want true", result.Output["truncated"])
+	}
+}
+
 func TestExecuteRejectsUndeclaredSecretBeforeStart(t *testing.T) {
 	adapter := &Executor{Launcher: Launcher{Path: fakeBubblewrap(t)}}
 	_, err := adapter.Execute(context.Background(), &executor.Request{

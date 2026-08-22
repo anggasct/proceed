@@ -84,8 +84,9 @@ func (e *Executor) Execute(ctx context.Context, req *executor.Request) (*executo
 	if limit <= 0 {
 		limit = DefaultOutputLimit
 	}
-	stdout := &limitedBuffer{limit: limit}
-	stderr := &limitedBuffer{limit: limit}
+	captureLimit := redactionCaptureLimit(limit, redactions)
+	stdout := &limitedBuffer{limit: captureLimit}
+	stderr := &limitedBuffer{limit: captureLimit}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
@@ -110,17 +111,17 @@ func (e *Executor) Execute(ctx context.Context, req *executor.Request) (*executo
 		return nil, executor.ErrCancelled
 	}
 
-	stdoutBytes := redact(stdout.Bytes(), redactions)
-	stderrBytes := redact(stderr.Bytes(), redactions)
+	stdoutBytes, stdoutTruncated := redactAndBound(stdout.Bytes(), redactions, limit, stdout.Truncated())
+	stderrBytes, stderrTruncated := redactAndBound(stderr.Bytes(), redactions, limit, stderr.Truncated())
 	result := &executor.Result{
 		Output: map[string]any{
 			"stdout":    string(stdoutBytes),
 			"stderr":    string(stderrBytes),
 			"exit_code": 0,
-			"truncated": stdout.Truncated() || stderr.Truncated(),
+			"truncated": stdoutTruncated || stderrTruncated,
 		},
 	}
-	refs, err := publishOutput(ctx, req.ArtifactPublisher, stdoutBytes, stderrBytes, stdout.Truncated(), stderr.Truncated())
+	refs, err := publishOutput(ctx, req.ArtifactPublisher, stdoutBytes, stderrBytes, stdoutTruncated, stderrTruncated)
 	if err != nil {
 		return nil, err
 	}
@@ -299,6 +300,33 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 func (b *limitedBuffer) Bytes() []byte { return b.buf.Bytes() }
 
 func (b *limitedBuffer) Truncated() bool { return b.truncated }
+
+func redactionCaptureLimit(limit int, secrets [][]byte) int {
+	maxSecret := 0
+	for _, secret := range secrets {
+		if len(secret) > maxSecret {
+			maxSecret = len(secret)
+		}
+	}
+	if maxSecret <= 1 {
+		return limit
+	}
+	maxInt := int(^uint(0) >> 1)
+	extra := maxSecret - 1
+	if extra > maxInt-limit {
+		return maxInt
+	}
+	return limit + extra
+}
+
+func redactAndBound(value []byte, secrets [][]byte, limit int, capturedLimit bool) ([]byte, bool) {
+	redacted := redact(value, secrets)
+	truncated := capturedLimit || len(value) > limit || len(redacted) > limit
+	if len(redacted) > limit {
+		redacted = redacted[:limit]
+	}
+	return redacted, truncated
+}
 
 func redact(value []byte, secrets [][]byte) []byte {
 	for _, secret := range secrets {
