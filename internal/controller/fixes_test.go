@@ -317,13 +317,13 @@ func TestLongExecutorKeepsLeaseAlive(t *testing.T) {
 	frozen := compileAndFreeze(t, st, linearGraph)
 	pool := map[executor.Kind]executor.Executor{
 		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
-			time.Sleep(400 * time.Millisecond)
+			time.Sleep(2 * time.Second)
 			return &executor.Result{}, nil
 		}),
 	}
 	cfg := DefaultConfig()
-	cfg.LeaseTTL = 150 * time.Millisecond
-	cfg.HeartbeatPeriod = 40 * time.Millisecond
+	cfg.LeaseTTL = time.Second
+	cfg.HeartbeatPeriod = 200 * time.Millisecond
 	c, err := New(st, cfg, pool)
 	if err != nil {
 		t.Fatal(err)

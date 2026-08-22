@@ -15,6 +15,8 @@ CGO_ENABLED=0 go build -o proceed ./cmd/proceed
 ./proceed --help
 ```
 
+Shell execution requires Linux and the `bubblewrap` command. Proceed refuses isolated shell runs when the sandbox is unavailable.
+
 ## Development checks
 
 ```sh

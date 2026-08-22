@@ -6,11 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/oklog/ulid/v2"
 
+	"proceed/internal/capability"
 	"proceed/internal/executor"
 	"proceed/internal/store"
 )
@@ -166,6 +169,42 @@ func (c *Controller) parseNodeConfig(config string) (map[string]any, executor.Ki
 	return cfg, kind, contract, nil
 }
 
+func declaredCommand(cfg map[string]any) ([]string, error) {
+	rawExec, ok := cfg["executor"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("node has no executor config")
+	}
+	rawCommand, ok := rawExec["command"]
+	if !ok {
+		return nil, fmt.Errorf("shell executor command is required")
+	}
+	var values []any
+	switch command := rawCommand.(type) {
+	case []any:
+		values = command
+	case []string:
+		result := append([]string(nil), command...)
+		if len(result) == 0 {
+			return nil, fmt.Errorf("shell executor command is required")
+		}
+		return result, nil
+	default:
+		return nil, fmt.Errorf("shell executor command must be an argv list")
+	}
+	result := make([]string, len(values))
+	for i, value := range values {
+		var ok bool
+		result[i], ok = value.(string)
+		if !ok || result[i] == "" {
+			return nil, fmt.Errorf("shell executor command must contain non-empty strings")
+		}
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("shell executor command is required")
+	}
+	return result, nil
+}
+
 func (c *Controller) resolveExecutor(cfg map[string]any) (executor.Executor, executor.Kind, executor.Contract, error) {
 	rawExec, ok := cfg["executor"].(map[string]any)
 	if !ok {
@@ -263,6 +302,22 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 	}
 	maxAttempts, backoffMs := retryPolicy(cfg)
 	n.MaxAttempts, n.BackoffMs = maxAttempts, backoffMs
+	var profile capability.Profile
+	var workspaceRoot string
+	var artifactSink executor.ArtifactPublisher
+	if kind == executor.Shell {
+		if _, hasProfile := cfg["capability"]; hasProfile {
+			profile, err = capability.FromConfig(cfg)
+			if err != nil {
+				return c.failNode(ctx, runID, n.NodeKey, n.AttemptNo, err)
+			}
+		}
+		workspaceRoot, err = c.prepareWorkspace(runID)
+		if err != nil {
+			return c.failNode(ctx, runID, n.NodeKey, n.AttemptNo, err)
+		}
+		artifactSink = &artifactPublisher{dataDir: c.store.DataDir()}
+	}
 
 	opKey := OperationKey(runID, digest, n.NodeKey, n.AttemptNo)
 	leaseToken := ulid.Make().String()
@@ -272,7 +327,39 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 	signalRequestCancel := func() {
 		cancelOnce.Do(func() { close(cancelChan) })
 	}
-
+	req := &executor.Request{
+		RunID:             runID,
+		GraphVersionID:    graphVersionID,
+		DefinitionDigest:  digest,
+		NodeKey:           n.NodeKey,
+		AttemptNo:         n.AttemptNo,
+		OperationKey:      opKey,
+		Config:            cfg,
+		Cancellation:      cancelChan,
+		Capability:        profile,
+		WorkspaceRoot:     workspaceRoot,
+		Secrets:           c.cfg.Secrets,
+		ArtifactPublisher: artifactSink,
+	}
+	if kind == executor.Shell {
+		req.DeclaredCommand, err = declaredCommand(cfg)
+		if err != nil {
+			return c.rejectNode(ctx, runID, n.NodeKey, n.AttemptNo, kind, contract, opKey, err)
+		}
+	}
+	if v, ok := cfg["timeout_ms"].(float64); ok && int64(v) > 0 {
+		req.TimeoutMs = int64(v)
+	}
+	if admitter, ok := ex.(executor.Admitter); ok {
+		if err := admitter.Admit(ctx, req); err != nil {
+			return c.rejectNode(ctx, runID, n.NodeKey, n.AttemptNo, kind, contract, opKey, err)
+		}
+	}
+	if kind == executor.Shell && profile.Process != "" {
+		if err := c.recordCapabilityApproval(ctx, runID, digest, n.NodeKey, opKey, profile); err != nil {
+			return c.rejectNode(ctx, runID, n.NodeKey, n.AttemptNo, kind, contract, opKey, err)
+		}
+	}
 	claimed, execCtx, cancelExec, err := c.beginClaimedAttempt(ctx, runID, n, kind, contract, opKey, leaseToken, leaseExpiry, signalRequestCancel)
 	if err != nil {
 		return err
@@ -287,21 +374,6 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 	if execCtx.Err() != nil || c.nodeCancelled(ctx, runID, n.NodeKey) {
 		return c.cancelledNode(ctx, runID, n.NodeKey, n.AttemptNo)
 	}
-
-	req := &executor.Request{
-		RunID:            runID,
-		GraphVersionID:   graphVersionID,
-		DefinitionDigest: digest,
-		NodeKey:          n.NodeKey,
-		AttemptNo:        n.AttemptNo,
-		OperationKey:     opKey,
-		Config:           cfg,
-		Cancellation:     cancelChan,
-	}
-	if v, ok := cfg["timeout_ms"].(float64); ok && int64(v) > 0 {
-		req.TimeoutMs = int64(v)
-	}
-
 	var execErr error
 	var result *executor.Result
 	done := make(chan struct{})
@@ -340,6 +412,9 @@ watch:
 		execErr = executor.ErrTimeout
 	}
 	if execErr != nil {
+		if err := c.persistArtifacts(ctx, runID, n.NodeKey, opKey, resultArtifacts(result)); err != nil {
+			return err
+		}
 		if errors.Is(execErr, executor.ErrUncertain) {
 			return c.uncertainNode(ctx, runID, n.NodeKey, n.AttemptNo, execErr)
 		}
@@ -361,6 +436,34 @@ watch:
 	}
 
 	return c.commitNodeSuccess(ctx, runID, graphVersionID, digest, n, result, opKey)
+}
+
+func resultArtifacts(result *executor.Result) []executor.ArtifactRef {
+	if result == nil {
+		return nil
+	}
+	return result.Artifacts
+}
+
+func (c *Controller) prepareWorkspace(runID string) (string, error) {
+	root := filepath.Join(c.store.DataDir(), "workspaces", runID)
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", err
+	}
+	return root, nil
+}
+
+func (c *Controller) recordCapabilityApproval(ctx context.Context, runID, digest, nodeKey, opKey string, profile capability.Profile) error {
+	return c.appendEvent(ctx, runID, "capability_approved", map[string]any{
+		"definition_digest": digest,
+		"node_key":          nodeKey,
+		"filesystem":        profile.Filesystem.Mode,
+		"paths":             profile.Filesystem.Paths,
+		"process":           profile.Process,
+		"network":           profile.Network,
+		"secrets":           profile.Secrets,
+		"operation_key":     opKey,
+	})
 }
 
 func (c *Controller) nodeCancelled(ctx context.Context, runID, nodeKey string) bool {

@@ -19,10 +19,8 @@ func (c *Controller) CancelRun(ctx context.Context, runID string) error {
 		return nil
 	}
 
-	c.cancelInflightRun(runID)
-
 	nowMs := time.Now().UnixMilli()
-	return c.store.WithTx(ctx, func(tx *sql.Tx) error {
+	err = c.store.WithTx(ctx, func(tx *sql.Tx) error {
 		var status string
 		if err := tx.QueryRowContext(ctx,
 			"SELECT status FROM graph_run WHERE id = ?", runID).Scan(&status); err != nil {
@@ -150,4 +148,9 @@ SELECT COUNT(*) FROM run_node WHERE run_id = ?
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	c.cancelInflightRun(runID)
+	return nil
 }
