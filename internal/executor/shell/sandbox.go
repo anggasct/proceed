@@ -113,24 +113,41 @@ func appendFilesystemArgs(args []string, profile capability.Profile, workspace s
 	case capability.FilesystemWorkspaceWrite:
 		return append(args, "--bind", workspace, "/workspace"), nil
 	case capability.FilesystemDeclaredPaths:
-		args = append(args, "--ro-bind", workspace, "/workspace")
 		resolvedWorkspace, err := filepath.EvalSymlinks(workspace)
 		if err != nil {
 			return nil, &capability.Error{Message: "workspace path cannot be resolved"}
 		}
 		for _, path := range profile.Filesystem.Paths {
 			hostPath := filepath.Join(workspace, path)
-			if _, err := os.Stat(hostPath); err != nil {
+			info, err := os.Stat(hostPath)
+			if err != nil {
 				return nil, &capability.Error{Message: "approved workspace path does not exist"}
 			}
 			resolvedPath, err := filepath.EvalSymlinks(hostPath)
 			if err != nil || !withinPath(resolvedWorkspace, resolvedPath) {
 				return nil, &capability.Error{Message: "approved workspace path escapes the workspace"}
 			}
+			args = appendSandboxParentDirs(args, path)
+			if info.IsDir() {
+				target := filepath.Join("/workspace", path)
+				args = append(args, "--dir", target, "--chmod", "0555", target)
+			}
 			args = append(args, "--bind", hostPath, filepath.Join("/workspace", path))
 		}
 	}
 	return args, nil
+}
+
+func appendSandboxParentDirs(args []string, path string) []string {
+	target := filepath.Join("/workspace", path)
+	var parents []string
+	for parent := filepath.Dir(target); parent != "/workspace"; parent = filepath.Dir(parent) {
+		parents = append(parents, parent)
+	}
+	for i := len(parents) - 1; i >= 0; i-- {
+		args = append(args, "--dir", parents[i], "--chmod", "0555", parents[i])
+	}
+	return args
 }
 
 func withinPath(root, path string) bool {

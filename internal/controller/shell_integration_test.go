@@ -88,8 +88,58 @@ edges: []
 			finishSeq = event.Sequence
 		}
 	}
-	if approvalSeq == 0 || startedSeq == 0 || artifactSeq == 0 || finishSeq == 0 || approvalSeq >= startedSeq || artifactSeq >= finishSeq {
+	if approvalSeq == 0 || startedSeq == 0 || artifactSeq == 0 || finishSeq == 0 || approvalSeq <= startedSeq || approvalSeq >= artifactSeq || artifactSeq >= finishSeq {
 		t.Fatalf("event order approval=%d node_started=%d artifact=%d node_finished=%d", approvalSeq, startedSeq, artifactSeq, finishSeq)
+	}
+}
+
+func TestShellAdmissionFailureRecordsAttempt(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	frozen := compileAndFreeze(t, st, `schema: proceed/v1
+name: denied-shell
+nodes:
+  - id: denied
+    type: task
+    executor: { kind: shell, command: [/bin/true] }
+    contract: pure
+    terminal: true
+edges: []
+`)
+	c := newController(t, st, map[executor.Kind]executor.Executor{
+		executor.Shell: &shell.Executor{Launcher: shell.Launcher{Path: "/missing/bwrap"}},
+	})
+	runID, err := c.Run(ctx, RunInput{GraphVersionID: frozen.GraphVersionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Drain(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
+
+	var attemptStatus, nodeStatus string
+	if err := st.DB().QueryRow(`
+SELECT na.status, rn.status
+FROM node_attempt na
+JOIN run_node rn ON rn.id = na.run_node_id
+WHERE rn.run_id = ? AND rn.node_key = 'denied'`, runID).Scan(&attemptStatus, &nodeStatus); err != nil {
+		t.Fatal(err)
+	}
+	if attemptStatus != "failed" || nodeStatus != "failed" {
+		t.Fatalf("attempt/node status = %s/%s, want failed/failed", attemptStatus, nodeStatus)
+	}
+	events, err := st.Events(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Type == "capability_approved" {
+			t.Fatal("capability approval recorded for a rejected shell")
+		}
 	}
 }
 

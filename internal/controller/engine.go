@@ -308,13 +308,7 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 	if v, ok := cfg["timeout_ms"].(float64); ok && int64(v) > 0 {
 		req.TimeoutMs = int64(v)
 	}
-	if admitter, ok := ex.(executor.Admitter); ok {
-		if err := admitter.Admit(ctx, req); err != nil {
-			return c.failNode(ctx, runID, n.NodeKey, n.AttemptNo, err)
-		}
-	}
-
-	claimed, execCtx, cancelExec, err := c.beginClaimedAttempt(ctx, runID, digest, n, kind, contract, profile, opKey, leaseToken, leaseExpiry, signalRequestCancel)
+	claimed, execCtx, cancelExec, err := c.beginClaimedAttempt(ctx, runID, n, kind, contract, opKey, leaseToken, leaseExpiry, signalRequestCancel)
 	if err != nil {
 		return err
 	}
@@ -327,6 +321,16 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 	}()
 	if execCtx.Err() != nil || c.nodeCancelled(ctx, runID, n.NodeKey) {
 		return c.cancelledNode(ctx, runID, n.NodeKey, n.AttemptNo)
+	}
+	if admitter, ok := ex.(executor.Admitter); ok {
+		if err := admitter.Admit(ctx, req); err != nil {
+			return c.failNode(ctx, runID, n.NodeKey, n.AttemptNo, err)
+		}
+	}
+	if kind == executor.Shell && profile.Process != "" {
+		if err := c.recordCapabilityApproval(ctx, runID, digest, n.NodeKey, opKey, profile); err != nil {
+			return c.failNode(ctx, runID, n.NodeKey, n.AttemptNo, err)
+		}
 	}
 
 	var execErr error
@@ -408,6 +412,19 @@ func (c *Controller) prepareWorkspace(runID string) (string, error) {
 	return root, nil
 }
 
+func (c *Controller) recordCapabilityApproval(ctx context.Context, runID, digest, nodeKey, opKey string, profile capability.Profile) error {
+	return c.appendEvent(ctx, runID, "capability_approved", map[string]any{
+		"definition_digest": digest,
+		"node_key":          nodeKey,
+		"filesystem":        profile.Filesystem.Mode,
+		"paths":             profile.Filesystem.Paths,
+		"process":           profile.Process,
+		"network":           profile.Network,
+		"secrets":           profile.Secrets,
+		"operation_key":     opKey,
+	})
+}
+
 func (c *Controller) nodeCancelled(ctx context.Context, runID, nodeKey string) bool {
 	var count int
 	if err := c.store.DB().QueryRowContext(ctx,
@@ -428,7 +445,7 @@ func (c *Controller) nodeCancelRequested(ctx context.Context, runID, nodeKey str
 	return count > 0
 }
 
-func (c *Controller) beginClaimedAttempt(ctx context.Context, runID, digest string, n runnableNode, kind executor.Kind, contract executor.Contract, profile capability.Profile, opKey, leaseToken string, leaseExpiry int64, cancelRequest func()) (bool, context.Context, context.CancelFunc, error) {
+func (c *Controller) beginClaimedAttempt(ctx context.Context, runID string, n runnableNode, kind executor.Kind, contract executor.Contract, opKey, leaseToken string, leaseExpiry int64, cancelRequest func()) (bool, context.Context, context.CancelFunc, error) {
 	execCtx, cancelExec := context.WithCancel(ctx)
 	if !c.trackInflight(runID, n.NodeKey, inflightExecution{
 		cancelContext: cancelExec,
@@ -449,30 +466,6 @@ func (c *Controller) beginClaimedAttempt(ctx context.Context, runID, digest stri
 		}
 		if err == nil && (!current.Valid || current.String != "eligible") {
 			return nil
-		}
-		if kind == executor.Shell && profile.Process != "" {
-			if _, err := c.appendWithin(ctx, tx, &store.Event{
-				EventID:       ulid.Make().String(),
-				RunID:         runID,
-				SchemaVersion: "proceed/v1",
-				Type:          "capability_approved",
-				OccurredAt:    nowMs,
-				RecordedAt:    nowMs,
-				ActorType:     "controller",
-				ActorID:       c.cfg.OwnerID,
-				CorrelationID: opKey,
-				Payload: payloadJSON(map[string]any{
-					"definition_digest": digest,
-					"node_key":          n.NodeKey,
-					"filesystem":        profile.Filesystem.Mode,
-					"paths":             profile.Filesystem.Paths,
-					"process":           profile.Process,
-					"network":           profile.Network,
-					"secrets":           profile.Secrets,
-				}),
-			}); err != nil {
-				return err
-			}
 		}
 		ev := store.Event{
 			EventID:       ulid.Make().String(),
