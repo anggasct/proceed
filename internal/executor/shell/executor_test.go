@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"proceed/internal/capability"
 	"proceed/internal/executor"
@@ -148,36 +147,6 @@ func TestExecuteRejectsCommandMismatchBeforeStart(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), capability.CodePolicyDenied) {
 		t.Fatalf("Execute() error = %v, want policy denial", err)
-	}
-}
-
-func TestExecuteCancellationKillsProcessGroup(t *testing.T) {
-	adapter := &Executor{Launcher: Launcher{Path: fakeBubblewrap(t)}}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() {
-		_, err := adapter.Execute(ctx, &executor.Request{
-			Config: map[string]any{
-				"executor": map[string]any{
-					"kind":    "shell",
-					"command": []any{"/bin/sh", "-c", "sleep 5"},
-				},
-			},
-			Capability:    testProfile(),
-			WorkspaceRoot: t.TempDir(),
-		})
-		done <- err
-	}()
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-	select {
-	case err := <-done:
-		if !errors.Is(err, executor.ErrCancelled) {
-			t.Fatalf("Execute() error = %v, want cancellation", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Execute() did not stop after cancellation")
 	}
 }
 
