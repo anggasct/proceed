@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install sandbox dependency
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap curl
+
+      - name: Verify sandbox dependency
+        run: bwrap --version
+
+      - name: Run tests
+        env:
+          PROCEED_NATIVE_SANDBOX: "1"
+        run: go test ./...
+
+      - name: Run race tests
+        env:
+          PROCEED_NATIVE_SANDBOX: "1"
+        run: go test -race ./...
+
+      - name: Run vet and formatting checks
+        run: |
+          go vet ./...
+          test -z "$(gofmt -l .)"

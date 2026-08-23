@@ -24,6 +24,7 @@ type Config struct {
 	MaxConcurrent   int
 	OwnerID         string
 	Mode            string
+	Secrets         executor.SecretResolver
 }
 
 func DefaultConfig() Config {

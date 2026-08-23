@@ -35,6 +35,19 @@ func (c *Controller) failNode(ctx context.Context, runID, nodeKey string, attemp
 	})
 }
 
+func (c *Controller) rejectNode(ctx context.Context, runID, nodeKey string, attemptNo int64, kind executor.Kind, contract executor.Contract, opKey string, cause error) error {
+	return c.appendEvent(ctx, runID, "node_failed", map[string]any{
+		"node_key":             nodeKey,
+		"attempt_no":           attemptNo,
+		"executor":             string(kind),
+		"side_effect_contract": string(contract),
+		"operation_key":        opKey,
+		"result": map[string]any{
+			"error": trimErr(cause),
+		},
+	})
+}
+
 func (c *Controller) uncertainNode(ctx context.Context, runID, nodeKey string, attemptNo int64, cause error) error {
 	return c.appendEvent(ctx, runID, "node_uncertain", map[string]any{
 		"node_key":   nodeKey,
@@ -123,6 +136,9 @@ func (c *Controller) commitNodeSuccess(ctx context.Context, runID, graphVersionI
 		} else if status != "running" && status != "reconciling" {
 			return nil
 		}
+		if err := c.appendArtifactEventsTx(ctx, tx, runID, n.NodeKey, opKey, result.Artifacts, nowMs); err != nil {
+			return err
+		}
 		ev := store.Event{
 			EventID:       ulid.Make().String(),
 			RunID:         runID,
@@ -148,6 +164,44 @@ func (c *Controller) commitNodeSuccess(ctx context.Context, runID, graphVersionI
 		}
 		return c.routeFromTx(ctx, tx, runID, graphVersionID, n, result, routeKnown, nowMs)
 	})
+}
+
+func (c *Controller) persistArtifacts(ctx context.Context, runID, nodeKey, opKey string, artifacts []executor.ArtifactRef) error {
+	if len(artifacts) == 0 {
+		return nil
+	}
+	nowMs := time.Now().UnixMilli()
+	return c.store.WithTx(ctx, func(tx *sql.Tx) error {
+		return c.appendArtifactEventsTx(ctx, tx, runID, nodeKey, opKey, artifacts, nowMs)
+	})
+}
+
+func (c *Controller) appendArtifactEventsTx(ctx context.Context, tx *sql.Tx, runID, nodeKey, opKey string, artifacts []executor.ArtifactRef, nowMs int64) error {
+	for _, artifact := range artifacts {
+		if _, err := c.appendWithin(ctx, tx, &store.Event{
+			EventID:       ulid.Make().String(),
+			RunID:         runID,
+			SchemaVersion: "proceed/v1",
+			Type:          "artifact_published",
+			OccurredAt:    nowMs,
+			RecordedAt:    nowMs,
+			ActorType:     "controller",
+			ActorID:       c.cfg.OwnerID,
+			CorrelationID: opKey,
+			Payload: payloadJSON(map[string]any{
+				"node_key":     nodeKey,
+				"name":         artifact.Name,
+				"path":         artifact.Path,
+				"content_hash": artifact.ContentHash,
+				"media_type":   artifact.MediaType,
+				"size_bytes":   artifact.SizeBytes,
+				"truncated":    artifact.Truncated,
+			}),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *Controller) routeFromTx(ctx context.Context, tx *sql.Tx, runID, graphVersionID string, n runnableNode, result *executor.Result, routeKnown bool, nowMs int64) error {
