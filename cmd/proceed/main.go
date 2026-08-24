@@ -46,6 +46,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 		switch args[0] {
 		case "validate":
 			return cmdValidate(args[1:], stdout, stderr)
+		case "run":
+			return cmdRun(args[1:], stdout, stderr)
+		case "serve":
+			return cmdServe(args[1:], stdout, stderr)
+		case "graph":
+			return cmdGraph(args[1:], stdout, stderr)
 		case "store":
 			return cmdStore(args[1:], stdout, stderr)
 		default:

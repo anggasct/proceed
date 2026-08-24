@@ -72,5 +72,5 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 
 func printGraphInvalid(err error, stderr io.Writer) int {
 	fmt.Fprintln(stderr, err.Error())
-	return 1
+	return exitCodeForClass("GRAPH_INVALID")
 }

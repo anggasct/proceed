@@ -63,8 +63,8 @@ func TestValidateCommand(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := run([]string{"validate", invalid, "--data-dir", dataDir}, &stdout, &stderr); code != 1 {
-		t.Fatalf("invalid exit = %d", code)
+	if code := run([]string{"validate", invalid, "--data-dir", dataDir}, &stdout, &stderr); code != 10 {
+		t.Fatalf("invalid exit = %d, want 10", code)
 	}
 	if !strings.Contains(stderr.String(), "GRAPH_INVALID") || !strings.Contains(stderr.String(), "E107") {
 		t.Errorf("stderr = %q", stderr.String())
