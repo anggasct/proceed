@@ -350,6 +350,113 @@ func TestExecuteRejectsRedirectToNonAllowlistedHost(t *testing.T) {
 	}
 }
 
+type failingReceiptEffects struct {
+	recordingEffects
+	failReceipts error
+}
+
+func (r *failingReceiptEffects) RecordReceipt(_ context.Context, receipt executor.EffectReceipt) error {
+	if r.failReceipts != nil {
+		return r.failReceipts
+	}
+	return r.recordingEffects.RecordReceipt(context.Background(), receipt)
+}
+
+// A response whose headers and a partial body arrive, followed by a
+// connection tear-down: the request was dispatched, so the executor must
+// not report a definitive outcome from the torn body.
+func TestExecuteUncertainWhenBodyReadFailsAfterHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1024")
+		fmt.Fprint(w, `{"partial":`)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("server does not support hijacking")
+			return
+		}
+		conn, _, err := hijacker.Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	effects := newRecordingEffects()
+	adapter := New()
+	result, err := adapter.Execute(context.Background(), withExtras(request(nodeConfig(server.URL, []string{"127.0.0.1"})), effects, nil, nil))
+	if !errors.Is(err, executor.ErrUncertain) {
+		t.Fatalf("Execute() error = %v, want EFFECT_UNCERTAIN", err)
+	}
+	if result != nil {
+		t.Fatalf("Execute() result = %v, want nil", result)
+	}
+	if status, ok := effects.status("effect-1"); !ok || status != executor.EffectUnknown {
+		t.Fatalf("effect status = %v (%v), want unknown", status, ok)
+	}
+}
+
+// The reconcile GET must enforce the redirect allowlist on every hop: a
+// redirect from the allowlisted host to a non-allowlisted host is denied
+// before any connection is dialed to the second host.
+func TestReconcileRedirectToNonAllowlistedHostDialsNothing(t *testing.T) {
+	var targetConnections int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&targetConnections, 1)
+		fmt.Fprint(w, "leaked")
+	}))
+	defer target.Close()
+
+	var redirectorHits int32
+	// The allowlist matches hostnames, so the redirect must target a
+	// different hostname that still resolves to the local server: if the
+	// redirect check were missing, this URL would be dialed.
+	targetPort := strings.TrimPrefix(target.URL, "http://127.0.0.1:")
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&redirectorHits, 1)
+		http.Redirect(w, r, "http://localhost:"+targetPort+"/elsewhere", http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	adapter := New()
+	_, state, err := adapter.ReconcileResult(context.Background(), request(nodeConfig(redirector.URL, []string{"127.0.0.1"})))
+	if err != nil {
+		t.Fatalf("ReconcileResult() error = %v", err)
+	}
+	if state != executor.EffectUnknown {
+		t.Fatalf("state = %v, want unknown", state)
+	}
+	if atomic.LoadInt32(&redirectorHits) != 1 {
+		t.Fatalf("redirector hits = %d, want 1", redirectorHits)
+	}
+	if atomic.LoadInt32(&targetConnections) != 0 {
+		t.Fatalf("non-allowlisted target connections = %d, want 0", targetConnections)
+	}
+}
+
+// A confirmed result must not be returned when its receipt cannot be made
+// durable.
+func TestExecuteFailingReceiptPublisherReturnsUncertain(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"status":"ok"}`)
+	}))
+	defer server.Close()
+
+	effects := &failingReceiptEffects{failReceipts: errors.New("receipt append failed")}
+	adapter := New()
+	result, err := adapter.Execute(context.Background(), withExtras(request(nodeConfig(server.URL, []string{"127.0.0.1"})), effects, nil, nil))
+	if !errors.Is(err, executor.ErrUncertain) {
+		t.Fatalf("Execute() error = %v, want EFFECT_UNCERTAIN", err)
+	}
+	if result != nil {
+		t.Fatalf("Execute() result = %v, want nil", result)
+	}
+}
+
 func TestAdmitRejectsInvalidConfigurations(t *testing.T) {
 	adapter := New()
 	cases := []struct {

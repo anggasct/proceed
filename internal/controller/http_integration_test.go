@@ -378,3 +378,87 @@ edges: []
 		t.Fatalf("effect statuses = %v, want [rejected confirmed]", statuses)
 	}
 }
+
+// A node must not be committed as succeeded while its reconciled effect
+// receipt cannot be appended durably; the recovery pass aborts and a later
+// pass with a healthy store completes the node.
+func TestHTTPNodeReconcileReceiptFailureDoesNotCommitSuccess(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	var posts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			atomic.AddInt32(&posts, 1)
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("server does not support hijacking")
+				return
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		fmt.Fprint(w, "created")
+	}))
+	defer server.Close()
+
+	frozen := compileAndFreeze(t, st, httpGraph(server.URL))
+	cfg := DefaultConfig()
+	cfg.LeaseTTL = 40 * time.Millisecond
+	c, err := New(st, cfg, httpPool())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.acquireLease(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	runID, err := c.Run(ctx, RunInput{GraphVersionID: frozen.GraphVersionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Drain(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
+	if s := nodeStatus(t, st, runID, "call"); s != "uncertain" {
+		t.Fatalf("node status = %q, want uncertain", s)
+	}
+	c.releaseLease(ctx)
+	time.Sleep(60 * time.Millisecond)
+
+	if _, err := st.DB().ExecContext(ctx, `
+CREATE TRIGGER fail_effect_receipt BEFORE INSERT ON event
+WHEN NEW.type = 'effect_receipt'
+BEGIN SELECT RAISE(ABORT, 'receipt append failed'); END`); err != nil {
+		t.Fatal(err)
+	}
+	blocked := recoverController(t, st, httpPool())
+	if err := blocked.Recover(ctx, runID); err == nil {
+		t.Fatal("Recover() = nil, want error when the reconciled receipt cannot be appended")
+	}
+	if s := nodeStatus(t, st, runID, "call"); s == "succeeded" || s == "completed" {
+		t.Fatalf("node status after failed receipt append = %q, want success withheld", s)
+	}
+
+	if _, err := st.DB().ExecContext(ctx, `DROP TRIGGER fail_effect_receipt`); err != nil {
+		t.Fatal(err)
+	}
+	blocked.releaseLease(ctx)
+	healed := recoverController(t, st, httpPool())
+	if err := healed.Recover(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
+	if s := nodeStatus(t, st, runID, "call"); s != "succeeded" {
+		t.Fatalf("node status after healed append = %q, want succeeded", s)
+	}
+	statuses := effectStatuses(t, st, runID, "call")
+	if len(statuses) != 1 || statuses[0] != "confirmed" {
+		t.Fatalf("effect statuses = %v, want [confirmed]", statuses)
+	}
+	if atomic.LoadInt32(&posts) != 1 {
+		t.Fatalf("server posts = %d, want 1 (no blind retry)", posts)
+	}
+}

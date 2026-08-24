@@ -264,7 +264,9 @@ func (e *Executor) Execute(ctx context.Context, req *executor.Request) (*executo
 	if status >= 400 {
 		effectStatus = executor.EffectRejected
 	}
-	e.recordReceipt(ctx, req, effectID, effectStatus, receipt)
+	if err := e.recordReceipt(ctx, req, effectID, effectStatus, receipt); err != nil {
+		return nil, executor.ErrUncertain
+	}
 
 	result := &executor.Result{Output: map[string]any{
 		"status_code": status,
@@ -290,11 +292,11 @@ func (e *Executor) Execute(ctx context.Context, req *executor.Request) (*executo
 	return result, nil
 }
 
-func (e *Executor) recordReceipt(ctx context.Context, req *executor.Request, effectID string, status executor.EffectState, receipt []byte) {
+func (e *Executor) recordReceipt(ctx context.Context, req *executor.Request, effectID string, status executor.EffectState, receipt []byte) error {
 	if effectID == "" || req.EffectPublisher == nil {
-		return
+		return nil
 	}
-	_ = req.EffectPublisher.RecordReceipt(ctx, executor.EffectReceipt{
+	return req.EffectPublisher.RecordReceipt(ctx, executor.EffectReceipt{
 		EffectID: effectID,
 		Status:   status,
 		Receipt:  receipt,
@@ -337,20 +339,7 @@ func (e *Executor) dispatch(ctx context.Context, req *executor.Request, resolved
 		httpReq.Header.Set("Idempotency-Key", stableOperationKey(req))
 	}
 
-	client := e.Client
-	if client == nil {
-		client = &http.Client{
-			CheckRedirect: func(next *http.Request, via []*http.Request) error {
-				if len(via) >= 10 {
-					return fmt.Errorf("stopped after 10 redirects")
-				}
-				if !hostAllowed(hosts, next.URL) {
-					return errRedirectDenied
-				}
-				return nil
-			},
-		}
-	}
+	client := e.clientFor(hosts)
 	response, err := client.Do(httpReq)
 	if err != nil {
 		if watchCtx.Err() != nil {
@@ -385,7 +374,12 @@ func (e *Executor) dispatch(ctx context.Context, req *executor.Request, resolved
 
 	limit := e.limit()
 	capture := limit + captureExtra(redactions)
-	raw, _ := io.ReadAll(io.LimitReader(response.Body, int64(capture)+1))
+	raw, readErr := io.ReadAll(io.LimitReader(response.Body, int64(capture)+1))
+	if readErr != nil {
+		// The request was already dispatched, so a torn body cannot be
+		// reported as a definitive outcome.
+		return responseSummary{}, errDispatchUncertain
+	}
 	mediaType := response.Header.Get("Content-Type")
 	if mediaType == "" {
 		mediaType = "application/octet-stream"
@@ -395,6 +389,26 @@ func (e *Executor) dispatch(ctx context.Context, req *executor.Request, resolved
 		body:      raw,
 		mediaType: mediaType,
 	}, nil
+}
+
+// clientFor returns the HTTP client for a request against the given
+// allowlisted hosts. The constructed default enforces the redirect
+// allowlist on every hop; an injected client remains a test seam.
+func (e *Executor) clientFor(hosts []string) *http.Client {
+	if e.Client != nil {
+		return e.Client
+	}
+	return &http.Client{
+		CheckRedirect: func(next *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			if !hostAllowed(hosts, next.URL) {
+				return errRedirectDenied
+			}
+			return nil
+		},
+	}
 }
 
 func isPreSendError(err error) bool {
@@ -436,16 +450,16 @@ func (e *Executor) ReconcileResult(ctx context.Context, req *executor.Request) (
 	for name, value := range resolved.headers {
 		httpReq.Header.Set(name, value)
 	}
-	client := e.Client
-	if client == nil {
-		client = http.DefaultClient
-	}
+	client := e.clientFor(cfg.allowHosts)
 	response, err := client.Do(httpReq)
 	if err != nil {
 		return nil, executor.EffectUnknown, nil
 	}
 	defer response.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(response.Body, int64(e.limit())+1))
+	raw, readErr := io.ReadAll(io.LimitReader(response.Body, int64(e.limit())+1))
+	if readErr != nil {
+		return nil, executor.EffectUnknown, nil
+	}
 	switch {
 	case response.StatusCode >= 200 && response.StatusCode < 300:
 		return &executor.Result{Output: map[string]any{

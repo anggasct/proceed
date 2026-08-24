@@ -154,11 +154,15 @@ func (c *Controller) reconcileNode(ctx context.Context, runID, nodeKey string) e
 		return c.waitingNode(ctx, runID, nodeKey)
 	}
 	if state == executor.EffectConfirmed {
-		c.recordReconciledEffect(ctx, runID, nodeKey, opKey, attemptNo, executor.EffectConfirmed)
+		if err := c.recordReconciledEffect(ctx, runID, nodeKey, opKey, attemptNo, executor.EffectConfirmed); err != nil {
+			return err
+		}
 		return c.commitNodeSuccess(ctx, runID, run.graphVersionID, run.digest,
 			runnableNode{NodeKey: nodeKey, AttemptNo: attemptNo}, result, opKey)
 	}
-	c.recordReconciledEffect(ctx, runID, nodeKey, opKey, attemptNo, executor.EffectRejected)
+	if err := c.recordReconciledEffect(ctx, runID, nodeKey, opKey, attemptNo, executor.EffectRejected); err != nil {
+		return err
+	}
 	if c.nodeCancelRequested(ctx, runID, nodeKey) {
 		return c.cancelledNode(ctx, runID, nodeKey, attemptNo)
 	}
@@ -217,7 +221,9 @@ func (c *Controller) reconcileCancelledNode(ctx context.Context, runID, nodeKey 
 		return c.waitingNode(ctx, runID, nodeKey)
 	}
 	if state == executor.EffectConfirmed {
-		c.recordReconciledEffect(ctx, runID, nodeKey, opKey, attemptNo, executor.EffectConfirmed)
+		if err := c.recordReconciledEffect(ctx, runID, nodeKey, opKey, attemptNo, executor.EffectConfirmed); err != nil {
+			return err
+		}
 	}
 	return c.cancelledNode(ctx, runID, nodeKey, attemptNo)
 }

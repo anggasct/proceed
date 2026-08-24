@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -102,7 +103,7 @@ func (p *effectPublisher) RecordReceipt(ctx context.Context, receipt executor.Ef
 	})
 }
 
-func (c *Controller) recordReconciledEffect(ctx context.Context, runID, nodeKey, opKey string, attemptNo int64, status executor.EffectState) {
+func (c *Controller) recordReconciledEffect(ctx context.Context, runID, nodeKey, opKey string, attemptNo int64, status executor.EffectState) error {
 	var effectID string
 	err := c.store.DB().QueryRowContext(ctx, `
 SELECT e.id FROM effect e
@@ -112,10 +113,13 @@ WHERE rn.run_id = ? AND rn.node_key = ? AND na.operation_key = ?
 ORDER BY e.created_at DESC, e.id DESC LIMIT 1`,
 		runID, nodeKey, opKey).Scan(&effectID)
 	if err != nil {
-		return
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("record reconciled effect: %w", err)
 	}
 	receipt, _ := json.Marshal(map[string]any{"reconciled": true})
-	_ = c.appendEvent(ctx, runID, "effect_receipt", map[string]any{
+	return c.appendEvent(ctx, runID, "effect_receipt", map[string]any{
 		"effect_id":          effectID,
 		"status":             string(status),
 		"receipt":            json.RawMessage(receipt),
