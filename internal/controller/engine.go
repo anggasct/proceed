@@ -415,7 +415,10 @@ watch:
 		}
 	}
 
-	if timedOut {
+	// The executor's own error classification wins: a timer firing at
+	// the same moment must not mask an uncertainty the executor already
+	// reported (for example a failed effect-receipt append).
+	if timedOut && execErr == nil {
 		execErr = executor.ErrTimeout
 	}
 	if execErr != nil {

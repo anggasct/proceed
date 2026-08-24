@@ -239,18 +239,26 @@ func (e *Executor) Execute(ctx context.Context, req *executor.Request) (*executo
 	response, sendErr := e.dispatch(ctx, req, resolved, cfg.allowHosts, redactions)
 	if sendErr != nil {
 		if errors.Is(sendErr, errDispatchUncertain) {
-			e.recordReceipt(ctx, req, effectID, executor.EffectUnknown, nil)
+			if rerr := e.recordReceipt(ctx, req, effectID, executor.EffectUnknown, nil); rerr != nil {
+				return nil, errors.Join(executor.ErrUncertain, sendErr, rerr)
+			}
 			return nil, executor.ErrUncertain
 		}
 		if errors.Is(sendErr, executor.ErrTimeout) {
-			e.recordReceipt(ctx, req, effectID, executor.EffectUnknown, nil)
+			if rerr := e.recordReceipt(ctx, req, effectID, executor.EffectUnknown, nil); rerr != nil {
+				return nil, errors.Join(executor.ErrUncertain, sendErr, rerr)
+			}
 			return nil, executor.ErrTimeout
 		}
 		if errors.Is(sendErr, executor.ErrCancelled) {
-			e.recordReceipt(ctx, req, effectID, executor.EffectUnknown, nil)
+			if rerr := e.recordReceipt(ctx, req, effectID, executor.EffectUnknown, nil); rerr != nil {
+				return nil, errors.Join(executor.ErrUncertain, sendErr, rerr)
+			}
 			return nil, executor.ErrCancelled
 		}
-		e.recordReceipt(ctx, req, effectID, executor.EffectRejected, nil)
+		if rerr := e.recordReceipt(ctx, req, effectID, executor.EffectRejected, nil); rerr != nil {
+			return nil, errors.Join(executor.ErrUncertain, sendErr, rerr)
+		}
 		return nil, &FailureError{reason: "request could not be delivered"}
 	}
 
@@ -265,7 +273,7 @@ func (e *Executor) Execute(ctx context.Context, req *executor.Request) (*executo
 		effectStatus = executor.EffectRejected
 	}
 	if err := e.recordReceipt(ctx, req, effectID, effectStatus, receipt); err != nil {
-		return nil, executor.ErrUncertain
+		return nil, errors.Join(executor.ErrUncertain, err)
 	}
 
 	result := &executor.Result{Output: map[string]any{
@@ -281,7 +289,9 @@ func (e *Executor) Execute(ctx context.Context, req *executor.Request) (*executo
 			Truncated: truncated,
 		})
 		if err != nil {
-			return nil, &FailureError{reason: "artifact publication failed"}
+			// The effect is already durably recorded, so a publication
+			// failure must not route the node into the retry path.
+			return nil, errors.Join(executor.ErrUncertain, fmt.Errorf("artifact publication failed: %w", err))
 		}
 		result.Artifacts = append(result.Artifacts, ref)
 	}
@@ -392,23 +402,29 @@ func (e *Executor) dispatch(ctx context.Context, req *executor.Request, resolved
 }
 
 // clientFor returns the HTTP client for a request against the given
-// allowlisted hosts. The constructed default enforces the redirect
-// allowlist on every hop; an injected client remains a test seam.
+// allowlisted hosts. An injected client keeps its transport and timeout,
+// but its redirect policy is wrapped so every hop is still checked
+// against the allowlist; an injected client cannot bypass the policy.
 func (e *Executor) clientFor(hosts []string) *http.Client {
-	if e.Client != nil {
-		return e.Client
+	injected := e.Client
+	if injected == nil {
+		injected = &http.Client{}
 	}
-	return &http.Client{
-		CheckRedirect: func(next *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return fmt.Errorf("stopped after 10 redirects")
-			}
-			if !hostAllowed(hosts, next.URL) {
-				return errRedirectDenied
-			}
-			return nil
-		},
+	wrapped := *injected
+	original := injected.CheckRedirect
+	wrapped.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+		if !hostAllowed(hosts, next.URL) {
+			return errRedirectDenied
+		}
+		if original != nil {
+			return original(next, via)
+		}
+		return nil
 	}
+	return &wrapped
 }
 
 func isPreSendError(err error) bool {

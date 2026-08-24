@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -454,6 +455,111 @@ func TestExecuteFailingReceiptPublisherReturnsUncertain(t *testing.T) {
 	}
 	if result != nil {
 		t.Fatalf("Execute() result = %v, want nil", result)
+	}
+}
+
+type failingArtifacts struct {
+	fail error
+}
+
+func (p *failingArtifacts) Publish(_ context.Context, _ executor.ArtifactInput) (executor.ArtifactRef, error) {
+	return executor.ArtifactRef{}, p.fail
+}
+
+// An injected client without its own redirect policy must still be
+// wrapped: a redirect to a non-allowlisted host is denied before any
+// connection is dialed to the second host.
+func TestExecuteInjectedClientRedirectEnforcesAllowlist(t *testing.T) {
+	var targetConnections int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&targetConnections, 1)
+		fmt.Fprint(w, "leaked")
+	}))
+	defer target.Close()
+
+	var redirectorHits int32
+	targetPort := strings.TrimPrefix(target.URL, "http://127.0.0.1:")
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&redirectorHits, 1)
+		http.Redirect(w, r, "http://localhost:"+targetPort+"/elsewhere", http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	effects := newRecordingEffects()
+	adapter := New()
+	adapter.Client = &http.Client{}
+	_, err := adapter.Execute(context.Background(), withExtras(request(nodeConfig(redirector.URL, []string{"127.0.0.1"})), effects, nil, nil))
+	if err == nil || !strings.Contains(err.Error(), "NODE_FAILED") {
+		t.Fatalf("Execute() error = %v, want definitive failure", err)
+	}
+	if atomic.LoadInt32(&redirectorHits) != 1 {
+		t.Fatalf("redirector hits = %d, want 1", redirectorHits)
+	}
+	if atomic.LoadInt32(&targetConnections) != 0 {
+		t.Fatalf("non-allowlisted target connections = %d, want 0", targetConnections)
+	}
+	if status, ok := effects.status("effect-1"); !ok || status != executor.EffectRejected {
+		t.Fatalf("effect status = %v (%v), want rejected", status, ok)
+	}
+}
+
+// Every post-intent branch must surface a receipt-publication failure as
+// uncertainty: timeout, definitive delivery rejection, and confirmed
+// outcomes alike.
+func TestExecuteFailingReceiptOnTimeoutAndRejectionReturnsUncertain(t *testing.T) {
+	blocked := make(chan struct{})
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-blocked
+		fmt.Fprint(w, "late")
+	}))
+	defer func() {
+		close(blocked)
+		slow.Close()
+	}()
+
+	adapter := New()
+	timeoutReq := request(nodeConfig(slow.URL, []string{"127.0.0.1"}))
+	timeoutReq.TimeoutMs = 50
+	_, err := adapter.Execute(context.Background(), withExtras(timeoutReq, &failingReceiptEffects{failReceipts: errors.New("receipt append failed")}, nil, nil))
+	if !errors.Is(err, executor.ErrUncertain) {
+		t.Fatalf("timeout + failing receipt error = %v, want EFFECT_UNCERTAIN", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedPort := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rejectReq := request(nodeConfig("http://"+closedPort, []string{"127.0.0.1"}))
+	_, err = adapter.Execute(context.Background(), withExtras(rejectReq, &failingReceiptEffects{failReceipts: errors.New("receipt append failed")}, nil, nil))
+	if !errors.Is(err, executor.ErrUncertain) {
+		t.Fatalf("delivery rejection + failing receipt error = %v, want EFFECT_UNCERTAIN", err)
+	}
+}
+
+// Once the effect receipt is durable, an artifact publication failure is
+// an uncertainty, never a retryable node failure: the external request
+// already happened.
+func TestExecuteArtifactFailureAfterDurableReceiptIsUncertain(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"status":"ok"}`)
+	}))
+	defer server.Close()
+
+	effects := newRecordingEffects()
+	adapter := New()
+	result, err := adapter.Execute(context.Background(), withExtras(request(nodeConfig(server.URL, []string{"127.0.0.1"})), effects, &failingArtifacts{fail: errors.New("artifact sink unavailable")}, nil))
+	if !errors.Is(err, executor.ErrUncertain) {
+		t.Fatalf("Execute() error = %v, want EFFECT_UNCERTAIN", err)
+	}
+	if result != nil {
+		t.Fatalf("Execute() result = %v, want nil", result)
+	}
+	if status, ok := effects.status("effect-1"); !ok || status != executor.EffectConfirmed {
+		t.Fatalf("effect status = %v (%v), want confirmed before the artifact failure", status, ok)
 	}
 }
 

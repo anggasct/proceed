@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -460,5 +461,161 @@ BEGIN SELECT RAISE(ABORT, 'receipt append failed'); END`); err != nil {
 	}
 	if atomic.LoadInt32(&posts) != 1 {
 		t.Fatalf("server posts = %d, want 1 (no blind retry)", posts)
+	}
+}
+
+// An artifact publication failure after a durable confirmed receipt must
+// route the node through uncertainty, not the retry path: the external
+// request already happened and must not be re-dispatched.
+func TestHTTPNodeArtifactFailureDoesNotRedispatch(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	var posts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			atomic.AddInt32(&posts, 1)
+		}
+		fmt.Fprint(w, "ok")
+	}))
+	defer server.Close()
+
+	graph := `schema: proceed/v1
+name: http-artifact-fail
+nodes:
+  - id: call
+    type: task
+    executor:
+      kind: http
+      method: POST
+      url: ` + server.URL + `
+    contract: reconcilable
+    terminal: true
+    retry: { max_attempts: 2, backoff_ms: 0 }
+    capability:
+      network:
+        allowlisted_hosts: [127.0.0.1]
+edges: []
+`
+	frozen := compileAndFreeze(t, st, graph)
+
+	// Block artifact publication by occupying the artifacts directory path.
+	if err := os.MkdirAll(st.DataDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(st.DataDir(), "artifacts"), []byte("blocked"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := New(st, DefaultConfig(), httpPool())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.cfg.LeaseTTL = 40 * time.Millisecond
+	if err := c.acquireLease(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	runID, err := c.Run(ctx, RunInput{GraphVersionID: frozen.GraphVersionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Drain(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
+	if s := nodeStatus(t, st, runID, "call"); s != "uncertain" {
+		t.Fatalf("node status = %q, want uncertain (artifact failure must not fail/retry)", s)
+	}
+	if atomic.LoadInt32(&posts) != 1 {
+		t.Fatalf("server posts = %d, want 1 (no re-dispatch despite retry budget)", posts)
+	}
+
+	c.releaseLease(ctx)
+	if err := os.Remove(filepath.Join(st.DataDir(), "artifacts")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	healed := recoverController(t, st, httpPool())
+	if err := healed.Recover(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
+	if s := nodeStatus(t, st, runID, "call"); s != "succeeded" {
+		t.Fatalf("node status after healed artifacts = %q, want succeeded", s)
+	}
+	if atomic.LoadInt32(&posts) != 1 {
+		t.Fatalf("server posts after recovery = %d, want 1", posts)
+	}
+}
+
+// A receipt-publication failure on the timeout branch must surface as an
+// uncertain node, never as a retryable failure.
+func TestHTTPNodeTimeoutWithFailingReceiptStaysUncertain(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	blocked := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			<-blocked
+			return
+		}
+		fmt.Fprint(w, "ok")
+	}))
+	defer server.Close()
+
+	graph := `schema: proceed/v1
+name: http-receipt-fail
+nodes:
+  - id: call
+    type: task
+    executor:
+      kind: http
+      method: POST
+      url: ` + server.URL + `
+    contract: reconcilable
+    terminal: true
+    timeout_ms: 50
+    retry: { max_attempts: 2, backoff_ms: 0 }
+    capability:
+      network:
+        allowlisted_hosts: [127.0.0.1]
+edges: []
+`
+	frozen := compileAndFreeze(t, st, graph)
+
+	if _, err := st.DB().ExecContext(ctx, `
+CREATE TRIGGER fail_effect_receipt BEFORE INSERT ON event
+WHEN NEW.type = 'effect_receipt'
+BEGIN SELECT RAISE(ABORT, 'receipt append failed'); END`); err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(st, DefaultConfig(), httpPool())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.cfg.LeaseTTL = 40 * time.Millisecond
+	if err := c.acquireLease(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	runID, err := c.Run(ctx, RunInput{GraphVersionID: frozen.GraphVersionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Drain(ctx, runID); err == nil {
+		t.Fatal("Drain() = nil, want error while effect receipts cannot be appended")
+	}
+	if s := nodeStatus(t, st, runID, "call"); s == "failed" || s == "requeued" {
+		t.Fatalf("node status = %q, must not enter the retry path while receipts are undurable", s)
+	}
+
+	if _, err := st.DB().ExecContext(ctx, `DROP TRIGGER fail_effect_receipt`); err != nil {
+		t.Fatal(err)
+	}
+	c.releaseLease(ctx)
+	close(blocked)
+	time.Sleep(60 * time.Millisecond)
+	healed := recoverController(t, st, httpPool())
+	if err := healed.Recover(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
+	if s := nodeStatus(t, st, runID, "call"); s != "succeeded" {
+		t.Fatalf("node status after healed receipts = %q, want succeeded", s)
 	}
 }
