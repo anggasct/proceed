@@ -554,16 +554,43 @@ func TestCLIRunInterruptSettlesAfterDurableCancel(t *testing.T) {
 		_ = cmd.Process.Kill()
 		t.Fatalf("child run never started (stderr %q)", childStderr.String())
 	}
-	// Release the blocked HTTP target so the child's surviving drain can
-	// settle the cancelled in-flight node.
+	// The blocked target is released only after the cancellation is
+	// durable: releasing earlier lets the in-flight request complete
+	// before CancelRun commits, which would race the run to completion
+	// with no cancellation events at all.
+	waitSt, err := store.Open(filepath.Join(dataDir, "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelDurable := false
+	waitDeadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(waitDeadline) {
+		var cancelEvents int
+		if err := waitSt.DB().QueryRow(`
+SELECT COUNT(*) FROM event WHERE type IN ('node_cancel_requested', 'run_cancelled')`).Scan(&cancelEvents); err == nil && cancelEvents > 0 {
+			cancelDurable = true
+			break
+		}
+		var status string
+		if err := waitSt.DB().QueryRow("SELECT status FROM graph_run").Scan(&status); err == nil {
+			if status == "completed" || status == "failed" || status == "cancelled" {
+				break
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	_ = waitSt.Close()
 	releaseTarget()
-	err := cmd.Wait()
+	err = cmd.Wait()
 	exitErr, ok := err.(*exec.ExitError)
 	if !ok {
 		t.Fatalf("child run error = %v (stderr %q)", err, childStderr.String())
 	}
 	if code := exitErr.ExitCode(); code != 18 {
 		t.Fatalf("run exit = %d, want 18 (RUN_CANCELLED), stderr = %q", code, childStderr.String())
+	}
+	if !cancelDurable {
+		t.Fatalf("run reached a terminal state without a durable cancellation")
 	}
 
 	// The cancellation is durable before the command returned.

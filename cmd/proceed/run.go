@@ -264,7 +264,14 @@ func settleRunAfterInterrupt(st *store.Store, runID string, stderr io.Writer) in
 		return exitCodeForError(err)
 	}
 	fmt.Fprintf(stderr, "proceed: interrupted; run %s %s\n", g.RunID, g.Status)
-	return exitCodeForClass("RUN_CANCELLED")
+	switch g.Status {
+	case "completed":
+		return exitOK
+	case "failed":
+		return failedRunExit(st, runID)
+	default:
+		return exitCodeForClass("RUN_CANCELLED")
+	}
 }
 
 func classFromText(text string) string {
