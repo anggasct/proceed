@@ -318,6 +318,9 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 		}
 		artifactSink = &artifactPublisher{dataDir: c.store.DataDir()}
 	}
+	if kind == executor.HTTP {
+		artifactSink = &artifactPublisher{dataDir: c.store.DataDir()}
+	}
 
 	opKey := OperationKey(runID, digest, n.NodeKey, n.AttemptNo)
 	leaseToken := ulid.Make().String()
@@ -334,12 +337,16 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 		NodeKey:           n.NodeKey,
 		AttemptNo:         n.AttemptNo,
 		OperationKey:      opKey,
+		Contract:          contract,
 		Config:            cfg,
 		Cancellation:      cancelChan,
 		Capability:        profile,
 		WorkspaceRoot:     workspaceRoot,
 		Secrets:           c.cfg.Secrets,
 		ArtifactPublisher: artifactSink,
+	}
+	if kind == executor.HTTP {
+		req.EffectPublisher = c.newEffectPublisher(runID, n.NodeKey, n.AttemptNo, opKey)
 	}
 	if kind == executor.Shell {
 		req.DeclaredCommand, err = declaredCommand(cfg)

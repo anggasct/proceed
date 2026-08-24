@@ -49,11 +49,48 @@ func (c *Controller) rejectNode(ctx context.Context, runID, nodeKey string, atte
 }
 
 func (c *Controller) uncertainNode(ctx context.Context, runID, nodeKey string, attemptNo int64, cause error) error {
+	if err := c.markPendingEffectsUnknown(ctx, runID, nodeKey, attemptNo); err != nil {
+		return err
+	}
 	return c.appendEvent(ctx, runID, "node_uncertain", map[string]any{
 		"node_key":   nodeKey,
 		"attempt_no": attemptNo,
 		"reason":     trimErr(cause),
 	})
+}
+
+func (c *Controller) markPendingEffectsUnknown(ctx context.Context, runID, nodeKey string, attemptNo int64) error {
+	rows, err := c.store.DB().QueryContext(ctx, `
+SELECT e.id FROM effect e
+JOIN node_attempt na ON na.id = e.node_attempt_id
+JOIN run_node rn ON rn.id = na.run_node_id
+WHERE rn.run_id = ? AND rn.node_key = ? AND na.attempt_no = ? AND e.status = 'pending'`,
+		runID, nodeKey, attemptNo)
+	if err != nil {
+		return err
+	}
+	var effectIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		effectIDs = append(effectIDs, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, effectID := range effectIDs {
+		if err := c.appendEvent(ctx, runID, "effect_receipt", map[string]any{
+			"effect_id": effectID,
+			"status":    "unknown",
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *Controller) cancelledNode(ctx context.Context, runID, nodeKey string, attemptNo int64) error {
