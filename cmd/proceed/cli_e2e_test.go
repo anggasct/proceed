@@ -612,6 +612,25 @@ SELECT COUNT(*) FROM event WHERE type IN ('node_cancel_requested', 'run_cancelle
 		t.Fatal(err)
 	}
 	if status != "cancelled" {
-		t.Fatalf("run status after interrupt = %q, want cancelled", status)
+		var evTypes []string
+		evRows, qErr := st.DB().Query("SELECT type FROM event ORDER BY sequence")
+		if qErr == nil {
+			for evRows.Next() {
+				var ty string
+				_ = evRows.Scan(&ty)
+				evTypes = append(evTypes, ty)
+			}
+			evRows.Close()
+		}
+		nodeRows, qErr := st.DB().Query("SELECT node_key, status FROM run_node")
+		if qErr == nil {
+			for nodeRows.Next() {
+				var key, nodeStatus string
+				_ = nodeRows.Scan(&key, &nodeStatus)
+				evTypes = append(evTypes, key+"="+nodeStatus)
+			}
+			nodeRows.Close()
+		}
+		t.Fatalf("run status after interrupt = %q, want cancelled; events=%v; child stderr = %q", status, evTypes, childStderr.String())
 	}
 }
