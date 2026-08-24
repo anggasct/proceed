@@ -9,6 +9,13 @@ func (c *Controller) AcquireLease(ctx context.Context) error {
 	return c.acquireLease(ctx, time.Now())
 }
 
+// ValidateLease acquires or renews the controller lease without running
+// anything, so callers can confirm exclusive ownership before performing
+// state-changing work.
+func (c *Controller) ValidateLease(ctx context.Context) error {
+	return c.AcquireLease(ctx)
+}
+
 func (c *Controller) ReleaseLease() {
 	c.releaseLease(context.Background())
 }

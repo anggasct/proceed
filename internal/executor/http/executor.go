@@ -282,12 +282,14 @@ func (e *Executor) Execute(ctx context.Context, req *executor.Request) (*executo
 		"truncated":   truncated,
 	}}
 	if req.ArtifactPublisher != nil {
-		ref, err := req.ArtifactPublisher.Publish(ctx, executor.ArtifactInput{
+		pubCtx, cancelPub := context.WithTimeout(context.WithoutCancel(ctx), receiptPublishBudget)
+		ref, err := req.ArtifactPublisher.Publish(pubCtx, executor.ArtifactInput{
 			Name:      "response",
 			MediaType: response.mediaType,
 			Content:   body,
 			Truncated: truncated,
 		})
+		cancelPub()
 		if err != nil {
 			// The effect is already durably recorded, so a publication
 			// failure must not route the node into the retry path.

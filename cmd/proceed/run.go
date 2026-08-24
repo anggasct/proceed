@@ -21,6 +21,10 @@ import (
 
 const requestCancelTimeout = 5 * time.Second
 
+// defaultConfigPath is loaded when neither --config nor PROCEED_CONFIG is
+// set; Resolve treats a missing file as no configuration.
+const defaultConfigPath = "proceed.yaml"
+
 const runUsage = `usage:
   proceed run <file> [--data-dir <dir>] [--config <file>]
 `
@@ -73,6 +77,9 @@ func resolveConfig(f cliFlags) (config.Config, error) {
 	if path == "" {
 		path = os.Getenv("PROCEED_CONFIG")
 	}
+	if path == "" {
+		path = defaultConfigPath
+	}
 	cfg, err := config.Resolve(path, os.Getenv)
 	if err != nil {
 		return cfg, err
@@ -123,17 +130,24 @@ func cmdRun(args []string, stdout, stderr io.Writer) int {
 		return exitUnclassified
 	}
 	defer st.Close()
-	frozen, err := st.FreezeDefinition(context.Background(), path, src, doc)
-	if err != nil {
-		if _, ok := compiler.AsGraphInvalid(err); ok {
-			return printClassified(err, stderr)
-		}
-		fmt.Fprintf(stderr, "proceed: %v\n", err)
-		return exitUnclassified
-	}
 
 	c, err := controller.New(st, controller.DefaultConfig(), buildPool())
 	if err != nil {
+		fmt.Fprintf(stderr, "proceed: %v\n", err)
+		return exitUnclassified
+	}
+	// The lease is validated before any state-changing freeze so a busy
+	// store leaves graph/version/node projections untouched.
+	if err := c.ValidateLease(context.Background()); err != nil {
+		return printClassified(err, stderr)
+	}
+
+	frozen, err := st.FreezeDefinition(context.Background(), path, src, doc)
+	if err != nil {
+		c.ReleaseLease()
+		if _, ok := compiler.AsGraphInvalid(err); ok {
+			return printClassified(err, stderr)
+		}
 		fmt.Fprintf(stderr, "proceed: %v\n", err)
 		return exitUnclassified
 	}
@@ -142,24 +156,55 @@ func cmdRun(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 	runID, err := c.Run(ctx, controller.RunInput{GraphVersionID: frozen.GraphVersionID})
 	if err != nil {
+		c.ReleaseLease()
 		return printClassified(err, stderr)
 	}
 	fmt.Fprintf(stdout, "run %s started\n", runID)
 
+	// SIGINT cancels the durable run, not the drain context: the drain
+	// loop must survive the interrupt to settle in-flight nodes.
+	drainCtx, drainCancel := context.WithCancel(context.Background())
+	defer drainCancel()
+	interrupted := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		cancelCtx, cancel := context.WithTimeout(context.Background(), requestCancelTimeout)
-		defer cancel()
-		_ = c.CancelRun(cancelCtx, runID)
-	}()
-	if err := c.Drain(ctx, runID); err != nil {
-		if ctx.Err() != nil {
-			return settleRunAfterInterrupt(st, runID, stderr)
+		select {
+		case <-ctx.Done():
+		case <-drainCtx.Done():
+			return
 		}
-		return printClassified(err, stderr)
-	}
-	if ctx.Err() != nil {
+		close(interrupted)
+		cancelRunCtx, cancelRun := context.WithTimeout(context.Background(), requestCancelTimeout)
+		defer cancelRun()
+		_ = c.CancelRun(cancelRunCtx, runID)
+	}()
+	drainErr := c.Drain(drainCtx, runID)
+	drainCancel()
+	select {
+	case <-interrupted:
+		// Nodes already attempting settle asynchronously once their
+		// request aborts; nodes cancelled before their attempt started
+		// are settled by recovery. Stepping completes the run's terminal
+		// transition while we wait for the durable state.
+		if err := c.Recover(context.Background(), runID); err != nil {
+			fmt.Fprintf(stderr, "proceed: settling cancellation: %v\n", err)
+		}
+		deadline := time.Now().Add(requestCancelTimeout)
+		for time.Now().Before(deadline) {
+			g, err := st.RuntimeGraph(context.Background(), runID)
+			if err != nil {
+				break
+			}
+			if g.Status != "running" {
+				break
+			}
+			_, _ = c.Step(context.Background(), runID)
+			time.Sleep(20 * time.Millisecond)
+		}
 		return settleRunAfterInterrupt(st, runID, stderr)
+	default:
+	}
+	if drainErr != nil {
+		return printClassified(drainErr, stderr)
 	}
 	return runOutcomeExit(st, runID, stdout)
 }

@@ -151,14 +151,11 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	g, err := s.deps.Store.RuntimeGraph(r.Context(), runID)
-	if err != nil {
-		writeStoreError(w, err)
-		return
-	}
+	// The accepted envelope names the requested transition, not the
+	// post-cancel status: cancellation is durable but asynchronous.
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"run_id": runID,
-		"status": g.Status,
+		"status": "cancel_requested",
 	})
 }
 

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -380,5 +381,210 @@ func TestCLIServeRefusesWithoutTokens(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "tokens") {
 		t.Fatalf("stderr = %q, want token requirement message", stderr)
+	}
+}
+
+// A busy store must leave graph/version/node projections untouched: the
+// lease is validated before the definition is frozen.
+func TestCLIRunBusyLeavesGraphProjectionsUnmutated(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	defer server.Close()
+	graph := writeGraph(t, dir, httpNodeGraph(server.URL, "reconcilable"))
+
+	st, err := store.Open(filepath.Join(dataDir, "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	holder, err := controller.New(st, controller.DefaultConfig(), map[executor.Kind]executor.Executor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.AcquireLease(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer holder.ReleaseLease()
+
+	projectionCounts := func() (graphs, versions, nodes, events int) {
+		t.Helper()
+		for _, q := range []struct {
+			sql  string
+			dest *int
+		}{
+			{"SELECT COUNT(*) FROM graph", &graphs},
+			{"SELECT COUNT(*) FROM graph_version", &versions},
+			{"SELECT COUNT(*) FROM graph_node", &nodes},
+			{"SELECT COUNT(*) FROM event", &events},
+		} {
+			if err := st.DB().QueryRow(q.sql).Scan(q.dest); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return
+	}
+	graphs, versions, nodes, events := projectionCounts()
+
+	code, _, stderr := runCLI(t, "run", graph, "--data-dir", dataDir)
+	if code != 19 {
+		t.Fatalf("run exit = %d, want 19 (STORE_BUSY), stderr = %q", code, stderr)
+	}
+	gotGraphs, gotVersions, gotNodes, gotEvents := projectionCounts()
+	if gotGraphs != graphs || gotVersions != versions || gotNodes != nodes || gotEvents != events {
+		t.Fatalf("busy run mutated state: graphs %d->%d versions %d->%d nodes %d->%d events %d->%d",
+			graphs, gotGraphs, versions, gotVersions, nodes, gotNodes, events, gotEvents)
+	}
+}
+
+// A proceed.yaml in the working directory is loaded when no explicit
+// --config or PROCEED_CONFIG is supplied.
+func TestCLIDefaultConfigFileIsLoaded(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "from-default-config")
+	if err := os.WriteFile(filepath.Join(dir, "proceed.yaml"), []byte("data_dir: "+dataDir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+	t.Setenv("PROCEED_CONFIG", "")
+
+	cfg, err := resolveConfig(cliFlags{})
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if cfg.DataDir != dataDir {
+		t.Fatalf("DataDir = %q, want %q from ./proceed.yaml", cfg.DataDir, dataDir)
+	}
+
+	// Explicit flag still wins over the default file.
+	flagged, err := resolveConfig(cliFlags{configPath: filepath.Join(dir, "other.yaml")})
+	if err != nil {
+		t.Fatalf("resolveConfig(flag): %v", err)
+	}
+	if flagged.DataDir == dataDir {
+		t.Fatal("explicit --config did not take precedence over ./proceed.yaml")
+	}
+}
+
+// SIGINT must not settle the command until the cancellation is durable:
+// after the run command returns, the event stream already records the
+// cancel request and the run is cancelled.
+func TestCLIRunInterruptSettlesAfterDurableCancel(t *testing.T) {
+	if os.Getenv("PROCEED_TEST_RUN_MAIN") != "" {
+		dir := os.Getenv("PROCEED_TEST_DIR")
+		dataDir := filepath.Join(dir, "data")
+		graph := filepath.Join(dir, "graph.yaml")
+
+		var stdout, stderr strings.Builder
+		code := run([]string{"run", graph, "--data-dir", dataDir}, &stdout, &stderr)
+		if code != 18 {
+			fmt.Fprintf(os.Stderr, "run exit = %d stdout = %q stderr = %q\n", code, stdout.String(), stderr.String())
+		}
+		os.Exit(code)
+	}
+
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+	release := make(chan struct{})
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		fmt.Fprint(w, "ok")
+	}))
+	defer target.Close()
+	releaseClosed := false
+	releaseTarget := func() {
+		if !releaseClosed {
+			releaseClosed = true
+			close(release)
+		}
+	}
+	defer releaseTarget()
+	graphPath := filepath.Join(dir, "graph.yaml")
+	if err := os.WriteFile(graphPath, []byte(httpNodeGraph(target.URL, "reconcilable")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	readyMarker := releaseTarget
+	_ = readyMarker
+
+	cmd := exec.Command(os.Args[0], "-test.run", "TestCLIRunInterruptSettlesAfterDurableCancel")
+	cmd.Env = append(os.Environ(),
+		"PROCEED_TEST_RUN_MAIN=1",
+		"PROCEED_TEST_DIR="+dir,
+	)
+	var childStderr strings.Builder
+	cmd.Stderr = &childStderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The run row appears only after cmdRun has opened the store, frozen
+	// the graph, installed the signal handler, and called controller.Run
+	// — so polling for the database file plus a run row guarantees the
+	// interrupt handler is active before the signal is sent.
+	signaled := false
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if !signaled {
+			if s, err := store.Open(filepath.Join(dataDir, "proceed.db")); err == nil {
+				var runs int
+				if err := s.DB().QueryRow("SELECT COUNT(*) FROM graph_run").Scan(&runs); err == nil && runs > 0 {
+					_ = s.Close()
+					if err := cmd.Process.Signal(os.Interrupt); err != nil {
+						t.Fatal(err)
+					}
+					signaled = true
+					break
+				}
+				_ = s.Close()
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !signaled {
+		_ = cmd.Process.Kill()
+		t.Fatalf("child run never started (stderr %q)", childStderr.String())
+	}
+	// Release the blocked HTTP target so the child's surviving drain can
+	// settle the cancelled in-flight node.
+	releaseTarget()
+	err := cmd.Wait()
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("child run error = %v (stderr %q)", err, childStderr.String())
+	}
+	if code := exitErr.ExitCode(); code != 18 {
+		t.Fatalf("run exit = %d, want 18 (RUN_CANCELLED), stderr = %q", code, childStderr.String())
+	}
+
+	// The cancellation is durable before the command returned.
+	st, err := store.Open(filepath.Join(dataDir, "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	var cancelEvents int
+	if err := st.DB().QueryRow(`
+SELECT COUNT(*) FROM event WHERE type IN ('node_cancel_requested', 'run_cancelled')`).Scan(&cancelEvents); err != nil {
+		t.Fatal(err)
+	}
+	if cancelEvents == 0 {
+		t.Fatalf("no durable cancellation events recorded before the command returned")
+	}
+	var status string
+	if err := st.DB().QueryRow("SELECT status FROM graph_run").Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "cancelled" {
+		t.Fatalf("run status after interrupt = %q, want cancelled", status)
 	}
 }

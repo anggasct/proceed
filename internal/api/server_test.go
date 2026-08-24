@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"proceed/internal/config"
 	"proceed/internal/controller"
@@ -215,4 +216,77 @@ func TestAPIGraphInvalidSurfacesAs400(t *testing.T) {
 func jsonString(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+// The cancel response body carries the requested transition, not the
+// post-cancel run status.
+func TestAPICancelResponseIsCancelRequested(t *testing.T) {
+	cfg := testConfig(t)
+	server, _, _ := testServer(t, cfg)
+
+	release := make(chan struct{})
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		fmt.Fprint(w, "ok")
+	}))
+	defer target.Close()
+
+	graphPath := filepath.Join(cfg.DataDir, "graph.yaml")
+	graphYAML := fmt.Sprintf(`schema: proceed/v1
+name: api-cancel
+nodes:
+  - id: call
+    type: task
+    executor:
+      kind: http
+      method: GET
+      url: %s
+    contract: reconcilable
+    terminal: true
+    capability:
+      network:
+        allowlisted_hosts: [127.0.0.1]
+edges: []
+`, target.URL)
+	if err := os.WriteFile(graphPath, []byte(graphYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rec, payload := doJSON(t, server.Handler(), "POST", "/v1/runs", "operator-secret",
+			`{"graph":`+jsonString(graphPath)+`}`)
+		if rec.Code != http.StatusCreated {
+			t.Errorf("create status = %d body = %v", rec.Code, payload)
+		}
+	}()
+	// Wait for the run to exist, then cancel before it can complete.
+	var runID string
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := server.deps.Store.DB().QueryRow(
+			"SELECT id FROM graph_run LIMIT 1").Scan(&runID); err == nil && runID != "" {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if runID == "" {
+		close(release)
+		<-done
+		t.Fatal("run was never created")
+	}
+
+	rec, payload := doJSON(t, server.Handler(), "POST", "/v1/runs/"+runID+"/cancel", "operator-secret", "")
+	close(release)
+	<-done
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("cancel status = %d body = %v", rec.Code, payload)
+	}
+	if payload["status"] != "cancel_requested" {
+		t.Fatalf("cancel body status = %v, want cancel_requested", payload["status"])
+	}
+	if payload["run_id"] != runID {
+		t.Fatalf("cancel body run_id = %v, want %v", payload["run_id"], runID)
+	}
 }
