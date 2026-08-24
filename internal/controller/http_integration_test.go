@@ -619,3 +619,88 @@ BEGIN SELECT RAISE(ABORT, 'receipt append failed'); END`); err != nil {
 		t.Fatalf("node status after healed receipts = %q, want succeeded", s)
 	}
 }
+
+// A healthy timeout on a reconcilable node must deterministically record
+// the effect as unknown and route the node through uncertainty, whichever
+// of the equal-duration timers fires first; recovery then reconciles
+// instead of re-dispatching.
+func TestHTTPNodeHealthyTimeoutRecordsUnknownEffect(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	var posts int32
+	blocked := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			atomic.AddInt32(&posts, 1)
+			<-blocked
+			return
+		}
+		fmt.Fprint(w, "created")
+	}))
+	defer server.Close()
+
+	graph := `schema: proceed/v1
+name: http-timeout
+nodes:
+  - id: call
+    type: task
+    executor:
+      kind: http
+      method: POST
+      url: ` + server.URL + `
+    contract: reconcilable
+    terminal: true
+    timeout_ms: 50
+    retry: { max_attempts: 2, backoff_ms: 0 }
+    capability:
+      network:
+        allowlisted_hosts: [127.0.0.1]
+edges: []
+`
+	frozen := compileAndFreeze(t, st, graph)
+	cfg := DefaultConfig()
+	cfg.LeaseTTL = 40 * time.Millisecond
+	c, err := New(st, cfg, httpPool())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.acquireLease(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	runID, err := c.Run(ctx, RunInput{GraphVersionID: frozen.GraphVersionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Drain(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
+
+	if s := nodeStatus(t, st, runID, "call"); s != "uncertain" {
+		t.Fatalf("node status after timeout = %q, want uncertain", s)
+	}
+	statuses := effectStatuses(t, st, runID, "call")
+	if len(statuses) != 1 || statuses[0] != "unknown" {
+		t.Fatalf("effect statuses after timeout = %v, want [unknown] with no pending intent", statuses)
+	}
+	if atomic.LoadInt32(&posts) != 1 {
+		t.Fatalf("server posts = %d, want 1", posts)
+	}
+
+	close(blocked)
+	c.releaseLease(ctx)
+	time.Sleep(60 * time.Millisecond)
+	healed := recoverController(t, st, httpPool())
+	if err := healed.Recover(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
+	if s := nodeStatus(t, st, runID, "call"); s != "succeeded" {
+		t.Fatalf("node status after reconcile = %q, want succeeded", s)
+	}
+	statuses = effectStatuses(t, st, runID, "call")
+	if len(statuses) != 1 || statuses[0] != "confirmed" {
+		t.Fatalf("effect statuses after reconcile = %v, want [confirmed]", statuses)
+	}
+	if atomic.LoadInt32(&posts) != 1 {
+		t.Fatalf("server posts after reconcile = %d, want 1 (reconciled, not re-dispatched)", posts)
+	}
+}

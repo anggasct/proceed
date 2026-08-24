@@ -415,10 +415,11 @@ watch:
 		}
 	}
 
-	// The executor's own error classification wins: a timer firing at
-	// the same moment must not mask an uncertainty the executor already
-	// reported (for example a failed effect-receipt append).
-	if timedOut && execErr == nil {
+	// Serialize timeout classification: when the controller timer fired,
+	// a cancellation the executor reported was induced by this branch's
+	// own cancel signal, not the user, so it is a timeout. An uncertainty
+	// the executor already classified always wins.
+	if timedOut && (execErr == nil || errors.Is(execErr, executor.ErrCancelled)) {
 		execErr = executor.ErrTimeout
 	}
 	if execErr != nil {
@@ -430,6 +431,13 @@ watch:
 		}
 		if errors.Is(execErr, executor.ErrCancelled) {
 			return c.cancelledNode(ctx, runID, n.NodeKey, n.AttemptNo)
+		}
+		// A timeout on a contract whose delivery cannot be verified or
+		// safely repeated is an uncertainty: the request may have reached
+		// the external system, so recovery must reconcile instead of
+		// re-dispatching.
+		if errors.Is(execErr, executor.ErrTimeout) && (contract == executor.Reconcilable || contract == executor.NonReplayable) {
+			return c.uncertainNode(ctx, runID, n.NodeKey, n.AttemptNo, execErr)
 		}
 		return c.recordAttemptFailure(ctx, runID, graphVersionID, digest, n, execErr)
 	}

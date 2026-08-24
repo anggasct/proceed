@@ -563,6 +563,24 @@ func TestExecuteArtifactFailureAfterDurableReceiptIsUncertain(t *testing.T) {
 	}
 }
 
+// Receipt publication must run on a live bounded context even when the
+// execution context is already canceled (the controller timer cancels it
+// while the executor is classifying a timeout); a healthy store must
+// still receive the append.
+func TestRecordReceiptPublishesOnCanceledContext(t *testing.T) {
+	effects := newRecordingEffects()
+	adapter := New()
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := adapter.recordReceipt(canceled, &executor.Request{EffectPublisher: effects}, "effect-1", executor.EffectUnknown, []byte(`{}`))
+	if err != nil {
+		t.Fatalf("recordReceipt on canceled context = %v, want nil", err)
+	}
+	if status, ok := effects.status("effect-1"); !ok || status != executor.EffectUnknown {
+		t.Fatalf("effect status = %v (%v), want unknown", status, ok)
+	}
+}
+
 func TestAdmitRejectsInvalidConfigurations(t *testing.T) {
 	adapter := New()
 	cases := []struct {

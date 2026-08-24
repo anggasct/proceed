@@ -302,11 +302,19 @@ func (e *Executor) Execute(ctx context.Context, req *executor.Request) (*executo
 	return result, nil
 }
 
+// receiptPublishBudget bounds receipt publication on a context detached
+// from the request lifecycle: the controller may cancel the execution
+// context at the same moment the executor is classifying a timeout, and a
+// healthy store must still receive the durable append.
+const receiptPublishBudget = 5 * time.Second
+
 func (e *Executor) recordReceipt(ctx context.Context, req *executor.Request, effectID string, status executor.EffectState, receipt []byte) error {
 	if effectID == "" || req.EffectPublisher == nil {
 		return nil
 	}
-	return req.EffectPublisher.RecordReceipt(ctx, executor.EffectReceipt{
+	pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), receiptPublishBudget)
+	defer cancel()
+	return req.EffectPublisher.RecordReceipt(pubCtx, executor.EffectReceipt{
 		EffectID: effectID,
 		Status:   status,
 		Receipt:  receipt,
