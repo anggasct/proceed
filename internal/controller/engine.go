@@ -432,6 +432,14 @@ watch:
 		if errors.Is(execErr, executor.ErrCancelled) {
 			return c.cancelledNode(ctx, runID, n.NodeKey, n.AttemptNo)
 		}
+		// Any failure concurrent with the controller's own cancellation
+		// signal is a cancellation outcome, not a node failure: the
+		// request context dies before admission, dispatch, or recording
+		// can classify it. The controller's timeout path also cancels
+		// the context, so it is excluded via timedOut.
+		if !timedOut && execCtx.Err() != nil {
+			return c.cancelledNode(ctx, runID, n.NodeKey, n.AttemptNo)
+		}
 		// A timeout on a contract whose delivery cannot be verified or
 		// safely repeated is an uncertainty: the request may have reached
 		// the external system, so recovery must reconcile instead of

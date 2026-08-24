@@ -61,7 +61,13 @@ func (e *Executor) Execute(ctx context.Context, req *executor.Request) (*executo
 	if req == nil {
 		return nil, &capability.Error{Message: "executor request is required"}
 	}
+	if err := executor.AbortIfCancelled(ctx, req.Cancellation); err != nil {
+		return nil, err
+	}
 	if err := e.Admit(ctx, req); err != nil {
+		if cerr := executor.AbortIfCancelled(ctx, req.Cancellation); cerr != nil {
+			return nil, cerr
+		}
 		return nil, err
 	}
 	config, err := parseConfig(req.Config)
