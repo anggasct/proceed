@@ -19,7 +19,7 @@ func TestRun(t *testing.T) {
 		{name: "short help", args: []string{"-h"}, wantCode: 0, wantStdout: "Usage:"},
 		{name: "help subcommand", args: []string{"help"}, wantCode: 0, wantStdout: "Usage:"},
 		{name: "version", args: []string{"--version"}, wantCode: 0, wantStdout: "proceed "},
-		{name: "known command not implemented", args: []string{"run"}, wantCode: 1, wantStderr: "not implemented"},
+		{name: "run without file shows usage", args: []string{"run"}, wantCode: 2, wantStderr: "usage:"},
 		{name: "unknown command", args: []string{"frobnicate"}, wantCode: 2, wantStderr: `unknown command "frobnicate"`},
 	}
 	for _, tt := range tests {
