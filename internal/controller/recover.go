@@ -124,7 +124,7 @@ func (c *Controller) reconcileNode(ctx context.Context, runID, nodeKey string) e
 	if err != nil {
 		return err
 	}
-	kind, _, err := c.contractFor(nodeConfigForKey(c, ctx, runID, run.graphVersionID, nodeKey))
+	cfg, kind, contract, err := c.parseNodeConfig(nodeConfigForKey(c, ctx, runID, run.graphVersionID, nodeKey))
 	if err != nil {
 		return err
 	}
@@ -139,6 +139,9 @@ func (c *Controller) reconcileNode(ctx context.Context, runID, nodeKey string) e
 		NodeKey:          nodeKey,
 		AttemptNo:        attemptNo,
 		OperationKey:     opKey,
+		Contract:         contract,
+		Config:           cfg,
+		Secrets:          c.cfg.Secrets,
 	}
 	result, state, rerr := reconcileEffect(ctx, ex, req)
 	if errors.Is(rerr, executor.ErrNotReconcilable) {
@@ -151,8 +154,14 @@ func (c *Controller) reconcileNode(ctx context.Context, runID, nodeKey string) e
 		return c.waitingNode(ctx, runID, nodeKey)
 	}
 	if state == executor.EffectConfirmed {
+		if err := c.recordReconciledEffect(ctx, runID, nodeKey, opKey, attemptNo, executor.EffectConfirmed); err != nil {
+			return err
+		}
 		return c.commitNodeSuccess(ctx, runID, run.graphVersionID, run.digest,
 			runnableNode{NodeKey: nodeKey, AttemptNo: attemptNo}, result, opKey)
+	}
+	if err := c.recordReconciledEffect(ctx, runID, nodeKey, opKey, attemptNo, executor.EffectRejected); err != nil {
+		return err
 	}
 	if c.nodeCancelRequested(ctx, runID, nodeKey) {
 		return c.cancelledNode(ctx, runID, nodeKey, attemptNo)
@@ -183,7 +192,7 @@ func (c *Controller) reconcileCancelledNode(ctx context.Context, runID, nodeKey 
 	if storedAttemptNo > 0 {
 		attemptNo = storedAttemptNo
 	}
-	kind, _, err := c.contractFor(nodeConfigForKey(c, ctx, runID, run.graphVersionID, nodeKey))
+	cfg, kind, contract, err := c.parseNodeConfig(nodeConfigForKey(c, ctx, runID, run.graphVersionID, nodeKey))
 	if err != nil {
 		return err
 	}
@@ -198,6 +207,9 @@ func (c *Controller) reconcileCancelledNode(ctx context.Context, runID, nodeKey 
 		NodeKey:          nodeKey,
 		AttemptNo:        attemptNo,
 		OperationKey:     opKey,
+		Contract:         contract,
+		Config:           cfg,
+		Secrets:          c.cfg.Secrets,
 	})
 	if errors.Is(rerr, executor.ErrNotReconcilable) {
 		return c.waitingNode(ctx, runID, nodeKey)
@@ -207,6 +219,11 @@ func (c *Controller) reconcileCancelledNode(ctx context.Context, runID, nodeKey 
 			return nil
 		}
 		return c.waitingNode(ctx, runID, nodeKey)
+	}
+	if state == executor.EffectConfirmed {
+		if err := c.recordReconciledEffect(ctx, runID, nodeKey, opKey, attemptNo, executor.EffectConfirmed); err != nil {
+			return err
+		}
 	}
 	return c.cancelledNode(ctx, runID, nodeKey, attemptNo)
 }

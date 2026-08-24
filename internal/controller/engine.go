@@ -318,6 +318,9 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 		}
 		artifactSink = &artifactPublisher{dataDir: c.store.DataDir()}
 	}
+	if kind == executor.HTTP {
+		artifactSink = &artifactPublisher{dataDir: c.store.DataDir()}
+	}
 
 	opKey := OperationKey(runID, digest, n.NodeKey, n.AttemptNo)
 	leaseToken := ulid.Make().String()
@@ -334,12 +337,16 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 		NodeKey:           n.NodeKey,
 		AttemptNo:         n.AttemptNo,
 		OperationKey:      opKey,
+		Contract:          contract,
 		Config:            cfg,
 		Cancellation:      cancelChan,
 		Capability:        profile,
 		WorkspaceRoot:     workspaceRoot,
 		Secrets:           c.cfg.Secrets,
 		ArtifactPublisher: artifactSink,
+	}
+	if kind == executor.HTTP {
+		req.EffectPublisher = c.newEffectPublisher(runID, n.NodeKey, n.AttemptNo, opKey)
 	}
 	if kind == executor.Shell {
 		req.DeclaredCommand, err = declaredCommand(cfg)
@@ -408,7 +415,11 @@ watch:
 		}
 	}
 
-	if timedOut {
+	// Serialize timeout classification: when the controller timer fired,
+	// a cancellation the executor reported was induced by this branch's
+	// own cancel signal, not the user, so it is a timeout. An uncertainty
+	// the executor already classified always wins.
+	if timedOut && (execErr == nil || errors.Is(execErr, executor.ErrCancelled)) {
 		execErr = executor.ErrTimeout
 	}
 	if execErr != nil {
@@ -420,6 +431,13 @@ watch:
 		}
 		if errors.Is(execErr, executor.ErrCancelled) {
 			return c.cancelledNode(ctx, runID, n.NodeKey, n.AttemptNo)
+		}
+		// A timeout on a contract whose delivery cannot be verified or
+		// safely repeated is an uncertainty: the request may have reached
+		// the external system, so recovery must reconcile instead of
+		// re-dispatching.
+		if errors.Is(execErr, executor.ErrTimeout) && (contract == executor.Reconcilable || contract == executor.NonReplayable) {
+			return c.uncertainNode(ctx, runID, n.NodeKey, n.AttemptNo, execErr)
 		}
 		return c.recordAttemptFailure(ctx, runID, graphVersionID, digest, n, execErr)
 	}

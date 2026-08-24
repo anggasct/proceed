@@ -32,6 +32,7 @@ type Request struct {
 	NodeKey           string
 	AttemptNo         int64
 	OperationKey      string
+	Contract          Contract
 	Config            map[string]any
 	DeclaredCommand   []string
 	TimeoutMs         int64
@@ -41,6 +42,7 @@ type Request struct {
 	Inputs            []ArtifactRef
 	Secrets           SecretResolver
 	ArtifactPublisher ArtifactPublisher
+	EffectPublisher   EffectPublisher
 }
 
 type Result struct {
@@ -81,6 +83,22 @@ type Effect struct {
 	ReconcileRef string
 }
 
+type EffectIntent struct {
+	Target        string
+	RequestDigest string
+}
+
+type EffectReceipt struct {
+	EffectID string
+	Status   EffectState
+	Receipt  []byte
+}
+
+type EffectPublisher interface {
+	RecordIntent(ctx context.Context, intent EffectIntent) (string, error)
+	RecordReceipt(ctx context.Context, receipt EffectReceipt) error
+}
+
 var (
 	ErrTimeout         = errors.New("NODE_TIMEOUT")
 	ErrCancelled       = errors.New("RUN_CANCELLED")
@@ -111,4 +129,5 @@ const (
 	EffectConfirmed EffectState = "confirmed"
 	EffectAbsent    EffectState = "absent"
 	EffectUnknown   EffectState = "unknown"
+	EffectRejected  EffectState = "rejected"
 )
