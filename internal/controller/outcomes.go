@@ -199,7 +199,7 @@ func (c *Controller) commitNodeSuccess(ctx context.Context, runID, graphVersionI
 		if terminalType == "node_cancelled" {
 			return nil
 		}
-		return c.routeFromTx(ctx, tx, runID, graphVersionID, n, result, routeKnown, nowMs)
+		return c.routeFromTx(ctx, tx, runID, graphVersionID, digest, n, result, routeKnown, nowMs)
 	})
 }
 
@@ -241,22 +241,16 @@ func (c *Controller) appendArtifactEventsTx(ctx context.Context, tx *sql.Tx, run
 	return nil
 }
 
-func (c *Controller) routeFromTx(ctx context.Context, tx *sql.Tx, runID, graphVersionID string, n runnableNode, result *executor.Result, routeKnown bool, nowMs int64) error {
+func (c *Controller) routeFromTx(ctx context.Context, tx *sql.Tx, runID, graphVersionID, digest string, n runnableNode, result *executor.Result, routeKnown bool, nowMs int64) error {
 	rows, err := tx.QueryContext(ctx, `
 SELECT id, to_node_key, type, condition FROM graph_edge
 WHERE graph_version_id = ? AND from_node_key = ? ORDER BY id`, graphVersionID, n.NodeKey)
 	if err != nil {
 		return err
 	}
-	type edgeRow struct {
-		ID   string
-		To   string
-		Type string
-		Cond sql.NullString
-	}
-	var edges []edgeRow
+	var edges []edgeInfo
 	for rows.Next() {
-		var e edgeRow
+		var e edgeInfo
 		if err := rows.Scan(&e.ID, &e.To, &e.Type, &e.Cond); err != nil {
 			rows.Close()
 			return err
@@ -336,7 +330,10 @@ WHERE graph_version_id = ? AND from_node_key = ? ORDER BY id`, graphVersionID, n
 			return err
 		}
 	}
-	return nil
+	if err := c.recordRoutingDecision(ctx, tx, runID, graphVersionID, n.NodeKey, digest, result.Route, routeKnown, edges, nowMs); err != nil {
+		return err
+	}
+	return c.recordEligibilityDecisions(ctx, tx, runID, graphVersionID, digest, edges, nowMs)
 }
 
 func (c *Controller) onlyIncomingEdge(ctx context.Context, tx *sql.Tx, graphVersionID, nodeKey, edgeID string) bool {

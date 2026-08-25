@@ -239,7 +239,13 @@ func TestRecoveryFanOutPartialSurvives(t *testing.T) {
 		t.Fatal(err)
 	}
 	if joinCount != 0 {
-		t.Errorf("join rows = %d, want 0 (never started while a branch failed)", joinCount)
+		var joinStatus string
+		var joinAttempts int
+		_ = st.DB().QueryRow(
+			"SELECT status, attempt_count FROM run_node WHERE run_id = ? AND node_key = 'join'", runID).Scan(&joinStatus, &joinAttempts)
+		if joinStatus != "pending" || joinAttempts != 0 {
+			t.Errorf("join = %q attempts=%d, want pending with 0 attempts while a branch failed", joinStatus, joinAttempts)
+		}
 	}
 	if runStatus(t, st, runID) != "failed" {
 		t.Errorf("run = %q, want failed", runStatus(t, st, runID))

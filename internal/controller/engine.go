@@ -123,7 +123,7 @@ WHERE ge.graph_version_id = ?`, graphVersionID)
 	var out []runnableNode
 	for _, key := range order {
 		d := defs[key]
-		if d.runStatus.Valid {
+		if d.runStatus.Valid && d.runStatus.String != "pending" {
 			if d.runStatus.String != "eligible" {
 				continue
 			}
@@ -247,7 +247,9 @@ func (c *Controller) claimNonExecutable(ctx context.Context, runID, nodeKey stri
 			"SELECT status FROM run_node WHERE run_id = ? AND node_key = ?", runID, nodeKey).
 			Scan(&status)
 		if err == nil {
-			if status != "eligible" {
+			// Same rule as beginClaimedAttempt: a decision-materialized
+			// pending row has never run and is claimable.
+			if status != "eligible" && status != "pending" {
 				return nil
 			}
 		} else if err != sql.ErrNoRows {
@@ -531,7 +533,9 @@ func (c *Controller) beginClaimedAttempt(ctx context.Context, runID string, n ru
 		if err != nil && err != sql.ErrNoRows {
 			return err
 		}
-		if err == nil && (!current.Valid || current.String != "eligible") {
+		// A node materialized as pending by an early decision projection
+		// is claimable exactly like an absent row: it has never run.
+		if err == nil && (!current.Valid || (current.String != "eligible" && current.String != "pending")) {
 			return nil
 		}
 		ev := store.Event{

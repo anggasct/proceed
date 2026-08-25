@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"io"
 
+	"proceed/internal/query/why"
 	"proceed/internal/store"
 )
 
 const graphUsage = `usage:
   proceed graph inspect <run-id> [--data-dir <dir>] [--config <file>]
+  proceed graph why <run-id> <node-id> [--data-dir <dir>] [--config <file>]
 `
 
 func cmdGraph(args []string, stdout, stderr io.Writer) int {
@@ -19,12 +21,16 @@ func cmdGraph(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 	subcommand := args[0]
-	if subcommand != "inspect" {
+	if subcommand != "inspect" && subcommand != "why" {
 		fmt.Fprintf(stderr, "proceed graph: unknown subcommand %q\n%s", subcommand, graphUsage)
 		return exitUsage
 	}
+	wantPositional := 1
+	if subcommand == "why" {
+		wantPositional = 2
+	}
 	flags, positional, err := parseCommonFlags(args[1:])
-	if err != nil || len(positional) != 1 {
+	if err != nil || len(positional) != wantPositional {
 		fmt.Fprint(stderr, graphUsage)
 		return exitUsage
 	}
@@ -39,11 +45,18 @@ func cmdGraph(args []string, stdout, stderr io.Writer) int {
 		return exitUnclassified
 	}
 	defer st.Close()
-	g, err := st.RuntimeGraph(context.Background(), positional[0])
+
+	var payload any
+	switch subcommand {
+	case "inspect":
+		payload, err = st.RuntimeGraph(context.Background(), positional[0])
+	case "why":
+		payload, err = why.New(st).Explain(context.Background(), positional[0], positional[1])
+	}
 	if err != nil {
 		return printClassified(err, stderr)
 	}
-	encoded, err := json.MarshalIndent(g, "", "  ")
+	encoded, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		fmt.Fprintf(stderr, "proceed: %v\n", err)
 		return exitUnclassified
