@@ -3,7 +3,9 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -477,4 +479,283 @@ func mustExplain(t *testing.T, q *why.Query, runID, nodeKey string) *why.Explana
 		t.Fatal(err)
 	}
 	return explanation
+}
+
+// Reviewer verification 1: with projections wiped and NOT rebuilt, the
+// event-backed explanation matches the projection-backed answer.
+func TestWhyEventFallbackWithoutRebuild(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	frozen := compileAndFreeze(t, st, routingWhyGraph)
+	pool := map[executor.Kind]executor.Executor{
+		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			if req.NodeKey == "classify" {
+				return &executor.Result{Route: "requires_code"}, nil
+			}
+			return &executor.Result{}, nil
+		}),
+	}
+	runID := runToCompletion(t, st, frozen, pool)
+
+	projected := explainNode(t, st, runID, "code_path")
+	if projected.Recorded.Source != "projection" {
+		t.Fatalf("source = %q, want projection", projected.Recorded.Source)
+	}
+
+	for _, table := range []string{"causal_link", "decision", "node_attempt", "run_edge", "run_node", "artifact", "evaluation"} {
+		if _, err := st.DB().Exec("DELETE FROM " + table); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fromEvents := explainNode(t, st, runID, "code_path")
+	if fromEvents.Recorded.Source != "events" {
+		t.Fatalf("source = %q, want events", fromEvents.Recorded.Source)
+	}
+	if len(projected.Recorded.Decisions) == 0 || len(projected.Recorded.Decisions) != len(fromEvents.Recorded.Decisions) {
+		t.Fatalf("decisions projected=%d events=%d", len(projected.Recorded.Decisions), len(fromEvents.Recorded.Decisions))
+	}
+	if projected.Inference.SelectedEdge != fromEvents.Inference.SelectedEdge || projected.Inference.SelectedEdge == "" {
+		t.Fatalf("selected edge projected=%q events=%q", projected.Inference.SelectedEdge, fromEvents.Inference.SelectedEdge)
+	}
+	if len(projected.Recorded.CausalLinks) != len(fromEvents.Recorded.CausalLinks) {
+		t.Fatalf("links projected=%d events=%d", len(projected.Recorded.CausalLinks), len(fromEvents.Recorded.CausalLinks))
+	}
+	for i := range projected.Recorded.CausalLinks {
+		if projected.Recorded.CausalLinks[i].Attribution != fromEvents.Recorded.CausalLinks[i].Attribution ||
+			projected.Recorded.CausalLinks[i].GroupKey != fromEvents.Recorded.CausalLinks[i].GroupKey {
+			t.Fatalf("link %d mismatch: %+v vs %+v", i, projected.Recorded.CausalLinks[i], fromEvents.Recorded.CausalLinks[i])
+		}
+	}
+	pStrengths := attributionStrengths(projected)
+	eStrengths := attributionStrengths(fromEvents)
+	if !reflect.DeepEqual(pStrengths, eStrengths) {
+		t.Fatalf("attribution strengths differ: %v vs %v", pStrengths, eStrengths)
+	}
+}
+
+func attributionStrengths(e *why.Explanation) []string {
+	out := make([]string, 0, len(e.Inference.Attributions))
+	for _, a := range e.Inference.Attributions {
+		out = append(out, a.Strength)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Reviewer verification 2: downstream node explanations carry the upstream
+// evidence the decision cited.
+func TestWhyDownstreamSeesUpstreamEvidence(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	frozen := compileAndFreeze(t, st, `schema: proceed/v1
+name: evidence-chain
+nodes:
+  - id: produce
+    type: task
+    executor: { kind: shell, command: [bin/p] }
+    contract: pure
+  - id: consume
+    type: task
+    executor: { kind: shell, command: [bin/c] }
+    contract: pure
+    terminal: true
+edges:
+  - { from: produce, to: consume, type: depends_on }
+`)
+	runID := runToCompletion(t, st, frozen, map[executor.Kind]executor.Executor{
+		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			if req.NodeKey == "produce" {
+				return artifactProducingResult(), nil
+			}
+			return &executor.Result{}, nil
+		}),
+	})
+
+	explanation := explainNode(t, st, runID, "consume")
+	if len(explanation.Recorded.Evidence.Artifacts) == 0 {
+		t.Fatalf("downstream evidence artifacts = %+v, want the cited upstream artifact", explanation.Recorded.Evidence.Artifacts)
+	}
+	upstream := artifactIDsByNode(t, st, runID, "produce")
+	found := map[string]bool{}
+	for _, a := range explanation.Recorded.Evidence.Artifacts {
+		found[a.ID] = true
+	}
+	for _, id := range upstream {
+		if !found[id] {
+			t.Fatalf("cited upstream artifact %s missing from downstream evidence %+v", id, explanation.Recorded.Evidence.Artifacts)
+		}
+		if a := findArtifact(explanation, id); a != nil && a.ContentHash == "" {
+			t.Fatalf("artifact %s missing content hash", id)
+		}
+	}
+}
+
+func findArtifact(e *why.Explanation, id string) *why.ArtifactEvidence {
+	for i := range e.Recorded.Evidence.Artifacts {
+		if e.Recorded.Evidence.Artifacts[i].ID == id {
+			return &e.Recorded.Evidence.Artifacts[i]
+		}
+	}
+	return nil
+}
+
+// Reviewer verification 3: every decision/event source id in causal links
+// resolves to its row or event, including after a retry produced several
+// finish events.
+func TestWhySourceIDsResolve(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	frozen := compileAndFreeze(t, st, `schema: proceed/v1
+name: resolve-sources
+nodes:
+  - id: flaky
+    type: task
+    executor: { kind: shell, command: [bin/f] }
+    contract: pure
+    retry: { max_attempts: 2, backoff_ms: 0 }
+  - id: after
+    type: task
+    executor: { kind: shell, command: [bin/a] }
+    contract: pure
+    terminal: true
+edges:
+  - { from: flaky, to: after, type: depends_on }
+`)
+	attempts := 0
+	runID := runToCompletion(t, st, frozen, map[executor.Kind]executor.Executor{
+		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			if req.NodeKey == "flaky" {
+				attempts++
+				if attempts == 1 {
+					return nil, errors.New("transient")
+				}
+			}
+			return &executor.Result{}, nil
+		}),
+	})
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+
+	explanation := explainNode(t, st, runID, "after")
+	for _, link := range explanation.Recorded.CausalLinks {
+		switch link.SourceKind {
+		case "decision":
+			var count int
+			if err := st.DB().QueryRow("SELECT COUNT(*) FROM decision WHERE id = ?", link.SourceID).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != 1 {
+				t.Errorf("decision source %q does not resolve", link.SourceID)
+			}
+		case "event":
+			var count int
+			if err := st.DB().QueryRow("SELECT COUNT(*) FROM event WHERE event_id = ?", link.SourceID).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != 1 {
+				t.Errorf("event source %q does not resolve", link.SourceID)
+			}
+		}
+	}
+
+	// The fallback path must resolve the same identifiers.
+	if _, err := st.DB().Exec("DELETE FROM causal_link"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().Exec("DELETE FROM decision"); err != nil {
+		t.Fatal(err)
+	}
+	fallback := explainNode(t, st, runID, "after")
+	for _, link := range fallback.Recorded.CausalLinks {
+		if link.SourceKind != "event" {
+			continue
+		}
+		var count int
+		if err := st.DB().QueryRow("SELECT COUNT(*) FROM event WHERE event_id = ?", link.SourceID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Errorf("fallback event source %q does not resolve", link.SourceID)
+		}
+	}
+}
+
+// Reviewer verification 4: two matching route edges produce recorded
+// decisions and traversals for both, without a false blocked_by.
+func TestWhyDualRouteEdgesBothRecorded(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	frozen := compileAndFreeze(t, st, `schema: proceed/v1
+name: dual-route
+nodes:
+  - id: classify
+    type: model
+    executor: { kind: shell, command: [bin/c] }
+    contract: pure
+  - id: path_a
+    type: task
+    executor: { kind: shell, command: [bin/a] }
+    contract: pure
+    terminal: true
+  - id: path_b
+    type: task
+    executor: { kind: shell, command: [bin/b] }
+    contract: pure
+    terminal: true
+edges:
+  - { from: classify, to: path_a, type: routes_to, when: go }
+  - { from: classify, to: path_b, type: routes_to, when: go }
+`)
+	runID := runToCompletion(t, st, frozen, map[executor.Kind]executor.Executor{
+		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			if req.NodeKey == "classify" {
+				return &executor.Result{Route: "go"}, nil
+			}
+			return &executor.Result{}, nil
+		}),
+	})
+
+	for _, key := range []string{"path_a", "path_b"} {
+		if s := nodeStatus(t, st, runID, key); s != "succeeded" {
+			t.Fatalf("%s status = %q, want succeeded", key, s)
+		}
+		explanation := explainNode(t, st, runID, key)
+		selected := map[string]bool{}
+		for _, link := range explanation.Recorded.CausalLinks {
+			if link.Attribution == "blocked_by" {
+				t.Fatalf("false blocked_by for %s: %+v", key, link)
+			}
+			if link.Attribution == "necessary" {
+				selected[key] = true
+			}
+		}
+		if !selected[key] {
+			t.Fatalf("%s has no selection attribution: %+v", key, explanation.Recorded.CausalLinks)
+		}
+	}
+
+	var decisions, traversed int
+	if err := st.DB().QueryRow(`
+SELECT (SELECT COUNT(*) FROM decision d JOIN run_node rn ON rn.id = d.run_node_id WHERE d.run_id = ? AND rn.node_key = 'classify'),
+       (SELECT COUNT(*) FROM run_edge re JOIN graph_edge ge ON ge.id = re.edge_id WHERE re.run_id = ? AND ge.from_node_key = 'classify')`,
+		runID, runID).Scan(&decisions, &traversed); err != nil {
+		t.Fatal(err)
+	}
+	if decisions < 2 || traversed != 2 {
+		t.Fatalf("decisions = %d (want >= 2), traversed = %d (want 2)", decisions, traversed)
+	}
 }

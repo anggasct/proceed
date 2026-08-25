@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	"proceed/internal/store"
 )
@@ -107,11 +108,54 @@ func New(st *store.Store) *Query {
 }
 
 func (q *Query) Explain(ctx context.Context, runID, nodeKey string) (*Explanation, error) {
-	rec, err := q.load(ctx, runID, nodeKey)
+	current, err := q.projectionCurrent(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	var rec *Recorded
+	if current {
+		rec, err = q.load(ctx, runID, nodeKey)
+	} else {
+		rec, err = q.loadFromEvents(ctx, runID, nodeKey)
+	}
 	if err != nil {
 		return nil, err
 	}
 	return &Explanation{Recorded: *rec, Inference: render(*rec)}, nil
+}
+
+// projectionCurrent reports whether the projection tables are present and
+// hold every decision event the immutable stream recorded for the run; a
+// missing graph_run row or lagging projections route the explanation
+// through event replay.
+func (q *Query) projectionCurrent(ctx context.Context, runID string) (bool, error) {
+	var runExists int
+	if err := q.st.DB().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM graph_run WHERE id = ?", runID).Scan(&runExists); err != nil {
+		return false, err
+	}
+	if runExists == 0 {
+		var runEvents int
+		if err := q.st.DB().QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM event WHERE run_id = ? AND type = 'run_started'", runID).Scan(&runEvents); err != nil {
+			return false, err
+		}
+		if runEvents > 0 {
+			return false, nil
+		}
+		return false, store.NewCodeError("RUN_NOT_FOUND", "run %s does not exist", runID)
+	}
+	var projected int
+	if err := q.st.DB().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM decision WHERE run_id = ?", runID).Scan(&projected); err != nil {
+		return false, err
+	}
+	var recorded int
+	if err := q.st.DB().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM event WHERE run_id = ? AND type = 'decision_recorded'", runID).Scan(&recorded); err != nil {
+		return false, err
+	}
+	return projected >= recorded, nil
 }
 
 func (q *Query) load(ctx context.Context, runID, nodeKey string) (*Recorded, error) {
@@ -194,13 +238,234 @@ ORDER BY id`, graphVersionID, nodeKey)
 	return ids, rows.Err()
 }
 
+// loadFromEvents reconstructs the explanation purely from the immutable
+// event stream when the projections are missing or stale.
+func (q *Query) loadFromEvents(ctx context.Context, runID, nodeKey string) (*Recorded, error) {
+	rows, err := q.st.DB().QueryContext(ctx, `
+SELECT event_id, sequence, payload FROM event
+WHERE run_id = ? AND type = 'run_started'
+ORDER BY sequence LIMIT 1`, runID)
+	if err != nil {
+		return nil, err
+	}
+	var graphVersionID, payload string
+	for rows.Next() {
+		if err := rows.Scan(&graphVersionID, &payload, &payload); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		var started struct {
+			GraphVersionID string `json:"graph_version_id"`
+		}
+		if err := json.Unmarshal([]byte(payload), &started); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		graphVersionID = started.GraphVersionID
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if graphVersionID == "" {
+		return nil, store.NewCodeError("RUN_NOT_FOUND", "run %s does not exist", runID)
+	}
+
+	var defined int
+	if err := q.st.DB().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM graph_node WHERE graph_version_id = ? AND node_key = ?",
+		graphVersionID, nodeKey).Scan(&defined); err != nil {
+		return nil, err
+	}
+	if defined == 0 {
+		return nil, store.NewCodeError("NODE_NOT_FOUND", "run %s has no node %q", runID, nodeKey)
+	}
+
+	rec := &Recorded{
+		RunID:          runID,
+		GraphVersionID: graphVersionID,
+		NodeKey:        nodeKey,
+		NodeStatus:     "unknown",
+		Source:         "events",
+		CandidateEdges: []string{},
+	}
+	if rec.CandidateEdges, err = q.definitionCandidates(ctx, graphVersionID, nodeKey); err != nil {
+		return nil, err
+	}
+
+	var decisionEvents []decisionEventPayload
+	decRows, err := q.st.DB().QueryContext(ctx, `
+SELECT payload, occurred_at FROM event
+WHERE run_id = ? AND type = 'decision_recorded'
+ORDER BY sequence`, runID)
+	if err != nil {
+		return nil, err
+	}
+	var occurredAts []int64
+	for decRows.Next() {
+		var payload string
+		var occurredAt int64
+		if err := decRows.Scan(&payload, &occurredAt); err != nil {
+			decRows.Close()
+			return nil, err
+		}
+		var p decisionEventPayload
+		if err := json.Unmarshal([]byte(payload), &p); err != nil {
+			decRows.Close()
+			return nil, err
+		}
+		targetsNode := false
+		for _, link := range p.CausalLinks {
+			if link.TargetNodeKey == nodeKey {
+				targetsNode = true
+			}
+		}
+		if p.NodeKey == nodeKey || targetsNode {
+			decisionEvents = append(decisionEvents, p)
+			occurredAts = append(occurredAts, occurredAt)
+		}
+	}
+	decRows.Close()
+	if err := decRows.Err(); err != nil {
+		return nil, err
+	}
+	for i, p := range decisionEvents {
+		rec.Decisions = append(rec.Decisions, RecordedDecision{
+			ID:                "event-pending",
+			Kind:              p.Kind,
+			CandidateEdges:    orEmpty(p.CandidateEdges),
+			SelectedEdgeID:    p.SelectedEdgeID,
+			Rejection:         p.Rejection,
+			PredicateSnapshot: p.PredicateSnapshot,
+			InputReferences:   orEmpty(p.InputReferences),
+			PolicyVersion:     p.PolicyVersion,
+			DecidedAt:         occurredAts[i],
+		})
+	}
+
+	type finishState struct {
+		status string
+		count  int64
+	}
+	nodeStates := map[string]finishState{}
+	stateRows, err := q.st.DB().QueryContext(ctx, `
+SELECT type, payload FROM event
+WHERE run_id = ? AND type IN ('node_started','node_finished','node_failed','node_skipped','node_uncertain','node_cancelled')
+ORDER BY sequence`, runID)
+	if err != nil {
+		return nil, err
+	}
+	for stateRows.Next() {
+		var typ, payload string
+		if err := stateRows.Scan(&typ, &payload); err != nil {
+			stateRows.Close()
+			return nil, err
+		}
+		var p struct {
+			NodeKey string `json:"node_key"`
+		}
+		_ = json.Unmarshal([]byte(payload), &p)
+		if p.NodeKey != nodeKey {
+			continue
+		}
+		state := nodeStates[p.NodeKey]
+		state.count++
+		switch typ {
+		case "node_started":
+			state.status = "running"
+		case "node_finished":
+			state.status = "succeeded"
+		case "node_failed":
+			state.status = "failed"
+		case "node_skipped":
+			state.status = "skipped"
+		case "node_uncertain":
+			state.status = "uncertain"
+		case "node_cancelled":
+			state.status = "cancelled"
+		}
+		nodeStates[p.NodeKey] = state
+	}
+	stateRows.Close()
+	if s, ok := nodeStates[nodeKey]; ok {
+		rec.NodeStatus = s.status
+		rec.AttemptCount = s.count
+	}
+
+	linkRows, err := q.st.DB().QueryContext(ctx, `
+SELECT payload FROM event
+WHERE run_id = ? AND type = 'decision_recorded'
+ORDER BY sequence`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer linkRows.Close()
+	for linkRows.Next() {
+		var payload string
+		if err := linkRows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		var p decisionEventPayload
+		if err := json.Unmarshal([]byte(payload), &p); err != nil {
+			return nil, err
+		}
+		for _, link := range p.CausalLinks {
+			if link.TargetNodeKey != nodeKey {
+				continue
+			}
+			rec.CausalLinks = append(rec.CausalLinks, RecordedLink{
+				Attribution:   link.Attribution,
+				SourceKind:    link.SourceKind,
+				SourceID:      link.SourceID,
+				CitationType:  link.CitationType,
+				CitationID:    link.CitationID,
+				GroupKey:      link.GroupKey,
+				TargetNodeKey: link.TargetNodeKey,
+				DecidedByNode: p.NodeKey,
+			})
+		}
+	}
+
+	var evidenceIDs []string
+	for _, d := range rec.Decisions {
+		evidenceIDs = append(evidenceIDs, d.InputReferences...)
+	}
+	if err := q.loadEvidenceByReferences(ctx, rec, runID, evidenceIDs); err != nil {
+		return nil, err
+	}
+	return rec, nil
+}
+
+type decisionEventPayload struct {
+	NodeKey           string             `json:"node_key"`
+	Kind              string             `json:"kind"`
+	CandidateEdges    []string           `json:"candidate_edges"`
+	SelectedEdgeID    string             `json:"selected_edge_id"`
+	Rejection         string             `json:"rejection"`
+	PredicateSnapshot json.RawMessage    `json:"predicate_snapshot"`
+	InputReferences   []string           `json:"input_references"`
+	PolicyVersion     string             `json:"policy_version"`
+	CausalLinks       []linkEventPayload `json:"causal_links"`
+}
+
+type linkEventPayload struct {
+	TargetNodeKey string `json:"target_node_key"`
+	Attribution   string `json:"attribution"`
+	SourceKind    string `json:"source_kind"`
+	SourceID      string `json:"source_id"`
+	CitationType  string `json:"citation_type"`
+	CitationID    string `json:"citation_id"`
+	GroupKey      string `json:"group_key"`
+}
+
 func (q *Query) loadDecisions(ctx context.Context, rec *Recorded, nodeID string) error {
 	rows, err := q.st.DB().QueryContext(ctx, `
 SELECT d.id, d.kind, d.candidate_edges, COALESCE(d.selected_edge_id, ''),
        COALESCE(d.rejection, ''), d.predicate_snapshot, d.input_references, d.policy_version, d.decided_at
 FROM decision d
 WHERE d.run_node_id = ?
-ORDER BY d.decided_at, d.id`, nodeID)
+   OR d.id IN (SELECT cl.decision_id FROM causal_link cl WHERE cl.target_run_node_id = ?)
+ORDER BY d.decided_at, d.id`, nodeID, nodeID)
 	if err != nil {
 		return err
 	}
@@ -250,9 +515,93 @@ ORDER BY d.decided_at, cl.id`, nodeID)
 }
 
 func (q *Query) loadEvidence(ctx context.Context, rec *Recorded, runID, nodeKey, nodeID string) error {
-	artRows, err := q.st.DB().QueryContext(ctx, `
+	var evidenceIDs []string
+	for _, d := range rec.Decisions {
+		evidenceIDs = append(evidenceIDs, d.InputReferences...)
+	}
+	if err := q.loadEvidenceByReferences(ctx, rec, runID, evidenceIDs); err != nil {
+		return err
+	}
+	ownRows, err := q.st.DB().QueryContext(ctx, `
 SELECT id, name, content_hash, media_type, size_bytes, truncated
 FROM artifact WHERE run_id = ? AND produced_by_node_key = ? ORDER BY id`, runID, nodeKey)
+	if err != nil {
+		return err
+	}
+	defer ownRows.Close()
+	for ownRows.Next() {
+		var a ArtifactEvidence
+		var truncated int
+		if err := ownRows.Scan(&a.ID, &a.Name, &a.ContentHash, &a.MediaType, &a.SizeBytes, &truncated); err != nil {
+			return err
+		}
+		a.Truncated = truncated == 1
+		rec.Evidence.Artifacts = append(rec.Evidence.Artifacts, a)
+	}
+	if err := ownRows.Err(); err != nil {
+		return err
+	}
+	ownEvalRows, err := q.st.DB().QueryContext(ctx, `
+SELECT e.id, e.verdict, e.evaluated_by_node_key, COALESCE(e.evidence_ref, '')
+FROM evaluation e
+JOIN artifact a ON a.id = e.artifact_id
+WHERE e.run_id = ? AND a.produced_by_node_key = ? ORDER BY e.id`, runID, nodeKey)
+	if err != nil {
+		return err
+	}
+	defer ownEvalRows.Close()
+	for ownEvalRows.Next() {
+		var e EvaluationEvidence
+		if err := ownEvalRows.Scan(&e.ID, &e.Verdict, &e.EvaluatedByNodeKey, &e.EvidenceRef); err != nil {
+			return err
+		}
+		rec.Evidence.Evaluations = append(rec.Evidence.Evaluations, e)
+	}
+	if err := ownEvalRows.Err(); err != nil {
+		return err
+	}
+
+	approvalRows, err := q.st.DB().QueryContext(ctx, `
+SELECT id, requested_action, required_scope, COALESCE(decision, ''), COALESCE(decided_by, ''), expires_at
+FROM approval WHERE run_id = ? AND run_node_id = ? ORDER BY created_at, id`, runID, nodeID)
+	if err != nil {
+		return err
+	}
+	defer approvalRows.Close()
+	for approvalRows.Next() {
+		var a ApprovalEvidence
+		if err := approvalRows.Scan(&a.ID, &a.RequestedAction, &a.RequiredScope,
+			&a.Decision, &a.DecidedBy, &a.ExpiresAt); err != nil {
+			return err
+		}
+		rec.Evidence.Approvals = append(rec.Evidence.Approvals, a)
+	}
+	return approvalRows.Err()
+}
+
+// loadEvidenceByReferences resolves the artifact ids the decision actually
+// cited, so a downstream node's explanation includes the upstream evidence
+// that made it eligible.
+func (q *Query) loadEvidenceByReferences(ctx context.Context, rec *Recorded, runID string, evidenceIDs []string) error {
+	ids := map[string]bool{}
+	for _, ref := range evidenceIDs {
+		if id, ok := strings.CutPrefix(ref, "artifact:"); ok {
+			ids[id] = true
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := make([]string, 0, len(ids))
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, runID)
+	for id := range ids {
+		placeholders = append(placeholders, "?")
+		args = append(args, id)
+	}
+	artRows, err := q.st.DB().QueryContext(ctx, `
+SELECT id, name, content_hash, media_type, size_bytes, truncated
+FROM artifact WHERE run_id = ? AND id IN (`+strings.Join(placeholders, ",")+`) ORDER BY id`, args...)
 	if err != nil {
 		return err
 	}
@@ -274,7 +623,7 @@ FROM artifact WHERE run_id = ? AND produced_by_node_key = ? ORDER BY id`, runID,
 SELECT e.id, e.verdict, e.evaluated_by_node_key, COALESCE(e.evidence_ref, '')
 FROM evaluation e
 JOIN artifact a ON a.id = e.artifact_id
-WHERE e.run_id = ? AND a.produced_by_node_key = ? ORDER BY e.id`, runID, nodeKey)
+WHERE a.run_id = ? AND a.id IN (`+strings.Join(placeholders, ",")+`) ORDER BY e.id`, args...)
 	if err != nil {
 		return err
 	}
@@ -286,26 +635,7 @@ WHERE e.run_id = ? AND a.produced_by_node_key = ? ORDER BY e.id`, runID, nodeKey
 		}
 		rec.Evidence.Evaluations = append(rec.Evidence.Evaluations, e)
 	}
-	if err := evalRows.Err(); err != nil {
-		return err
-	}
-
-	approvalRows, err := q.st.DB().QueryContext(ctx, `
-SELECT id, requested_action, required_scope, COALESCE(decision, ''), COALESCE(decided_by, ''), expires_at
-FROM approval WHERE run_id = ? AND run_node_id = ? ORDER BY created_at, id`, runID, nodeID)
-	if err != nil {
-		return err
-	}
-	defer approvalRows.Close()
-	for approvalRows.Next() {
-		var a ApprovalEvidence
-		if err := approvalRows.Scan(&a.ID, &a.RequestedAction, &a.RequiredScope,
-			&a.Decision, &a.DecidedBy, &a.ExpiresAt); err != nil {
-			return err
-		}
-		rec.Evidence.Approvals = append(rec.Evidence.Approvals, a)
-	}
-	return approvalRows.Err()
+	return evalRows.Err()
 }
 
 func orEmpty(v []string) []string {

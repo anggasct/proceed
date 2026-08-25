@@ -31,7 +31,7 @@ type decisionPayload struct {
 	CausalLinks       []causalLink `json:"causal_links"`
 }
 
-func (c *Controller) appendDecisionEvent(ctx context.Context, tx *sql.Tx, runID string, nowMs int64, payload decisionPayload) error {
+func (c *Controller) appendDecisionEvent(ctx context.Context, tx *sql.Tx, runID string, nowMs int64, eventID string, payload decisionPayload) error {
 	if payload.CandidateEdges == nil {
 		payload.CandidateEdges = []string{}
 	}
@@ -42,7 +42,7 @@ func (c *Controller) appendDecisionEvent(ctx context.Context, tx *sql.Tx, runID 
 		payload.PredicateSnapshot = map[string]any{}
 	}
 	_, err := c.appendWithin(ctx, tx, &store.Event{
-		EventID:       ulid.Make().String(),
+		EventID:       eventID,
 		RunID:         runID,
 		SchemaVersion: "proceed/v1",
 		Type:          "decision_recorded",
@@ -62,22 +62,21 @@ type edgeInfo struct {
 }
 
 // recordRoutingDecision persists the route selection made by a finishing
-// node: candidate routes_to edges, the selected edge or rejection, the
-// predicate snapshot, and blocked_by links for targets the rejection
-// fail-closed. Links live in the event payload so a projection rebuild
-// reproduces them.
+// node: candidate routes_to edges, one decision row per selected edge (the
+// schema binds a single edge id per row), the predicate snapshot, and
+// blocked_by links for targets the rejection fail-closed. Links live in
+// the event payload so a projection rebuild reproduces them, and every
+// link source id is the decision event id that produced it.
 func (c *Controller) recordRoutingDecision(ctx context.Context, tx *sql.Tx, runID, graphVersionID, nodeKey, digest, route string, routeKnown bool, edges []edgeInfo, nowMs int64) error {
-	var candidates []string
-	selected := ""
-	selectedConditional := false
+	var candidates []edgeInfo
+	var selected []edgeInfo
 	for _, e := range edges {
 		if e.Type != "routes_to" {
 			continue
 		}
-		candidates = append(candidates, e.ID)
-		if routeKnown && selected == "" && (!e.Cond.Valid || e.Cond.String == "" || route == e.Cond.String) {
-			selected = e.ID
-			selectedConditional = e.Cond.Valid && e.Cond.String != ""
+		candidates = append(candidates, e)
+		if routeKnown && (!e.Cond.Valid || e.Cond.String == "" || route == e.Cond.String) {
+			selected = append(selected, e)
 		}
 	}
 	if len(candidates) == 0 {
@@ -88,62 +87,96 @@ func (c *Controller) recordRoutingDecision(ctx context.Context, tx *sql.Tx, runI
 	if err != nil {
 		return err
 	}
+	candidateIDs := edgeIDs(candidates)
 
-	snapshot := map[string]any{
-		"route": route,
-	}
-	rejection := ""
-	var links []causalLink
-	var selectedTarget string
-	if selected == "" {
-		rejection = "no candidate condition matched the recorded route"
-		snapshot["match"] = "router produced no route"
-	} else {
-		snapshot["match"] = "route value equals edge condition"
-		for _, e := range edges {
-			if e.ID == selected && e.Type == "routes_to" {
-				selectedTarget = e.To
+	if len(selected) == 0 {
+		rejection := "no candidate condition matched the recorded route"
+		eventID := ulid.Make().String()
+		var links []causalLink
+		for _, e := range candidates {
+			if c.onlyIncomingEdge(ctx, tx, graphVersionID, e.To, e.ID) {
+				links = append(links, causalLink{
+					TargetNodeKey: e.To,
+					Attribution:   "blocked_by",
+					SourceKind:    "decision",
+					SourceID:      eventID,
+				})
 			}
 		}
-		if selectedConditional {
-			snapshot["counterfactual_basis"] = "route value selected this edge; a different route value would not have"
-			links = append(links, causalLink{
-				TargetNodeKey: selectedTarget,
-				Attribution:   "necessary",
-				SourceKind:    "decision",
-				SourceID:      nodeKey,
-			})
-		} else {
-			snapshot["counterfactual_basis"] = "unconditional edge; selection did not depend on the route value"
-			links = append(links, causalLink{
-				TargetNodeKey: selectedTarget,
-				Attribution:   "contributing",
-				SourceKind:    "decision",
-				SourceID:      nodeKey,
-			})
-		}
+		return c.appendDecisionEvent(ctx, tx, runID, nowMs, eventID, decisionPayload{
+			NodeKey:           nodeKey,
+			Kind:              "routing",
+			CandidateEdges:    candidateIDs,
+			Rejection:         rejection,
+			PredicateSnapshot: map[string]any{"route": route, "match": "router produced no route"},
+			InputReferences:   inputRefs,
+			PolicyVersion:     digest,
+			CausalLinks:       links,
+		})
 	}
-	for _, e := range edges {
-		if e.Type == "routes_to" && e.ID != selected && c.onlyIncomingEdge(ctx, tx, graphVersionID, e.To, e.ID) {
-			links = append(links, causalLink{
+
+	selectedIDs := map[string]bool{}
+	for _, e := range selected {
+		selectedIDs[e.ID] = true
+	}
+	var blockedLinks []causalLink
+	for _, e := range candidates {
+		if !selectedIDs[e.ID] && c.onlyIncomingEdge(ctx, tx, graphVersionID, e.To, e.ID) {
+			blockedLinks = append(blockedLinks, causalLink{
 				TargetNodeKey: e.To,
 				Attribution:   "blocked_by",
 				SourceKind:    "decision",
-				SourceID:      nodeKey,
 			})
 		}
 	}
-	return c.appendDecisionEvent(ctx, tx, runID, nowMs, decisionPayload{
-		NodeKey:           nodeKey,
-		Kind:              "routing",
-		CandidateEdges:    candidates,
-		SelectedEdgeID:    selected,
-		Rejection:         rejection,
-		PredicateSnapshot: snapshot,
-		InputReferences:   inputRefs,
-		PolicyVersion:     digest,
-		CausalLinks:       links,
-	})
+
+	for i, e := range selected {
+		eventID := ulid.Make().String()
+		conditional := e.Cond.Valid && e.Cond.String != ""
+		attribution := "contributing"
+		basis := "unconditional edge; selection did not depend on the route value"
+		if conditional {
+			attribution = "necessary"
+			basis = "route value selected this edge; a different route value would not have"
+		}
+		links := []causalLink{{
+			TargetNodeKey: e.To,
+			Attribution:   attribution,
+			SourceKind:    "decision",
+			SourceID:      eventID,
+		}}
+		if i == 0 {
+			for j := range blockedLinks {
+				blockedLinks[j].SourceID = eventID
+			}
+			links = append(links, blockedLinks...)
+		}
+		if err := c.appendDecisionEvent(ctx, tx, runID, nowMs, eventID, decisionPayload{
+			NodeKey:        nodeKey,
+			Kind:           "routing",
+			CandidateEdges: candidateIDs,
+			SelectedEdgeID: e.ID,
+			PredicateSnapshot: map[string]any{
+				"route":                route,
+				"match":                "route value equals edge condition",
+				"counterfactual_basis": basis,
+			},
+			InputReferences: inputRefs,
+			PolicyVersion:   digest,
+			CausalLinks:     links,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func edgeIDs(edges []edgeInfo) []string {
+	ids := make([]string, 0, len(edges))
+	for _, e := range edges {
+		ids = append(ids, e.ID)
+	}
+	return ids
 }
 
 type dependency struct {
@@ -235,11 +268,15 @@ ORDER BY ge.id`, graphVersionID, nodeKey)
 		case sole:
 			attribution = "necessary"
 		}
+		finishEventID, err := c.latestNodeFinishedEvent(ctx, tx, runID, d.from)
+		if err != nil {
+			return err
+		}
 		links = append(links, causalLink{
 			TargetNodeKey: nodeKey,
 			Attribution:   attribution,
 			SourceKind:    "event",
-			SourceID:      "node_finished:" + d.from,
+			SourceID:      finishEventID,
 			GroupKey:      groupKey,
 		})
 		artifactRefs, err := c.nodeArtifactRefs(ctx, tx, runID, d.from)
@@ -258,7 +295,7 @@ ORDER BY ge.id`, graphVersionID, nodeKey)
 	} else {
 		snapshot["counterfactual_basis"] = "conjunctive group; no single member is individually necessary"
 	}
-	return c.appendDecisionEvent(ctx, tx, runID, nowMs, decisionPayload{
+	return c.appendDecisionEvent(ctx, tx, runID, nowMs, ulid.Make().String(), decisionPayload{
 		NodeKey:           nodeKey,
 		Kind:              "routing",
 		CandidateEdges:    dependencyEdgeIDs(deps),
@@ -267,6 +304,21 @@ ORDER BY ge.id`, graphVersionID, nodeKey)
 		PolicyVersion:     digest,
 		CausalLinks:       links,
 	})
+}
+
+// latestNodeFinishedEvent resolves the durable finish event backing a
+// dependency source, so a causal link always cites a resolvable event id —
+// including after retries produced several finish events.
+func (c *Controller) latestNodeFinishedEvent(ctx context.Context, tx *sql.Tx, runID, nodeKey string) (string, error) {
+	var eventID string
+	err := tx.QueryRowContext(ctx, `
+SELECT event_id FROM event
+WHERE run_id = ? AND type = 'node_finished' AND json_extract(payload, '$.node_key') = ?
+ORDER BY sequence DESC LIMIT 1`, runID, nodeKey).Scan(&eventID)
+	if err == sql.ErrNoRows {
+		return "node:" + nodeKey, nil
+	}
+	return eventID, err
 }
 
 func dependencyEdgeIDs(deps []dependency) []string {
