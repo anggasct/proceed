@@ -210,7 +210,7 @@ func TestPartialProjectionFallbackReplaysCausalLinksAndEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.append("decision_recorded", map[string]any{
-		"node_key": "b", "kind": "routing", "candidate_edges": []string{},
+		"node_key": "b", "kind": "routing", "candidate_edges": []string{"event-candidate"},
 		"predicate_snapshot": map[string]any{}, "input_references": []string{"artifact:" + artifactID},
 		"policy_version": "v1", "causal_links": []map[string]any{{
 			"target_node_key": "b", "attribution": "necessary", "source_kind": "event", "source_id": "event-source",
@@ -233,9 +233,32 @@ func TestPartialProjectionFallbackReplaysCausalLinksAndEvidence(t *testing.T) {
 	if len(explanation.Recorded.CausalLinks) != 1 {
 		t.Fatalf("causal links = %d, want 1", len(explanation.Recorded.CausalLinks))
 	}
+	var decisionEventID string
+	if err := f.st.DB().QueryRow(
+		"SELECT event_id FROM event WHERE run_id = ? AND type = 'decision_recorded'", f.runID).Scan(&decisionEventID); err != nil {
+		t.Fatal(err)
+	}
+	if explanation.Recorded.Decisions[0].ID != decisionEventID {
+		t.Errorf("decision id = %q, want event %q", explanation.Recorded.Decisions[0].ID, decisionEventID)
+	}
+	if explanation.Recorded.CausalLinks[0].DecisionID != decisionEventID {
+		t.Errorf("causal link decision id = %q, want event %q", explanation.Recorded.CausalLinks[0].DecisionID, decisionEventID)
+	}
+	if !containsString(explanation.Recorded.CandidateEdges, "event-candidate") {
+		t.Errorf("candidate edges = %v, want event-candidate", explanation.Recorded.CandidateEdges)
+	}
 	if len(explanation.Recorded.Evidence.Artifacts) != 1 || explanation.Recorded.Evidence.Artifacts[0].ID != artifactID {
 		t.Fatalf("artifacts = %+v, want cited artifact %s", explanation.Recorded.Evidence.Artifacts, artifactID)
 	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestCompletedRootIsNotPending(t *testing.T) {

@@ -411,6 +411,33 @@ edges:
 	}
 }
 
+func TestWhyConditionalSelectionWithoutEvidenceIsContributing(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	frozen := compileAndFreeze(t, st, routingWhyGraph)
+	runID := runToCompletion(t, st, frozen, map[executor.Kind]executor.Executor{
+		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			if req.NodeKey == "classify" {
+				return &executor.Result{Route: "requires_code"}, nil
+			}
+			return &executor.Result{}, nil
+		}),
+	})
+
+	explanation := explainNode(t, st, runID, "code_path")
+	for _, attribution := range explanation.Inference.Attributions {
+		if attribution.Strength == "necessary" {
+			t.Fatalf("conditional selection without evidence rendered necessary: %+v", explanation.Inference.Attributions)
+		}
+	}
+	if len(explanation.Inference.Attributions) != 1 || explanation.Inference.Attributions[0].Strength != "contributing" {
+		t.Fatalf("attributions = %+v, want one contributing attribution", explanation.Inference.Attributions)
+	}
+}
+
 func TestWhyFallbackEquivalenceAfterProjectionRebuild(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
 	if err != nil {
@@ -598,6 +625,47 @@ edges:
 	}
 }
 
+func TestWhyEligibilityRecordsAllReleaseEdgeTypes(t *testing.T) {
+	for _, edgeType := range []string{"produces", "consumes"} {
+		t.Run(edgeType, func(t *testing.T) {
+			st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			frozen := compileAndFreeze(t, st, `schema: proceed/v1
+name: release-edge-why
+nodes:
+  - id: source
+    type: task
+    executor: { kind: shell, command: [bin/source] }
+    contract: pure
+  - id: target
+    type: task
+    executor: { kind: shell, command: [bin/target] }
+    contract: pure
+    terminal: true
+edges:
+  - { from: source, to: target, type: `+edgeType+` }
+`)
+			runID := runToCompletion(t, st, frozen, map[executor.Kind]executor.Executor{
+				"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+					return &executor.Result{}, nil
+				}),
+			})
+
+			explanation := explainNode(t, st, runID, "target")
+			if len(explanation.Recorded.Decisions) != 1 {
+				t.Fatalf("decisions = %d, want 1", len(explanation.Recorded.Decisions))
+			}
+			edgeID := edgeIDBetween(t, st, frozen.GraphVersionID, "source", "target", edgeType)
+			if len(explanation.Recorded.Decisions[0].CandidateEdges) != 1 || explanation.Recorded.Decisions[0].CandidateEdges[0] != edgeID {
+				t.Fatalf("candidate edges = %v, want [%s]", explanation.Recorded.Decisions[0].CandidateEdges, edgeID)
+			}
+		})
+	}
+}
+
 func findArtifact(e *why.Explanation, id string) *why.ArtifactEvidence {
 	for i := range e.Recorded.Evidence.Artifacts {
 		if e.Recorded.Evidence.Artifacts[i].ID == id {
@@ -748,7 +816,7 @@ edges:
 			if link.Attribution == "blocked_by" {
 				t.Fatalf("false blocked_by for %s: %+v", key, link)
 			}
-			if link.Attribution == "necessary" {
+			if link.Attribution == "contributing" {
 				selected[key] = true
 			}
 		}

@@ -134,10 +134,12 @@ func (c *Controller) recordRoutingDecision(ctx context.Context, tx *sql.Tx, runI
 		eventID := ulid.Make().String()
 		conditional := e.Cond.Valid && e.Cond.String != ""
 		attribution := "contributing"
-		basis := "unconditional edge; selection did not depend on the route value"
-		if conditional {
+		basis := "selection did not include a recorded counterfactual input"
+		if conditional && len(inputRefs) > 0 {
 			attribution = "necessary"
 			basis = "route value selected this edge; a different route value would not have"
+		} else if !conditional {
+			basis = "unconditional edge; selection did not depend on the route value"
 		}
 		links := []causalLink{{
 			TargetNodeKey: e.To,
@@ -185,12 +187,12 @@ type dependency struct {
 }
 
 // recordEligibilityDecisions persists why each newly-eligible downstream
-// node became eligible: the satisfied depends_on sources as a conjunctive
+// node became eligible: the satisfied release-edge sources as a conjunctive
 // group, with per-source attribution bounded by recorded evidence.
 func (c *Controller) recordEligibilityDecisions(ctx context.Context, tx *sql.Tx, runID, graphVersionID, digest string, edges []edgeInfo, nowMs int64) error {
 	seen := map[string]bool{}
 	for _, e := range edges {
-		if e.Type != "depends_on" || seen[e.To] {
+		if (e.Type != "depends_on" && e.Type != "produces" && e.Type != "consumes") || seen[e.To] {
 			continue
 		}
 		seen[e.To] = true
@@ -204,7 +206,7 @@ func (c *Controller) recordEligibilityDecisions(ctx context.Context, tx *sql.Tx,
 func (c *Controller) recordOneEligibility(ctx context.Context, tx *sql.Tx, runID, graphVersionID, digest, nodeKey string, nowMs int64) error {
 	depRows, err := tx.QueryContext(ctx, `
 SELECT ge.id, ge.from_node_key FROM graph_edge ge
-WHERE ge.graph_version_id = ? AND ge.to_node_key = ? AND ge.type = 'depends_on'
+WHERE ge.graph_version_id = ? AND ge.to_node_key = ? AND ge.type IN ('depends_on', 'produces', 'consumes')
 ORDER BY ge.id`, graphVersionID, nodeKey)
 	if err != nil {
 		return err

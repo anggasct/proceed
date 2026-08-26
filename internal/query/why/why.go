@@ -411,19 +411,24 @@ ORDER BY sequence LIMIT 1`, runID)
 		return nil, err
 	}
 
-	var decisionEvents []decisionEventPayload
+	type decisionEvent struct {
+		id         string
+		payload    decisionEventPayload
+		occurredAt int64
+	}
+	var decisionEvents []decisionEvent
 	decRows, err := q.st.DB().QueryContext(ctx, `
-SELECT payload, occurred_at FROM event
+SELECT event_id, payload, occurred_at FROM event
 WHERE run_id = ? AND type = 'decision_recorded'
 ORDER BY sequence`, runID)
 	if err != nil {
 		return nil, err
 	}
-	var occurredAts []int64
 	for decRows.Next() {
+		var eventID string
 		var payload string
 		var occurredAt int64
-		if err := decRows.Scan(&payload, &occurredAt); err != nil {
+		if err := decRows.Scan(&eventID, &payload, &occurredAt); err != nil {
 			decRows.Close()
 			return nil, err
 		}
@@ -439,17 +444,18 @@ ORDER BY sequence`, runID)
 			}
 		}
 		if p.NodeKey == nodeKey || targetsNode {
-			decisionEvents = append(decisionEvents, p)
-			occurredAts = append(occurredAts, occurredAt)
+			decisionEvents = append(decisionEvents, decisionEvent{id: eventID, payload: p, occurredAt: occurredAt})
+			rec.CandidateEdges = mergeUnique(rec.CandidateEdges, p.CandidateEdges)
 		}
 	}
 	decRows.Close()
 	if err := decRows.Err(); err != nil {
 		return nil, err
 	}
-	for i, p := range decisionEvents {
+	for _, event := range decisionEvents {
+		p := event.payload
 		rec.Decisions = append(rec.Decisions, RecordedDecision{
-			ID:                "event-pending",
+			ID:                event.id,
 			Kind:              p.Kind,
 			CandidateEdges:    orEmpty(p.CandidateEdges),
 			SelectedEdgeID:    p.SelectedEdgeID,
@@ -457,7 +463,7 @@ ORDER BY sequence`, runID)
 			PredicateSnapshot: p.PredicateSnapshot,
 			InputReferences:   orEmpty(p.InputReferences),
 			PolicyVersion:     p.PolicyVersion,
-			DecidedAt:         occurredAts[i],
+			DecidedAt:         event.occurredAt,
 		})
 	}
 
@@ -527,7 +533,7 @@ ORDER BY sequence`, runID)
 	}
 
 	linkRows, err := q.st.DB().QueryContext(ctx, `
-SELECT payload FROM event
+SELECT event_id, payload FROM event
 WHERE run_id = ? AND type = 'decision_recorded'
 ORDER BY sequence`, runID)
 	if err != nil {
@@ -535,8 +541,9 @@ ORDER BY sequence`, runID)
 	}
 	defer linkRows.Close()
 	for linkRows.Next() {
+		var eventID string
 		var payload string
-		if err := linkRows.Scan(&payload); err != nil {
+		if err := linkRows.Scan(&eventID, &payload); err != nil {
 			return nil, err
 		}
 		var p decisionEventPayload
@@ -548,6 +555,7 @@ ORDER BY sequence`, runID)
 				continue
 			}
 			rec.CausalLinks = append(rec.CausalLinks, RecordedLink{
+				DecisionID:    eventID,
 				Attribution:   link.Attribution,
 				SourceKind:    link.SourceKind,
 				SourceID:      link.SourceID,
