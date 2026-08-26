@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -648,6 +649,10 @@ edges:
 	}
 
 	explanation := explainNode(t, st, runID, "after")
+	flakyProjected := explainNode(t, st, runID, "flaky")
+	if flakyProjected.Recorded.AttemptCount != 2 {
+		t.Fatalf("projected flaky attempts = %d, want 2", flakyProjected.Recorded.AttemptCount)
+	}
 	for _, link := range explanation.Recorded.CausalLinks {
 		switch link.SourceKind {
 		case "decision":
@@ -677,6 +682,10 @@ edges:
 		t.Fatal(err)
 	}
 	fallback := explainNode(t, st, runID, "after")
+	flakyFallback := explainNode(t, st, runID, "flaky")
+	if flakyFallback.Recorded.AttemptCount != flakyProjected.Recorded.AttemptCount {
+		t.Fatalf("fallback flaky attempts = %d, projected = %d", flakyFallback.Recorded.AttemptCount, flakyProjected.Recorded.AttemptCount)
+	}
 	for _, link := range fallback.Recorded.CausalLinks {
 		if link.SourceKind != "event" {
 			continue
@@ -757,5 +766,137 @@ SELECT (SELECT COUNT(*) FROM decision d JOIN run_node rn ON rn.id = d.run_node_i
 	}
 	if decisions < 2 || traversed != 2 {
 		t.Fatalf("decisions = %d (want >= 2), traversed = %d (want 2)", decisions, traversed)
+	}
+}
+
+func TestIndependentRootsFanInWithSerialConcurrency(t *testing.T) {
+	st := newStore(t)
+	frozen := compileAndFreeze(t, st, `schema: proceed/v1
+name: serial-fan-in
+nodes:
+  - id: left
+    type: task
+    executor: { kind: shell, command: [bin/left] }
+    contract: pure
+  - id: right
+    type: task
+    executor: { kind: shell, command: [bin/right] }
+    contract: pure
+  - id: join
+    type: task
+    executor: { kind: shell, command: [bin/join] }
+    contract: pure
+    terminal: true
+edges:
+  - { from: left, to: join, type: depends_on }
+  - { from: right, to: join, type: depends_on }
+`)
+	cfg := DefaultConfig()
+	cfg.MaxConcurrent = 1
+	c, err := New(st, cfg, map[executor.Kind]executor.Executor{
+		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			return &executor.Result{}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, err := c.Run(context.Background(), RunInput{GraphVersionID: frozen.GraphVersionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Drain(context.Background(), runID); err != nil {
+		t.Fatal(err)
+	}
+	if got := nodeStatus(t, st, runID, "join"); got != "succeeded" {
+		t.Fatalf("join status = %q, want succeeded", got)
+	}
+}
+
+func TestUnmatchedRouteWithDependencySkipsTarget(t *testing.T) {
+	st := newStore(t)
+	frozen := compileAndFreeze(t, st, `schema: proceed/v1
+name: mixed-incoming
+nodes:
+  - id: chooser
+    type: router
+    executor: { kind: shell, command: [bin/chooser] }
+    contract: pure
+  - id: prerequisite
+    type: task
+    executor: { kind: shell, command: [bin/prerequisite] }
+    contract: pure
+  - id: target
+    type: task
+    executor: { kind: shell, command: [bin/target] }
+    contract: pure
+    terminal: true
+edges:
+  - { from: chooser, to: target, type: routes_to, when: expected }
+  - { from: prerequisite, to: target, type: depends_on }
+`)
+	cfg := DefaultConfig()
+	cfg.MaxConcurrent = 1
+	c, err := New(st, cfg, map[executor.Kind]executor.Executor{
+		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			if req.NodeKey == "chooser" {
+				return &executor.Result{Route: "other"}, nil
+			}
+			return &executor.Result{}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, err := c.Run(context.Background(), RunInput{GraphVersionID: frozen.GraphVersionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Drain(context.Background(), runID); err != nil {
+		t.Fatal(err)
+	}
+	if got := nodeStatus(t, st, runID, "target"); got != "skipped" {
+		t.Fatalf("target status = %q, want skipped", got)
+	}
+	explanation := explainNode(t, st, runID, "target")
+	blocked := false
+	for _, link := range explanation.Recorded.CausalLinks {
+		if link.Attribution == "blocked_by" {
+			blocked = true
+		}
+	}
+	if !blocked {
+		t.Fatalf("target links = %+v, want blocked_by", explanation.Recorded.CausalLinks)
+	}
+}
+
+func TestSkippedDependencyCitesSkipEvent(t *testing.T) {
+	st := newStore(t)
+	frozen := compileAndFreeze(t, st, linearGraph)
+	c := newController(t, st, map[executor.Kind]executor.Executor{})
+	runID, err := st.CreateRun(context.Background(), frozen.GraphVersionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	skipped, err := st.Append(context.Background(), store.Event{
+		RunID: runID.ID, Sequence: 2, SchemaVersion: "proceed/v1", Type: "node_skipped",
+		OccurredAt: 1700000000001, ActorType: "controller", ActorID: "test",
+		Payload: `{"node_key":"a"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := st.DB().BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.latestNodeFinishedEvent(context.Background(), tx, runID.ID, "a")
+	if rollbackErr := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	} else if rollbackErr != nil && rollbackErr != sql.ErrTxDone {
+		t.Fatal(rollbackErr)
+	}
+	if got != skipped.EventID {
+		t.Fatalf("source event = %q, want skipped event %q", got, skipped.EventID)
 	}
 }

@@ -198,3 +198,59 @@ func TestEvidenceJoinIncludesArtifactsEvaluationsAndApprovals(t *testing.T) {
 			ev.Approvals[0].Decision, ev.Approvals[0].DecidedBy)
 	}
 }
+
+func TestPartialProjectionFallbackReplaysCausalLinksAndEvidence(t *testing.T) {
+	f := newFixture(t)
+	f.append("node_started", map[string]any{"node_key": "a", "attempt_no": 1})
+	f.append("artifact_published", map[string]any{
+		"node_key": "a", "name": "result", "content_hash": "sha256:abc", "media_type": "text/plain", "size_bytes": 3,
+	})
+	var artifactID string
+	if err := f.st.DB().QueryRow("SELECT id FROM artifact WHERE run_id = ?", f.runID).Scan(&artifactID); err != nil {
+		t.Fatal(err)
+	}
+	f.append("decision_recorded", map[string]any{
+		"node_key": "b", "kind": "routing", "candidate_edges": []string{},
+		"predicate_snapshot": map[string]any{}, "input_references": []string{"artifact:" + artifactID},
+		"policy_version": "v1", "causal_links": []map[string]any{{
+			"target_node_key": "b", "attribution": "necessary", "source_kind": "event", "source_id": "event-source",
+		}},
+	})
+	if _, err := f.st.DB().Exec("DELETE FROM causal_link"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.DB().Exec("DELETE FROM artifact"); err != nil {
+		t.Fatal(err)
+	}
+
+	explanation, err := f.q.Explain(context.Background(), f.runID, "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explanation.Recorded.Source != "events" {
+		t.Fatalf("source = %q, want events", explanation.Recorded.Source)
+	}
+	if len(explanation.Recorded.CausalLinks) != 1 {
+		t.Fatalf("causal links = %d, want 1", len(explanation.Recorded.CausalLinks))
+	}
+	if len(explanation.Recorded.Evidence.Artifacts) != 1 || explanation.Recorded.Evidence.Artifacts[0].ID != artifactID {
+		t.Fatalf("artifacts = %+v, want cited artifact %s", explanation.Recorded.Evidence.Artifacts, artifactID)
+	}
+}
+
+func TestCompletedRootIsNotPending(t *testing.T) {
+	f := newFixture(t)
+	f.append("node_started", map[string]any{"node_key": "a", "attempt_no": 1})
+	f.append("node_finished", map[string]any{"node_key": "a", "attempt_no": 1})
+
+	explanation, err := f.q.Explain(context.Background(), f.runID, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explanation.Recorded.NodeStatus != "succeeded" {
+		t.Fatalf("status = %q, want succeeded", explanation.Recorded.NodeStatus)
+	}
+	if explanation.Inference.Pending {
+		t.Fatal("completed root was reported as pending")
+	}
+}

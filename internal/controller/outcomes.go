@@ -339,7 +339,8 @@ WHERE graph_version_id = ? AND from_node_key = ? ORDER BY id`, graphVersionID, n
 func (c *Controller) onlyIncomingEdge(ctx context.Context, tx *sql.Tx, graphVersionID, nodeKey, edgeID string) bool {
 	var count int
 	if err := tx.QueryRowContext(ctx, `
-SELECT COUNT(*) FROM graph_edge WHERE graph_version_id = ? AND to_node_key = ? AND id <> ?`,
+	SELECT COUNT(*) FROM graph_edge
+	WHERE graph_version_id = ? AND to_node_key = ? AND type = 'routes_to' AND id <> ?`,
 		graphVersionID, nodeKey, edgeID).Scan(&count); err != nil {
 		return false
 	}

@@ -155,7 +155,125 @@ func (q *Query) projectionCurrent(ctx context.Context, runID string) (bool, erro
 		"SELECT COUNT(*) FROM event WHERE run_id = ? AND type = 'decision_recorded'", runID).Scan(&recorded); err != nil {
 		return false, err
 	}
-	return projected >= recorded, nil
+	if projected != recorded {
+		return false, nil
+	}
+
+	rows, err := q.st.DB().QueryContext(ctx, `
+SELECT type, payload FROM event
+WHERE run_id = ? AND type IN (
+  'decision_recorded', 'edge_traversed', 'artifact_published', 'evaluation_failed',
+  'approval_requested', 'node_started', 'node_finished', 'node_failed',
+  'node_skipped', 'node_uncertain', 'node_cancelled', 'node_attempt_failed',
+  'node_requeued', 'node_waiting', 'node_reconciling', 'node_cancel_requested'
+) ORDER BY sequence`, runID)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	expected := map[string]int{}
+	nodeKeys := map[string]bool{}
+	causalLinks := 0
+	for rows.Next() {
+		var typ, payload string
+		if err := rows.Scan(&typ, &payload); err != nil {
+			return false, err
+		}
+		switch typ {
+		case "decision_recorded":
+			var p decisionEventPayload
+			if err := json.Unmarshal([]byte(payload), &p); err != nil {
+				return false, err
+			}
+			expected["decision"]++
+			causalLinks += len(p.CausalLinks)
+			if p.NodeKey != "" {
+				nodeKeys[p.NodeKey] = true
+			}
+			for _, link := range p.CausalLinks {
+				if link.TargetNodeKey != "" {
+					nodeKeys[link.TargetNodeKey] = true
+				}
+			}
+		case "edge_traversed":
+			expected["run_edge"]++
+		case "artifact_published":
+			var p struct {
+				NodeKey string `json:"node_key"`
+			}
+			if err := json.Unmarshal([]byte(payload), &p); err != nil {
+				return false, err
+			}
+			expected["artifact"]++
+			if p.NodeKey != "" {
+				nodeKeys[p.NodeKey] = true
+			}
+		case "evaluation_failed":
+			expected["evaluation"]++
+		case "approval_requested":
+			var p struct {
+				NodeKey string `json:"node_key"`
+			}
+			if err := json.Unmarshal([]byte(payload), &p); err != nil {
+				return false, err
+			}
+			expected["approval"]++
+			if p.NodeKey != "" {
+				nodeKeys[p.NodeKey] = true
+			}
+		default:
+			var p struct {
+				NodeKey string `json:"node_key"`
+			}
+			if err := json.Unmarshal([]byte(payload), &p); err != nil {
+				return false, err
+			}
+			if p.NodeKey != "" {
+				nodeKeys[p.NodeKey] = true
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+
+	counts := map[string]string{
+		"run_edge":   "SELECT COUNT(*) FROM run_edge WHERE run_id = ?",
+		"artifact":   "SELECT COUNT(*) FROM artifact WHERE run_id = ?",
+		"evaluation": "SELECT COUNT(*) FROM evaluation WHERE run_id = ?",
+		"approval":   "SELECT COUNT(*) FROM approval WHERE run_id = ?",
+	}
+	for table, query := range counts {
+		var actual int
+		if err := q.st.DB().QueryRowContext(ctx, query, runID).Scan(&actual); err != nil {
+			return false, err
+		}
+		if actual != expected[table] {
+			return false, nil
+		}
+	}
+	var actualLinks int
+	if err := q.st.DB().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM causal_link cl
+JOIN decision d ON d.id = cl.decision_id
+WHERE d.run_id = ?`, runID).Scan(&actualLinks); err != nil {
+		return false, err
+	}
+	if actualLinks != causalLinks {
+		return false, nil
+	}
+	for nodeKey := range nodeKeys {
+		var present int
+		if err := q.st.DB().QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM run_node WHERE run_id = ? AND node_key = ?", runID, nodeKey).Scan(&present); err != nil {
+			return false, err
+		}
+		if present == 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (q *Query) load(ctx context.Context, runID, nodeKey string) (*Recorded, error) {
@@ -285,7 +403,7 @@ ORDER BY sequence LIMIT 1`, runID)
 		RunID:          runID,
 		GraphVersionID: graphVersionID,
 		NodeKey:        nodeKey,
-		NodeStatus:     "unknown",
+		NodeStatus:     "pending",
 		Source:         "events",
 		CandidateEdges: []string{},
 	}
@@ -350,7 +468,8 @@ ORDER BY sequence`, runID)
 	nodeStates := map[string]finishState{}
 	stateRows, err := q.st.DB().QueryContext(ctx, `
 SELECT type, payload FROM event
-WHERE run_id = ? AND type IN ('node_started','node_finished','node_failed','node_skipped','node_uncertain','node_cancelled')
+WHERE run_id = ? AND type IN ('node_started','node_finished','node_failed','node_skipped','node_uncertain','node_cancelled',
+                              'node_attempt_failed','node_requeued','node_waiting','node_reconciling','node_cancel_requested')
 ORDER BY sequence`, runID)
 	if err != nil {
 		return nil, err
@@ -362,17 +481,24 @@ ORDER BY sequence`, runID)
 			return nil, err
 		}
 		var p struct {
-			NodeKey string `json:"node_key"`
+			NodeKey   string `json:"node_key"`
+			AttemptNo int64  `json:"attempt_no"`
 		}
 		_ = json.Unmarshal([]byte(payload), &p)
 		if p.NodeKey != nodeKey {
 			continue
 		}
 		state := nodeStates[p.NodeKey]
-		state.count++
 		switch typ {
 		case "node_started":
 			state.status = "running"
+			attemptNo := p.AttemptNo
+			if attemptNo <= 0 {
+				attemptNo = 1
+			}
+			if attemptNo > state.count {
+				state.count = attemptNo
+			}
 		case "node_finished":
 			state.status = "succeeded"
 		case "node_failed":
@@ -383,6 +509,14 @@ ORDER BY sequence`, runID)
 			state.status = "uncertain"
 		case "node_cancelled":
 			state.status = "cancelled"
+		case "node_attempt_failed", "node_requeued":
+			state.status = "eligible"
+		case "node_waiting":
+			state.status = "waiting"
+		case "node_reconciling":
+			state.status = "reconciling"
+		case "node_cancel_requested":
+			state.status = "cancel_requested"
 		}
 		nodeStates[p.NodeKey] = state
 	}
@@ -431,6 +565,9 @@ ORDER BY sequence`, runID)
 		evidenceIDs = append(evidenceIDs, d.InputReferences...)
 	}
 	if err := q.loadEvidenceByReferences(ctx, rec, runID, evidenceIDs); err != nil {
+		return nil, err
+	}
+	if err := q.loadEvidenceFromEvents(ctx, rec, runID, nodeKey); err != nil {
 		return nil, err
 	}
 	return rec, nil
@@ -638,6 +775,153 @@ WHERE a.run_id = ? AND a.id IN (`+strings.Join(placeholders, ",")+`) ORDER BY e.
 	return evalRows.Err()
 }
 
+func (q *Query) loadEvidenceFromEvents(ctx context.Context, rec *Recorded, runID, nodeKey string) error {
+	type eventEvidence struct {
+		id       string
+		typ      string
+		occurred int64
+		payload  string
+	}
+	rows, err := q.st.DB().QueryContext(ctx, `
+SELECT event_id, type, occurred_at, payload FROM event
+WHERE run_id = ? AND type IN ('artifact_published', 'evaluation_failed',
+                              'approval_requested', 'approval_granted', 'approval_denied')
+ORDER BY sequence`, runID)
+	if err != nil {
+		return err
+	}
+	var events []eventEvidence
+	for rows.Next() {
+		var ev eventEvidence
+		if err := rows.Scan(&ev.id, &ev.typ, &ev.occurred, &ev.payload); err != nil {
+			rows.Close()
+			return err
+		}
+		events = append(events, ev)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	wantedArtifacts := map[string]bool{}
+	for _, decision := range rec.Decisions {
+		for _, ref := range decision.InputReferences {
+			if id, ok := strings.CutPrefix(ref, "artifact:"); ok {
+				wantedArtifacts[id] = true
+			}
+		}
+	}
+	artifactNodes := map[string]string{}
+	for _, ev := range events {
+		if ev.typ != "artifact_published" {
+			continue
+		}
+		var p struct {
+			NodeKey     string `json:"node_key"`
+			Name        string `json:"name"`
+			ContentHash string `json:"content_hash"`
+			MediaType   string `json:"media_type"`
+			SizeBytes   int64  `json:"size_bytes"`
+			Truncated   bool   `json:"truncated"`
+		}
+		if err := json.Unmarshal([]byte(ev.payload), &p); err != nil {
+			return err
+		}
+		artifactNodes[ev.id] = p.NodeKey
+		if p.NodeKey != nodeKey && !wantedArtifacts[ev.id] {
+			continue
+		}
+		found := false
+		for _, artifact := range rec.Evidence.Artifacts {
+			if artifact.ID == ev.id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			rec.Evidence.Artifacts = append(rec.Evidence.Artifacts, ArtifactEvidence{
+				ID: ev.id, Name: p.Name, ContentHash: p.ContentHash, MediaType: p.MediaType,
+				SizeBytes: p.SizeBytes, Truncated: p.Truncated,
+			})
+		}
+	}
+	for _, ev := range events {
+		if ev.typ != "evaluation_failed" {
+			continue
+		}
+		var p struct {
+			ArtifactID         string `json:"artifact_id"`
+			EvaluatedByNodeKey string `json:"evaluated_by_node_key"`
+			EvidenceRef        string `json:"evidence_ref"`
+		}
+		if err := json.Unmarshal([]byte(ev.payload), &p); err != nil {
+			return err
+		}
+		if !wantedArtifacts[p.ArtifactID] && artifactNodes[p.ArtifactID] != nodeKey {
+			continue
+		}
+		found := false
+		for _, evaluation := range rec.Evidence.Evaluations {
+			if evaluation.ID == ev.id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			rec.Evidence.Evaluations = append(rec.Evidence.Evaluations, EvaluationEvidence{
+				ID: ev.id, Verdict: "failed", EvaluatedByNodeKey: p.EvaluatedByNodeKey, EvidenceRef: p.EvidenceRef,
+			})
+		}
+	}
+	approvalIndexes := map[string]int{}
+	for i, approval := range rec.Evidence.Approvals {
+		approvalIndexes[approval.ID] = i
+	}
+	for _, ev := range events {
+		switch ev.typ {
+		case "approval_requested":
+			var p struct {
+				NodeKey         string          `json:"node_key"`
+				RequestedAction json.RawMessage `json:"requested_action"`
+				RequiredScope   string          `json:"required_scope"`
+				ExpiresAt       int64           `json:"expires_at"`
+			}
+			if err := json.Unmarshal([]byte(ev.payload), &p); err != nil {
+				return err
+			}
+			if p.NodeKey != nodeKey {
+				continue
+			}
+			if _, ok := approvalIndexes[ev.id]; !ok {
+				action := string(p.RequestedAction)
+				if action == "" {
+					action = "{}"
+				}
+				rec.Evidence.Approvals = append(rec.Evidence.Approvals, ApprovalEvidence{
+					ID: ev.id, RequestedAction: action, RequiredScope: p.RequiredScope, ExpiresAt: p.ExpiresAt,
+				})
+				approvalIndexes[ev.id] = len(rec.Evidence.Approvals) - 1
+			}
+		case "approval_granted", "approval_denied":
+			var p struct {
+				ApprovalID string `json:"approval_id"`
+				DecidedBy  string `json:"decided_by"`
+			}
+			if err := json.Unmarshal([]byte(ev.payload), &p); err != nil {
+				return err
+			}
+			if i, ok := approvalIndexes[p.ApprovalID]; ok {
+				rec.Evidence.Approvals[i].Decision = map[string]string{
+					"approval_granted": "grant", "approval_denied": "deny",
+				}[ev.typ]
+				rec.Evidence.Approvals[i].DecidedBy = p.DecidedBy
+			}
+		}
+	}
+	return nil
+}
+
 func orEmpty(v []string) []string {
 	if v == nil {
 		return []string{}
@@ -661,7 +945,7 @@ func mergeUnique(base, add []string) []string {
 
 func render(rec Recorded) Inference {
 	inference := Inference{Attributions: []Attribution{}}
-	if len(rec.Decisions) == 0 && len(rec.CausalLinks) == 0 {
+	if len(rec.Decisions) == 0 && len(rec.CausalLinks) == 0 && (rec.NodeStatus == "pending" || rec.NodeStatus == "eligible") {
 		inference.Pending = true
 		inference.Summary = fmt.Sprintf("node %s has no recorded decision yet (%d candidate transitions)", rec.NodeKey, len(rec.CandidateEdges))
 		return inference

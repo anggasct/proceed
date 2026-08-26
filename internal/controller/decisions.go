@@ -231,6 +231,9 @@ ORDER BY ge.id`, graphVersionID, nodeKey)
 		var srcStatus string
 		if err := tx.QueryRowContext(ctx,
 			"SELECT status FROM run_node WHERE run_id = ? AND node_key = ?", runID, d.from).Scan(&srcStatus); err != nil {
+			if err == sql.ErrNoRows {
+				return nil
+			}
 			return err
 		}
 		statuses[d.from] = srcStatus
@@ -312,9 +315,9 @@ ORDER BY ge.id`, graphVersionID, nodeKey)
 func (c *Controller) latestNodeFinishedEvent(ctx context.Context, tx *sql.Tx, runID, nodeKey string) (string, error) {
 	var eventID string
 	err := tx.QueryRowContext(ctx, `
-SELECT event_id FROM event
-WHERE run_id = ? AND type = 'node_finished' AND json_extract(payload, '$.node_key') = ?
-ORDER BY sequence DESC LIMIT 1`, runID, nodeKey).Scan(&eventID)
+	SELECT event_id FROM event
+	WHERE run_id = ? AND type IN ('node_finished', 'node_skipped') AND json_extract(payload, '$.node_key') = ?
+	ORDER BY sequence DESC LIMIT 1`, runID, nodeKey).Scan(&eventID)
 	if err == sql.ErrNoRows {
 		return "node:" + nodeKey, nil
 	}
