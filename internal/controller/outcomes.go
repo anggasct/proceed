@@ -263,6 +263,7 @@ WHERE graph_version_id = ? AND from_node_key = ? ORDER BY id`, graphVersionID, n
 	}
 
 	var skipped []string
+	selectedTargets := map[string]bool{}
 	for _, e := range edges {
 		switch e.Type {
 		case "depends_on", "produces", "consumes":
@@ -301,9 +302,23 @@ WHERE graph_version_id = ? AND from_node_key = ? ORDER BY id`, graphVersionID, n
 				}); err != nil {
 					return err
 				}
-			} else if c.onlyIncomingEdge(ctx, tx, graphVersionID, e.To, e.ID) {
-				skipped = append(skipped, e.To)
+				selectedTargets[e.To] = true
 			}
+		}
+	}
+	for _, e := range edges {
+		if e.Type != "routes_to" || selectedTargets[e.To] || !c.onlyIncomingRoutesFromNode(ctx, tx, graphVersionID, e.To, n.NodeKey) {
+			continue
+		}
+		alreadySkipped := false
+		for _, key := range skipped {
+			if key == e.To {
+				alreadySkipped = true
+				break
+			}
+		}
+		if !alreadySkipped {
+			skipped = append(skipped, e.To)
 		}
 	}
 	for _, key := range skipped {
@@ -336,12 +351,12 @@ WHERE graph_version_id = ? AND from_node_key = ? ORDER BY id`, graphVersionID, n
 	return c.recordEligibilityDecisions(ctx, tx, runID, graphVersionID, digest, edges, nowMs)
 }
 
-func (c *Controller) onlyIncomingEdge(ctx context.Context, tx *sql.Tx, graphVersionID, nodeKey, edgeID string) bool {
+func (c *Controller) onlyIncomingRoutesFromNode(ctx context.Context, tx *sql.Tx, graphVersionID, nodeKey, fromNodeKey string) bool {
 	var count int
 	if err := tx.QueryRowContext(ctx, `
 	SELECT COUNT(*) FROM graph_edge
-	WHERE graph_version_id = ? AND to_node_key = ? AND type = 'routes_to' AND id <> ?`,
-		graphVersionID, nodeKey, edgeID).Scan(&count); err != nil {
+	WHERE graph_version_id = ? AND to_node_key = ? AND type = 'routes_to' AND from_node_key <> ?`,
+		graphVersionID, nodeKey, fromNodeKey).Scan(&count); err != nil {
 		return false
 	}
 	return count == 0

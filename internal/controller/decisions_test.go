@@ -411,7 +411,61 @@ edges:
 	}
 }
 
-func TestWhyConditionalSelectionWithoutEvidenceIsContributing(t *testing.T) {
+func TestWhyUnconditionalSelectionWithArtifactStaysContributing(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	frozen := compileAndFreeze(t, st, `schema: proceed/v1
+name: unconditional-artifact-route
+nodes:
+  - id: pick
+    type: router
+    executor: { kind: shell, command: [bin/p] }
+    contract: pure
+  - id: only
+    type: task
+    executor: { kind: shell, command: [bin/o] }
+    contract: pure
+    terminal: true
+edges:
+  - { from: pick, to: only, type: routes_to }
+`)
+	runID := runToCompletion(t, st, frozen, map[executor.Kind]executor.Executor{
+		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			if req.NodeKey == "pick" {
+				result := artifactProducingResult()
+				result.Route = "requires_code"
+				return result, nil
+			}
+			return &executor.Result{}, nil
+		}),
+	})
+
+	explanation := explainNode(t, st, runID, "only")
+	for _, attribution := range explanation.Inference.Attributions {
+		if attribution.Strength == "necessary" {
+			t.Fatalf("selection backed only by an unrelated artifact rendered necessary: %+v", explanation.Inference.Attributions)
+		}
+	}
+	if len(explanation.Inference.Attributions) != 1 || explanation.Inference.Attributions[0].Strength != "contributing" {
+		t.Fatalf("attributions = %+v, want one contributing attribution", explanation.Inference.Attributions)
+	}
+	var basisCount int
+	if err := st.DB().QueryRow(`
+SELECT COUNT(*) FROM decision d JOIN run_node rn ON rn.id = d.run_node_id
+WHERE d.run_id = ? AND rn.node_key = 'pick'
+  AND json_extract(d.predicate_snapshot, '$.counterfactual_basis') LIKE 'unconditional%'`,
+		runID).Scan(&basisCount); err != nil {
+		t.Fatal(err)
+	}
+	if basisCount == 0 {
+		t.Fatal("unconditional selection did not record the absence of a counterfactual basis")
+	}
+}
+
+func TestWhyConditionalSelectionRecordsCounterfactualBasis(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -428,13 +482,25 @@ func TestWhyConditionalSelectionWithoutEvidenceIsContributing(t *testing.T) {
 	})
 
 	explanation := explainNode(t, st, runID, "code_path")
+	found := false
 	for _, attribution := range explanation.Inference.Attributions {
-		if attribution.Strength == "necessary" {
-			t.Fatalf("conditional selection without evidence rendered necessary: %+v", explanation.Inference.Attributions)
+		if attribution.Strength != "necessary" {
+			t.Fatalf("conditional selection with recorded basis rendered %q: %+v", attribution.Strength, explanation.Inference.Attributions)
 		}
+		found = true
 	}
-	if len(explanation.Inference.Attributions) != 1 || explanation.Inference.Attributions[0].Strength != "contributing" {
-		t.Fatalf("attributions = %+v, want one contributing attribution", explanation.Inference.Attributions)
+	if !found {
+		t.Fatalf("no attribution rendered for conditional selection: %+v", explanation.Inference.Attributions)
+	}
+	var basis string
+	if err := st.DB().QueryRow(`
+SELECT json_extract(d.predicate_snapshot, '$.counterfactual_basis') FROM decision d
+JOIN run_node rn ON rn.id = d.run_node_id
+WHERE d.run_id = ? AND rn.node_key = 'classify' AND d.selected_edge_id IS NOT NULL`, runID).Scan(&basis); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(basis, "different recorded route value") {
+		t.Fatalf("counterfactual basis = %q, want recorded route-value basis", basis)
 	}
 }
 
@@ -816,7 +882,7 @@ edges:
 			if link.Attribution == "blocked_by" {
 				t.Fatalf("false blocked_by for %s: %+v", key, link)
 			}
-			if link.Attribution == "contributing" {
+			if link.Attribution == "necessary" {
 				selected[key] = true
 			}
 		}
@@ -966,5 +1032,121 @@ func TestSkippedDependencyCitesSkipEvent(t *testing.T) {
 	}
 	if got != skipped.EventID {
 		t.Fatalf("source event = %q, want skipped event %q", got, skipped.EventID)
+	}
+}
+
+// Reviewer verification F-002: route-node artifact evidence appears once
+// per id, and the fallback path returns the same evidence arrays.
+func TestWhyEvidenceDeduplicatedAcrossPaths(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	frozen := compileAndFreeze(t, st, `schema: proceed/v1
+name: route-evidence
+nodes:
+  - id: decide
+    type: model
+    executor: { kind: shell, command: [bin/d] }
+    contract: pure
+  - id: target
+    type: task
+    executor: { kind: shell, command: [bin/t] }
+    contract: pure
+    terminal: true
+edges:
+  - { from: decide, to: target, type: routes_to, when: go }
+`)
+	runID := runToCompletion(t, st, frozen, map[executor.Kind]executor.Executor{
+		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			if req.NodeKey == "decide" {
+				result := artifactProducingResult()
+				result.Route = "go"
+				return result, nil
+			}
+			return &executor.Result{}, nil
+		}),
+	})
+
+	// Explaining the deciding node: its own artifact is both the decision
+	// input reference and its own output — it must appear exactly once.
+	projectionBacked := explainNode(t, st, runID, "decide")
+	seen := map[string]int{}
+	for _, a := range projectionBacked.Recorded.Evidence.Artifacts {
+		seen[a.ID]++
+		if seen[a.ID] > 1 {
+			t.Fatalf("artifact %s duplicated in projection output: %+v", a.ID, projectionBacked.Recorded.Evidence.Artifacts)
+		}
+	}
+	if len(seen) == 0 {
+		t.Fatal("expected at least one artifact")
+	}
+
+	for _, table := range []string{"causal_link", "decision", "node_attempt", "run_edge", "run_node", "artifact", "evaluation"} {
+		if _, err := st.DB().Exec("DELETE FROM " + table); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fallback := explainNode(t, st, runID, "decide")
+	fallbackSeen := map[string]bool{}
+	for _, a := range fallback.Recorded.Evidence.Artifacts {
+		fallbackSeen[a.ID] = true
+	}
+	for id := range seen {
+		if !fallbackSeen[id] {
+			t.Fatalf("artifact %s present in projection output but missing from fallback: %+v", id, fallback.Recorded.Evidence.Artifacts)
+		}
+	}
+	for id := range fallbackSeen {
+		if _, ok := seen[id]; !ok {
+			t.Fatalf("artifact %s present in fallback but not projection output", id)
+		}
+	}
+}
+
+// Reviewer verification F-003: pending artifact-gated nodes list their
+// produces/consumes candidate edges before any decision exists.
+func TestWhyPendingArtifactGatedCandidates(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	frozen := compileAndFreeze(t, st, `schema: proceed/v1
+name: artifact-gated
+nodes:
+  - id: builder
+    type: task
+    executor: { kind: shell, command: [bin/b] }
+    contract: pure
+  - id: verifier
+    type: verifier
+    executor: { kind: shell, command: [bin/v] }
+    contract: pure
+    terminal: true
+edges:
+  - { from: builder, to: verifier, type: produces }
+`)
+	c := newController(t, st, map[executor.Kind]executor.Executor{
+		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			return &executor.Result{}, nil
+		}),
+	})
+	runID, err := c.Run(context.Background(), RunInput{GraphVersionID: frozen.GraphVersionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	explanation := explainNode(t, st, runID, "verifier")
+	if explanation.Recorded.NodeStatus != "pending" && explanation.Recorded.NodeStatus != "eligible" {
+		t.Fatalf("verifier status = %q, want pending/eligible", explanation.Recorded.NodeStatus)
+	}
+	if len(explanation.Recorded.CandidateEdges) != 1 {
+		t.Fatalf("candidate edges = %+v, want the produces edge", explanation.Recorded.CandidateEdges)
+	}
+	want := edgeIDBetween(t, st, frozen.GraphVersionID, "builder", "verifier", "produces")
+	if explanation.Recorded.CandidateEdges[0] != want {
+		t.Fatalf("candidate edge = %q, want %q", explanation.Recorded.CandidateEdges[0], want)
 	}
 }

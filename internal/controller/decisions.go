@@ -93,8 +93,10 @@ func (c *Controller) recordRoutingDecision(ctx context.Context, tx *sql.Tx, runI
 		rejection := "no candidate condition matched the recorded route"
 		eventID := ulid.Make().String()
 		var links []causalLink
+		blockedTargets := map[string]bool{}
 		for _, e := range candidates {
-			if c.onlyIncomingEdge(ctx, tx, graphVersionID, e.To, e.ID) {
+			if !blockedTargets[e.To] && c.onlyIncomingRoutesFromNode(ctx, tx, graphVersionID, e.To, nodeKey) {
+				blockedTargets[e.To] = true
 				links = append(links, causalLink{
 					TargetNodeKey: e.To,
 					Attribution:   "blocked_by",
@@ -116,12 +118,16 @@ func (c *Controller) recordRoutingDecision(ctx context.Context, tx *sql.Tx, runI
 	}
 
 	selectedIDs := map[string]bool{}
+	selectedTargets := map[string]bool{}
 	for _, e := range selected {
 		selectedIDs[e.ID] = true
+		selectedTargets[e.To] = true
 	}
 	var blockedLinks []causalLink
+	blockedTargets := map[string]bool{}
 	for _, e := range candidates {
-		if !selectedIDs[e.ID] && c.onlyIncomingEdge(ctx, tx, graphVersionID, e.To, e.ID) {
+		if !selectedIDs[e.ID] && !selectedTargets[e.To] && !blockedTargets[e.To] && c.onlyIncomingRoutesFromNode(ctx, tx, graphVersionID, e.To, nodeKey) {
+			blockedTargets[e.To] = true
 			blockedLinks = append(blockedLinks, causalLink{
 				TargetNodeKey: e.To,
 				Attribution:   "blocked_by",
@@ -134,12 +140,10 @@ func (c *Controller) recordRoutingDecision(ctx context.Context, tx *sql.Tx, runI
 		eventID := ulid.Make().String()
 		conditional := e.Cond.Valid && e.Cond.String != ""
 		attribution := "contributing"
-		basis := "selection did not include a recorded counterfactual input"
-		if conditional && len(inputRefs) > 0 {
+		basis := "unconditional edge; selection did not depend on the route value"
+		if conditional {
 			attribution = "necessary"
-			basis = "route value selected this edge; a different route value would not have"
-		} else if !conditional {
-			basis = "unconditional edge; selection did not depend on the route value"
+			basis = "recorded route value matched the edge condition; a different recorded route value would not have selected this edge"
 		}
 		links := []causalLink{{
 			TargetNodeKey: e.To,

@@ -57,6 +57,7 @@ type Evidence struct {
 	Artifacts   []ArtifactEvidence   `json:"artifacts"`
 	Evaluations []EvaluationEvidence `json:"evaluations"`
 	Approvals   []ApprovalEvidence   `json:"approvals"`
+	Events      []EventEvidence      `json:"events"`
 }
 
 type ArtifactEvidence struct {
@@ -82,6 +83,12 @@ type ApprovalEvidence struct {
 	Decision        string `json:"decision,omitempty"`
 	DecidedBy       string `json:"decided_by,omitempty"`
 	ExpiresAt       int64  `json:"expires_at"`
+}
+
+type EventEvidence struct {
+	ID         string `json:"id"`
+	Type       string `json:"type"`
+	OccurredAt int64  `json:"occurred_at"`
 }
 
 type Inference struct {
@@ -339,7 +346,8 @@ WHERE gn.graph_version_id = ? AND gn.node_key = ?`, runID, graphVersionID, nodeK
 func (q *Query) definitionCandidates(ctx context.Context, graphVersionID, nodeKey string) ([]string, error) {
 	rows, err := q.st.DB().QueryContext(ctx, `
 SELECT id FROM graph_edge
-WHERE graph_version_id = ? AND to_node_key = ? AND type IN ('depends_on', 'routes_to')
+WHERE graph_version_id = ? AND to_node_key = ?
+  AND type IN ('depends_on', 'routes_to', 'produces', 'consumes')
 ORDER BY id`, graphVersionID, nodeKey)
 	if err != nil {
 		return nil, err
@@ -568,11 +576,7 @@ ORDER BY sequence`, runID)
 		}
 	}
 
-	var evidenceIDs []string
-	for _, d := range rec.Decisions {
-		evidenceIDs = append(evidenceIDs, d.InputReferences...)
-	}
-	if err := q.loadEvidenceByReferences(ctx, rec, runID, evidenceIDs); err != nil {
+	if err := q.loadEvidenceByReferences(ctx, rec, runID, collectEvidenceReferences(rec)); err != nil {
 		return nil, err
 	}
 	if err := q.loadEvidenceFromEvents(ctx, rec, runID, nodeKey); err != nil {
@@ -659,12 +663,57 @@ ORDER BY d.decided_at, cl.id`, nodeID)
 	return rows.Err()
 }
 
-func (q *Query) loadEvidence(ctx context.Context, rec *Recorded, runID, nodeKey, nodeID string) error {
-	var evidenceIDs []string
-	for _, d := range rec.Decisions {
-		evidenceIDs = append(evidenceIDs, d.InputReferences...)
+type evidenceReferences struct {
+	artifacts   map[string]bool
+	evaluations map[string]bool
+	approvals   map[string]bool
+	events      map[string]bool
+}
+
+func newEvidenceReferences() evidenceReferences {
+	return evidenceReferences{
+		artifacts:   map[string]bool{},
+		evaluations: map[string]bool{},
+		approvals:   map[string]bool{},
+		events:      map[string]bool{},
 	}
-	if err := q.loadEvidenceByReferences(ctx, rec, runID, evidenceIDs); err != nil {
+}
+
+func (r *evidenceReferences) add(kind, id string) {
+	if id == "" {
+		return
+	}
+	switch kind {
+	case "artifact":
+		r.artifacts[id] = true
+	case "evaluation":
+		r.evaluations[id] = true
+	case "approval":
+		r.approvals[id] = true
+	case "event":
+		r.events[id] = true
+	}
+}
+
+func collectEvidenceReferences(rec *Recorded) evidenceReferences {
+	refs := newEvidenceReferences()
+	for _, decision := range rec.Decisions {
+		for _, input := range decision.InputReferences {
+			kind, id, ok := strings.Cut(input, ":")
+			if ok {
+				refs.add(kind, id)
+			}
+		}
+	}
+	for _, link := range rec.CausalLinks {
+		refs.add(link.CitationType, link.CitationID)
+	}
+	return refs
+}
+
+func (q *Query) loadEvidence(ctx context.Context, rec *Recorded, runID, nodeKey, nodeID string) error {
+	refs := collectEvidenceReferences(rec)
+	if err := q.loadEvidenceByReferences(ctx, rec, runID, refs); err != nil {
 		return err
 	}
 	ownRows, err := q.st.DB().QueryContext(ctx, `
@@ -681,7 +730,7 @@ FROM artifact WHERE run_id = ? AND produced_by_node_key = ? ORDER BY id`, runID,
 			return err
 		}
 		a.Truncated = truncated == 1
-		rec.Evidence.Artifacts = append(rec.Evidence.Artifacts, a)
+		appendArtifactEvidence(rec, a)
 	}
 	if err := ownRows.Err(); err != nil {
 		return err
@@ -700,7 +749,7 @@ WHERE e.run_id = ? AND a.produced_by_node_key = ? ORDER BY e.id`, runID, nodeKey
 		if err := ownEvalRows.Scan(&e.ID, &e.Verdict, &e.EvaluatedByNodeKey, &e.EvidenceRef); err != nil {
 			return err
 		}
-		rec.Evidence.Evaluations = append(rec.Evidence.Evaluations, e)
+		appendEvaluationEvidence(rec, e)
 	}
 	if err := ownEvalRows.Err(); err != nil {
 		return err
@@ -719,7 +768,7 @@ FROM approval WHERE run_id = ? AND run_node_id = ? ORDER BY created_at, id`, run
 			&a.Decision, &a.DecidedBy, &a.ExpiresAt); err != nil {
 			return err
 		}
-		rec.Evidence.Approvals = append(rec.Evidence.Approvals, a)
+		appendApprovalEvidence(rec, a)
 	}
 	return approvalRows.Err()
 }
@@ -727,12 +776,164 @@ FROM approval WHERE run_id = ? AND run_node_id = ? ORDER BY created_at, id`, run
 // loadEvidenceByReferences resolves the artifact ids the decision actually
 // cited, so a downstream node's explanation includes the upstream evidence
 // that made it eligible.
-func (q *Query) loadEvidenceByReferences(ctx context.Context, rec *Recorded, runID string, evidenceIDs []string) error {
-	ids := map[string]bool{}
-	for _, ref := range evidenceIDs {
-		if id, ok := strings.CutPrefix(ref, "artifact:"); ok {
-			ids[id] = true
+func idClause(ids map[string]bool) (string, []any) {
+	keys := make([]string, 0, len(ids))
+	for id := range ids {
+		keys = append(keys, id)
+	}
+	sort.Strings(keys)
+	placeholders := make([]string, len(keys))
+	args := make([]any, len(keys))
+	for i, key := range keys {
+		placeholders[i] = "?"
+		args[i] = key
+	}
+	return strings.Join(placeholders, ","), args
+}
+
+func appendArtifactEvidence(rec *Recorded, evidence ArtifactEvidence) {
+	for _, existing := range rec.Evidence.Artifacts {
+		if existing.ID == evidence.ID {
+			return
 		}
+	}
+	rec.Evidence.Artifacts = append(rec.Evidence.Artifacts, evidence)
+}
+
+func appendEvaluationEvidence(rec *Recorded, evidence EvaluationEvidence) {
+	for _, existing := range rec.Evidence.Evaluations {
+		if existing.ID == evidence.ID {
+			return
+		}
+	}
+	rec.Evidence.Evaluations = append(rec.Evidence.Evaluations, evidence)
+}
+
+func appendApprovalEvidence(rec *Recorded, evidence ApprovalEvidence) {
+	for _, existing := range rec.Evidence.Approvals {
+		if existing.ID == evidence.ID {
+			return
+		}
+	}
+	rec.Evidence.Approvals = append(rec.Evidence.Approvals, evidence)
+}
+
+func appendEventEvidence(rec *Recorded, evidence EventEvidence) {
+	for _, existing := range rec.Evidence.Events {
+		if existing.ID == evidence.ID {
+			return
+		}
+	}
+	rec.Evidence.Events = append(rec.Evidence.Events, evidence)
+}
+
+func (q *Query) loadEvaluationReferences(ctx context.Context, rec *Recorded, runID string, refs evidenceReferences) error {
+	if len(refs.evaluations) == 0 {
+		return nil
+	}
+	clause, ids := idClause(refs.evaluations)
+	args := []any{runID}
+	args = append(args, ids...)
+	rows, err := q.st.DB().QueryContext(ctx, `
+SELECT id, artifact_id, verdict, evaluated_by_node_key, COALESCE(evidence_ref, '')
+FROM evaluation WHERE run_id = ? AND id IN (`+clause+
+`) ORDER BY id`, args...)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var evidence EvaluationEvidence
+		var artifactID string
+		if err := rows.Scan(&evidence.ID, &artifactID, &evidence.Verdict,
+			&evidence.EvaluatedByNodeKey, &evidence.EvidenceRef); err != nil {
+			rows.Close()
+			return err
+		}
+		appendEvaluationEvidence(rec, evidence)
+		refs.artifacts[artifactID] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	return nil
+}
+
+func (q *Query) loadApprovalReferences(ctx context.Context, rec *Recorded, runID string, refs evidenceReferences) error {
+	if len(refs.approvals) == 0 {
+		return nil
+	}
+	clause, ids := idClause(refs.approvals)
+	args := []any{runID}
+	args = append(args, ids...)
+	rows, err := q.st.DB().QueryContext(ctx, `
+SELECT id, requested_action, required_scope, COALESCE(decision, ''), COALESCE(decided_by, ''), expires_at
+FROM approval WHERE run_id = ? AND id IN (`+clause+
+`) ORDER BY id`, args...)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var evidence ApprovalEvidence
+		if err := rows.Scan(&evidence.ID, &evidence.RequestedAction, &evidence.RequiredScope,
+			&evidence.Decision, &evidence.DecidedBy, &evidence.ExpiresAt); err != nil {
+			rows.Close()
+			return err
+		}
+		appendApprovalEvidence(rec, evidence)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	return nil
+}
+
+func (q *Query) loadEventReferences(ctx context.Context, rec *Recorded, runID string, refs evidenceReferences) error {
+	if len(refs.events) == 0 {
+		return nil
+	}
+	clause, ids := idClause(refs.events)
+	args := []any{runID}
+	args = append(args, ids...)
+	rows, err := q.st.DB().QueryContext(ctx, `
+SELECT event_id, type, occurred_at FROM event
+WHERE run_id = ? AND event_id IN (`+clause+
+`) ORDER BY sequence`, args...)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var evidence EventEvidence
+		if err := rows.Scan(&evidence.ID, &evidence.Type, &evidence.OccurredAt); err != nil {
+			rows.Close()
+			return err
+		}
+		appendEventEvidence(rec, evidence)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	return nil
+}
+
+func (q *Query) loadEvidenceByReferences(ctx context.Context, rec *Recorded, runID string, refs evidenceReferences) error {
+	if err := q.loadEvaluationReferences(ctx, rec, runID, refs); err != nil {
+		return err
+	}
+	if err := q.loadApprovalReferences(ctx, rec, runID, refs); err != nil {
+		return err
+	}
+	if err := q.loadEventReferences(ctx, rec, runID, refs); err != nil {
+		return err
+	}
+	ids := map[string]bool{}
+	for id := range refs.artifacts {
+		ids[id] = true
 	}
 	if len(ids) == 0 {
 		return nil
@@ -758,7 +959,7 @@ FROM artifact WHERE run_id = ? AND id IN (`+strings.Join(placeholders, ",")+`) O
 			return err
 		}
 		a.Truncated = truncated == 1
-		rec.Evidence.Artifacts = append(rec.Evidence.Artifacts, a)
+		appendArtifactEvidence(rec, a)
 	}
 	if err := artRows.Err(); err != nil {
 		return err
@@ -778,7 +979,7 @@ WHERE a.run_id = ? AND a.id IN (`+strings.Join(placeholders, ",")+`) ORDER BY e.
 		if err := evalRows.Scan(&e.ID, &e.Verdict, &e.EvaluatedByNodeKey, &e.EvidenceRef); err != nil {
 			return err
 		}
-		rec.Evidence.Evaluations = append(rec.Evidence.Evaluations, e)
+		appendEvaluationEvidence(rec, e)
 	}
 	return evalRows.Err()
 }
@@ -792,8 +993,7 @@ func (q *Query) loadEvidenceFromEvents(ctx context.Context, rec *Recorded, runID
 	}
 	rows, err := q.st.DB().QueryContext(ctx, `
 SELECT event_id, type, occurred_at, payload FROM event
-WHERE run_id = ? AND type IN ('artifact_published', 'evaluation_failed',
-                              'approval_requested', 'approval_granted', 'approval_denied')
+WHERE run_id = ?
 ORDER BY sequence`, runID)
 	if err != nil {
 		return err
@@ -812,13 +1012,21 @@ ORDER BY sequence`, runID)
 		return err
 	}
 
-	wantedArtifacts := map[string]bool{}
-	for _, decision := range rec.Decisions {
-		for _, ref := range decision.InputReferences {
-			if id, ok := strings.CutPrefix(ref, "artifact:"); ok {
-				wantedArtifacts[id] = true
-			}
+	refs := collectEvidenceReferences(rec)
+	wantedArtifacts := refs.artifacts
+	wantedEvaluations := refs.evaluations
+	wantedApprovals := refs.approvals
+	for _, ev := range events {
+		if ev.typ != "evaluation_failed" || !wantedEvaluations[ev.id] {
+			continue
 		}
+		var p struct {
+			ArtifactID string `json:"artifact_id"`
+		}
+		if err := json.Unmarshal([]byte(ev.payload), &p); err != nil {
+			return err
+		}
+		wantedArtifacts[p.ArtifactID] = true
 	}
 	artifactNodes := map[string]string{}
 	for _, ev := range events {
@@ -866,7 +1074,7 @@ ORDER BY sequence`, runID)
 		if err := json.Unmarshal([]byte(ev.payload), &p); err != nil {
 			return err
 		}
-		if !wantedArtifacts[p.ArtifactID] && artifactNodes[p.ArtifactID] != nodeKey {
+		if !wantedEvaluations[ev.id] && !wantedArtifacts[p.ArtifactID] && artifactNodes[p.ArtifactID] != nodeKey {
 			continue
 		}
 		found := false
@@ -898,7 +1106,7 @@ ORDER BY sequence`, runID)
 			if err := json.Unmarshal([]byte(ev.payload), &p); err != nil {
 				return err
 			}
-			if p.NodeKey != nodeKey {
+			if p.NodeKey != nodeKey && !wantedApprovals[ev.id] {
 				continue
 			}
 			if _, ok := approvalIndexes[ev.id]; !ok {
@@ -925,6 +1133,11 @@ ORDER BY sequence`, runID)
 				}[ev.typ]
 				rec.Evidence.Approvals[i].DecidedBy = p.DecidedBy
 			}
+		}
+	}
+	for _, ev := range events {
+		if refs.events[ev.id] {
+			appendEventEvidence(rec, EventEvidence{ID: ev.id, Type: ev.typ, OccurredAt: ev.occurred})
 		}
 	}
 	return nil
