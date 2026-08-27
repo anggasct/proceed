@@ -600,7 +600,7 @@ func onDecisionRecorded(ctx context.Context, tx *sql.Tx, ev *Event) error {
 	if err := decodePayload(ev, &p); err != nil {
 		return err
 	}
-	nodeID, err := runNodeID(ctx, tx, ev.RunID, p.NodeKey)
+	nodeID, err := ensureRunNode(ctx, tx, ev.RunID, p.NodeKey)
 	if err != nil {
 		return err
 	}
@@ -618,7 +618,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
 		return err
 	}
 	for i, link := range p.CausalLinks {
-		targetID, err := runNodeID(ctx, tx, ev.RunID, link.TargetNodeKey)
+		targetID, err := ensureRunNode(ctx, tx, ev.RunID, link.TargetNodeKey)
 		if err != nil {
 			return err
 		}
