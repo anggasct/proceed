@@ -837,7 +837,7 @@ func (q *Query) loadEvaluationReferences(ctx context.Context, rec *Recorded, run
 	rows, err := q.st.DB().QueryContext(ctx, `
 SELECT id, artifact_id, verdict, evaluated_by_node_key, COALESCE(evidence_ref, '')
 FROM evaluation WHERE run_id = ? AND id IN (`+clause+
-`) ORDER BY id`, args...)
+		`) ORDER BY id`, args...)
 	if err != nil {
 		return err
 	}
@@ -870,7 +870,7 @@ func (q *Query) loadApprovalReferences(ctx context.Context, rec *Recorded, runID
 	rows, err := q.st.DB().QueryContext(ctx, `
 SELECT id, requested_action, required_scope, COALESCE(decision, ''), COALESCE(decided_by, ''), expires_at
 FROM approval WHERE run_id = ? AND id IN (`+clause+
-`) ORDER BY id`, args...)
+		`) ORDER BY id`, args...)
 	if err != nil {
 		return err
 	}
@@ -901,7 +901,7 @@ func (q *Query) loadEventReferences(ctx context.Context, rec *Recorded, runID st
 	rows, err := q.st.DB().QueryContext(ctx, `
 SELECT event_id, type, occurred_at FROM event
 WHERE run_id = ? AND event_id IN (`+clause+
-`) ORDER BY sequence`, args...)
+		`) ORDER BY sequence`, args...)
 	if err != nil {
 		return err
 	}
