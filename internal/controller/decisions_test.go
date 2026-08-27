@@ -475,7 +475,9 @@ func TestWhyConditionalSelectionRecordsCounterfactualBasis(t *testing.T) {
 	runID := runToCompletion(t, st, frozen, map[executor.Kind]executor.Executor{
 		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
 			if req.NodeKey == "classify" {
-				return &executor.Result{Route: "requires_code"}, nil
+				result := artifactProducingResult()
+				result.Route = "requires_code"
+				return result, nil
 			}
 			return &executor.Result{}, nil
 		}),
@@ -499,8 +501,30 @@ JOIN run_node rn ON rn.id = d.run_node_id
 WHERE d.run_id = ? AND rn.node_key = 'classify' AND d.selected_edge_id IS NOT NULL`, runID).Scan(&basis); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(basis, "different recorded route value") {
-		t.Fatalf("counterfactual basis = %q, want recorded route-value basis", basis)
+	if !strings.Contains(basis, "single cited input") {
+		t.Fatalf("counterfactual basis = %q, want single-input basis", basis)
+	}
+}
+
+func TestWhyConditionalSelectionWithoutCounterfactualInputIsContributing(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	frozen := compileAndFreeze(t, st, routingWhyGraph)
+	runID := runToCompletion(t, st, frozen, map[executor.Kind]executor.Executor{
+		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			if req.NodeKey == "classify" {
+				return &executor.Result{Route: "requires_code"}, nil
+			}
+			return &executor.Result{}, nil
+		}),
+	})
+
+	explanation := explainNode(t, st, runID, "code_path")
+	if len(explanation.Inference.Attributions) != 1 || explanation.Inference.Attributions[0].Strength != "contributing" {
+		t.Fatalf("attributions = %+v, want one contributing attribution", explanation.Inference.Attributions)
 	}
 }
 
@@ -866,7 +890,9 @@ edges:
 	runID := runToCompletion(t, st, frozen, map[executor.Kind]executor.Executor{
 		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
 			if req.NodeKey == "classify" {
-				return &executor.Result{Route: "go"}, nil
+				result := artifactProducingResult()
+				result.Route = "go"
+				return result, nil
 			}
 			return &executor.Result{}, nil
 		}),

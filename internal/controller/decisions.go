@@ -141,9 +141,11 @@ func (c *Controller) recordRoutingDecision(ctx context.Context, tx *sql.Tx, runI
 		conditional := e.Cond.Valid && e.Cond.String != ""
 		attribution := "contributing"
 		basis := "unconditional edge; selection did not depend on the route value"
-		if conditional {
+		if conditional && len(inputRefs) == 1 {
 			attribution = "necessary"
-			basis = "recorded route value matched the edge condition; a different recorded route value would not have selected this edge"
+			basis = "recorded route value matched the edge condition; the single cited input is the counterfactual basis"
+		} else if conditional {
+			basis = "route value matched the edge condition; no single cited input establishes counterfactual necessity"
 		}
 		links := []causalLink{{
 			TargetNodeKey: e.To,
