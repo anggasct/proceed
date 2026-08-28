@@ -341,6 +341,169 @@ func TestProcessVerifiedWebhookRetryAfterOutage(t *testing.T) {
 	}
 }
 
+// Non-completion actions and non-completed check run statuses are rejected; only the polling (empty action) case is allowed
+func TestNormalizeCheckRunRejectsNonCompletion(t *testing.T) {
+	waitID := ulid.Make().String()
+	base := func(action, status string) *CheckRunEvent {
+		return &CheckRunEvent{
+			Action: action,
+			CheckRun: CheckRunPayload{
+				ID:           555,
+				Name:         "ci/build",
+				HeadSHA:      "sha256:norm123",
+				Status:       status,
+				Conclusion:   "success",
+				PullRequests: []PullRequestRef{{Number: 7}},
+			},
+			Repository: RepoRef{FullName: "org/repo"},
+		}
+	}
+
+	if _, err := NormalizeCheckRun(base("rerequested", "completed"), waitID, 0); err == nil {
+		t.Errorf("expected error for action=rerequested with completed status")
+	}
+	if _, err := NormalizeCheckRun(base("created", "completed"), waitID, 0); err == nil {
+		t.Errorf("expected error for action=created with completed status")
+	}
+	if _, err := NormalizeCheckRun(base("completed", "in_progress"), waitID, 0); err == nil {
+		t.Errorf("expected error for completed action with status=in_progress")
+	}
+	if _, err := NormalizeCheckRun(base("", "queued"), waitID, 0); err == nil {
+		t.Errorf("expected error for polling payload with status=queued")
+	}
+
+	req, err := NormalizeCheckRun(base("", "completed"), waitID, 0)
+	if err != nil {
+		t.Fatalf("polling payload without action must normalize: %v", err)
+	}
+	if req.Status != "success" || req.ProviderEventID != "github:check_run:555" {
+		t.Errorf("req = %+v, want success status and stable provider event id", req)
+	}
+}
+
+// Malformed or untyped HTTP responses surface errors instead of terminal completion outcomes
+func TestCompleteWaitRejectsMalformedResponses(t *testing.T) {
+	ctx := context.Background()
+	var mode int32
+	modeMalformed2xx, modeEmpty2xx, modeUntyped4xx, modeMalformed4xx, modeOK := int32(0), int32(1), int32(2), int32(3), int32(4)
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch atomic.LoadInt32(&mode) {
+		case modeMalformed2xx:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("<html>proxy error page</html>"))
+		case modeEmpty2xx:
+			w.WriteHeader(http.StatusOK)
+		case modeUntyped4xx:
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":{"message":"no code"}}`))
+		case modeMalformed4xx:
+			http.Error(w, "plain text gateway error", http.StatusConflict)
+		default:
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"wait_id": "wait-malformed-1",
+				"status":  "WAIT_COMPLETED",
+			})
+		}
+	}))
+	defer mockServer.Close()
+
+	adapter := NewAdapter(mockServer.URL, "token")
+	req := controller.CompleteWaitRequest{
+		WaitID:          "wait-malformed-1",
+		ProviderEventID: "github:check_run:malformed_1",
+		EventType:       "ci.completed",
+		Source:          "github",
+		CorrelationKey:  "repo=org/app;pr=3;head=sha256:mal1",
+		OccurredAt:      time.Now().UnixMilli(),
+		Status:          "success",
+		PayloadDigest:   "sha256:" + hexDigestOf("{}"),
+		Payload:         json.RawMessage("{}"),
+	}
+
+	for i, m := range []int32{modeMalformed2xx, modeEmpty2xx, modeUntyped4xx, modeMalformed4xx} {
+		atomic.StoreInt32(&mode, m)
+		if _, err := adapter.CompleteWait(ctx, req); err == nil {
+			t.Errorf("case %d: expected error for malformed response mode %d", i, m)
+		}
+	}
+
+	atomic.StoreInt32(&mode, modeOK)
+	res, err := adapter.CompleteWait(ctx, req)
+	if err != nil {
+		t.Fatalf("valid response after malformed ones must succeed with the same provider event id: %v", err)
+	}
+	if res.Code != "WAIT_COMPLETED" || res.HTTPStatus != 202 {
+		t.Errorf("res = %+v, want WAIT_COMPLETED (202)", res)
+	}
+}
+
+// A malformed success response must not mark the delivery completed; the same delivery stays retryable
+func TestProcessVerifiedWebhookMalformedResponseRetryable(t *testing.T) {
+	ctx := context.Background()
+	var respondValid int32
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.LoadInt32(&respondValid) == 0 {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("truncated response body"))
+			return
+		}
+		var req controller.CompleteWaitRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"wait_id": req.WaitID,
+			"status":  "WAIT_COMPLETED",
+		})
+	}))
+	defer mockServer.Close()
+
+	adapter := NewAdapter(mockServer.URL, "token")
+
+	secret := "webhook-secret-malformed"
+	deliveryID := "gh-delivery-uuid-malformed-001"
+	rawPayload := []byte(`{
+		"action": "completed",
+		"check_run": {
+			"id": 77001,
+			"name": "build",
+			"head_sha": "sha256:mal_sha",
+			"status": "completed",
+			"conclusion": "success",
+			"pull_requests": [{"number": 3}]
+		},
+		"repository": {"full_name": "org/repo"}
+	}`)
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(rawPayload)
+	validSig := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+
+	if _, err := adapter.ProcessVerifiedWebhook(ctx, secret, validSig, deliveryID, rawPayload, "wait-malformed-delivery", 0); err == nil {
+		t.Fatalf("expected error for malformed success response")
+	}
+
+	atomic.StoreInt32(&respondValid, 1)
+	res, err := adapter.ProcessVerifiedWebhook(ctx, secret, validSig, deliveryID, rawPayload, "wait-malformed-delivery", 0)
+	if err != nil {
+		t.Fatalf("same delivery must remain retryable after malformed response: %v", err)
+	}
+	if res.Code != "WAIT_COMPLETED" || res.HTTPStatus != 202 {
+		t.Errorf("res = %+v, want WAIT_COMPLETED (202)", res)
+	}
+
+	if _, err := adapter.ProcessVerifiedWebhook(ctx, secret, validSig, deliveryID, rawPayload, "wait-malformed-delivery", 0); err == nil {
+		t.Fatalf("expected replay rejection after successful completion")
+	}
+}
+
+func hexDigestOf(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
 // Full GitHub CI fixture
 // Maps completed required-check to wait, routes success to merge node, routes failure to fix node, rejects older head SHA
 func TestGitHubAdapterIntegration(t *testing.T) {
@@ -524,5 +687,135 @@ edges:
 	}
 	if retryRes.Code != "WAIT_ALREADY_COMPLETED" || retryRes.HTTPStatus != 200 {
 		t.Errorf("retryRes = %+v, want WAIT_ALREADY_COMPLETED (200)", retryRes)
+	}
+}
+
+// A completed failing required check routes to the fix node while the merge node does not run
+func TestGitHubAdapterIntegrationFailurePath(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	cfg := config.Config{
+		Tokens: []config.Token{
+			{Name: "github-webhook-adapter", Token: "gh-adapter-token-xyz", Scopes: []string{"event", "read"}},
+		},
+	}
+
+	executedNodes := map[string]bool{}
+	pool := map[executor.Kind]executor.Executor{
+		executor.Shell: executor.NewFuncExecutor(executor.Shell, executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			executedNodes[req.NodeKey] = true
+			return &executor.Result{Output: map[string]any{"executed": req.NodeKey}, Route: "success"}, nil
+		}),
+	}
+
+	ctrl, err := controller.New(st, controller.DefaultConfig(), pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := api.NewServer(api.Deps{Store: st, Controller: ctrl, Config: cfg})
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	adapter := NewAdapter(httpServer.URL, "gh-adapter-token-xyz")
+
+	graphYAML := `schema: proceed/v1
+name: github-ci-failure-flow
+nodes:
+  - id: wait_ci
+    type: task
+    contract: pure
+    executor: { kind: shell, command: ["echo", "wait"] }
+  - id: merge_pr
+    type: task
+    contract: pure
+    terminal: true
+    executor: { kind: shell, command: ["echo", "merge"] }
+  - id: fix_pr
+    type: task
+    contract: pure
+    terminal: true
+    executor: { kind: shell, command: ["echo", "fix"] }
+edges:
+  - { from: wait_ci, to: merge_pr, type: routes_to, when: success }
+  - { from: wait_ci, to: fix_pr, type: routes_to, when: failure }
+`
+	src := []byte(graphYAML)
+	doc, err := compiler.Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := compiler.Validate(doc); err != nil {
+		t.Fatal(err)
+	}
+	frozen, err := st.FreezeDefinition(ctx, "ci-failure.yaml", src, doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := st.CreateRun(ctx, frozen.GraphVersionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	failingHeadSHA := "sha256:failing_commit_sha_999"
+	waitID := ulid.Make().String()
+	corrKey := CorrelationKey("proceed/app", 200, failingHeadSHA)
+
+	_, err = ctrl.RegisterExternalWait(ctx, controller.ExternalWaitRequest{
+		RunID:             run.ID,
+		NodeKey:           "wait_ci",
+		EventType:         "ci.completed",
+		CorrelationKey:    corrKey,
+		ExpectedCondition: `{"status":"success"}`,
+		ExpiresAt:         time.Now().UnixMilli() + 60000,
+		WaitID:            waitID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	failEvent := &CheckRunEvent{
+		Action: "completed",
+		CheckRun: CheckRunPayload{
+			ID:           33333,
+			Name:         "ci/build",
+			HeadSHA:      failingHeadSHA,
+			Status:       "completed",
+			Conclusion:   "failure",
+			PullRequests: []PullRequestRef{{Number: 200}},
+		},
+		Repository: RepoRef{FullName: "proceed/app"},
+	}
+	failReq, err := NormalizeCheckRun(failEvent, waitID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failReq.Status != "failure" {
+		t.Fatalf("failReq.Status = %q, want failure", failReq.Status)
+	}
+
+	failRes, err := adapter.CompleteWait(ctx, *failReq)
+	if err != nil {
+		t.Fatalf("adapter.CompleteWait failing check: %v", err)
+	}
+	if failRes.Code != "WAIT_COMPLETED" || failRes.HTTPStatus != 202 {
+		t.Fatalf("failRes = %+v, want WAIT_COMPLETED (202)", failRes)
+	}
+
+	if _, err := ctrl.Step(ctx, run.ID); err != nil {
+		t.Fatalf("Step fix_pr: %v", err)
+	}
+	_, _ = ctrl.Step(ctx, run.ID)
+
+	if !executedNodes["fix_pr"] {
+		t.Errorf("fix_pr was not executed after failing CI completion")
+	}
+	if executedNodes["merge_pr"] {
+		t.Errorf("merge_pr must not execute after failing CI completion")
 	}
 }

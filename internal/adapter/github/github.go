@@ -64,7 +64,10 @@ func NormalizeCheckRun(event *CheckRunEvent, waitID string, prOverride int64) (*
 	if event == nil {
 		return nil, fmt.Errorf("check run event is nil")
 	}
-	if event.Action != "completed" && event.CheckRun.Status != "completed" {
+	if event.Action != "" && event.Action != "completed" {
+		return nil, fmt.Errorf("check run action %q is not completed", event.Action)
+	}
+	if event.CheckRun.Status != "completed" {
 		return nil, fmt.Errorf("check run is not completed (action=%s, status=%s)", event.Action, event.CheckRun.Status)
 	}
 	if event.Repository.FullName == "" {
@@ -306,8 +309,14 @@ func (a *Adapter) CompleteWait(ctx context.Context, req controller.CompleteWaitR
 					Details map[string]any `json:"details"`
 				} `json:"error"`
 			}
-			_ = json.NewDecoder(resp.Body).Decode(&errResp)
+			decodeErr := json.NewDecoder(resp.Body).Decode(&errResp)
 			resp.Body.Close()
+			if decodeErr != nil {
+				return nil, fmt.Errorf("complete wait: status %d with undecodable error body: %w", resp.StatusCode, decodeErr)
+			}
+			if errResp.Error.Code == "" {
+				return nil, fmt.Errorf("complete wait: status %d error body lacks a typed error code", resp.StatusCode)
+			}
 			result.Code = errResp.Error.Code
 			result.Message = errResp.Error.Message
 			result.Details = errResp.Error.Details
@@ -321,8 +330,14 @@ func (a *Adapter) CompleteWait(ctx context.Context, req controller.CompleteWaitR
 			NodeKey string `json:"node_key"`
 			Message string `json:"message"`
 		}
-		_ = json.NewDecoder(resp.Body).Decode(&okResp)
+		decodeErr := json.NewDecoder(resp.Body).Decode(&okResp)
 		resp.Body.Close()
+		if decodeErr != nil {
+			return nil, fmt.Errorf("complete wait: status %d with undecodable success body: %w", resp.StatusCode, decodeErr)
+		}
+		if okResp.Status == "" {
+			return nil, fmt.Errorf("complete wait: status %d success body lacks a typed completion status", resp.StatusCode)
+		}
 		result.WaitID = okResp.WaitID
 		result.Code = okResp.Status
 		result.RunID = okResp.RunID

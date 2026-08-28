@@ -732,6 +732,396 @@ edges:
 	}
 }
 
+// Non-terminal provider statuses leave the wait pending without consuming the provider event id
+func TestExternalWaitNonTerminalStatusKeepsPending(t *testing.T) {
+	ctx := context.Background()
+	graphYAML := `schema: proceed/v1
+name: test-nonterminal-status
+nodes:
+  - id: wait_ci
+    type: task
+    contract: pure
+    executor:
+      kind: shell
+      command: ["echo", "wait"]
+  - id: next_step
+    type: task
+    contract: pure
+    terminal: true
+    executor:
+      kind: shell
+      command: ["echo", "next"]
+edges:
+  - { from: wait_ci, to: next_step, type: routes_to, when: success }
+`
+	st, _, runID := openTestStoreWithGraph(t, graphYAML)
+	pool := map[executor.Kind]executor.Executor{
+		executor.Shell: &testShellExecutor{},
+	}
+	ctrl := newTestController(t, st, pool, "ctrl-1")
+
+	waitID := ulid.Make().String()
+	corrKey := "repo=org/nonterm;pr=20;head=sha256:nt1"
+	_, err := ctrl.RegisterExternalWait(ctx, ExternalWaitRequest{
+		RunID:             runID,
+		NodeKey:           "wait_ci",
+		EventType:         "ci.completed",
+		CorrelationKey:    corrKey,
+		ExpectedCondition: `{"status":"success"}`,
+		WaitID:            waitID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, status := range []string{"in_progress", "queued", "running", "pending"} {
+		res, err := ctrl.CompleteExternalWait(ctx, CompleteWaitRequest{
+			WaitID:          waitID,
+			ProviderEventID: "github:check_run:nt_1",
+			EventType:       "ci.completed",
+			Source:          "github",
+			CorrelationKey:  corrKey,
+			OccurredAt:      time.Now().UnixMilli(),
+			Status:          status,
+			PayloadDigest:   "sha256:" + hexDigest("{}"),
+			Payload:         json.RawMessage("{}"),
+		})
+		if err != nil {
+			t.Fatalf("status %q: %v", status, err)
+		}
+		if res.Code != "WAIT_REJECTED" || res.HTTPStatus != http.StatusAccepted {
+			t.Fatalf("status %q: res = %+v, want WAIT_REJECTED (202)", status, res)
+		}
+	}
+
+	w, _ := st.GetExternalWait(ctx, waitID)
+	if w.Status != "pending" {
+		t.Fatalf("wait.Status = %q, want pending after non-terminal completions", w.Status)
+	}
+
+	for _, typ := range []string{"external_wait_completed", "node_finished"} {
+		var count int
+		if err := st.DB().QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM event WHERE run_id = ? AND type = ?", runID, typ).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Errorf("%s count = %d, want 0", typ, count)
+		}
+	}
+
+	// The same provider event id must still be able to deliver the terminal outcome
+	res, err := ctrl.CompleteExternalWait(ctx, CompleteWaitRequest{
+		WaitID:          waitID,
+		ProviderEventID: "github:check_run:nt_1",
+		EventType:       "ci.completed",
+		Source:          "github",
+		CorrelationKey:  corrKey,
+		OccurredAt:      time.Now().UnixMilli(),
+		Status:          "success",
+		PayloadDigest:   "sha256:" + hexDigest("{}"),
+		Payload:         json.RawMessage("{}"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Code != "WAIT_COMPLETED" || res.HTTPStatus != http.StatusAccepted {
+		t.Fatalf("terminal res = %+v, want WAIT_COMPLETED (202)", res)
+	}
+}
+
+// The declared expected condition gates success eligibility and is evaluated before acceptance
+func TestExternalWaitExpectedConditionEvaluation(t *testing.T) {
+	ctx := context.Background()
+	graphYAML := `schema: proceed/v1
+name: test-expected-condition
+nodes:
+  - id: wait_ci
+    type: task
+    contract: pure
+    executor:
+      kind: shell
+      command: ["echo", "wait"]
+  - id: next_step
+    type: task
+    contract: pure
+    terminal: true
+    executor:
+      kind: shell
+      command: ["echo", "next"]
+edges:
+  - { from: wait_ci, to: next_step, type: routes_to, when: success }
+`
+	st, _, runID := openTestStoreWithGraph(t, graphYAML)
+	pool := map[executor.Kind]executor.Executor{
+		executor.Shell: &testShellExecutor{},
+	}
+	ctrl := newTestController(t, st, pool, "ctrl-1")
+
+	waitID := ulid.Make().String()
+	corrKey := "repo=org/cond;pr=21;head=sha256:cond1"
+	_, err := ctrl.RegisterExternalWait(ctx, ExternalWaitRequest{
+		RunID:             runID,
+		NodeKey:           "wait_ci",
+		EventType:         "ci.completed",
+		CorrelationKey:    corrKey,
+		ExpectedCondition: `{"required_checks.lint": "success"}`,
+		WaitID:            waitID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// status=success but the declared condition is not satisfied -> rejected, wait stays pending
+	missingPayload := `{"conclusion":"success"}`
+	res, err := ctrl.CompleteExternalWait(ctx, CompleteWaitRequest{
+		WaitID:          waitID,
+		ProviderEventID: "github:check_run:cond_1",
+		EventType:       "ci.completed",
+		Source:          "github",
+		CorrelationKey:  corrKey,
+		OccurredAt:      time.Now().UnixMilli(),
+		Status:          "success",
+		PayloadDigest:   "sha256:" + hexDigest(missingPayload),
+		Payload:         json.RawMessage(missingPayload),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Code != "WAIT_REJECTED" || res.HTTPStatus != http.StatusAccepted {
+		t.Fatalf("unsatisfied res = %+v, want WAIT_REJECTED (202)", res)
+	}
+	w, _ := st.GetExternalWait(ctx, waitID)
+	if w.Status != "pending" {
+		t.Fatalf("wait.Status = %q, want pending after unsatisfied condition", w.Status)
+	}
+
+	// same provider event id with a satisfying payload completes and records the success route
+	goodPayload := `{"required_checks":{"lint":"success","test":"success"}}`
+	res, err = ctrl.CompleteExternalWait(ctx, CompleteWaitRequest{
+		WaitID:          waitID,
+		ProviderEventID: "github:check_run:cond_1",
+		EventType:       "ci.completed",
+		Source:          "github",
+		CorrelationKey:  corrKey,
+		OccurredAt:      time.Now().UnixMilli(),
+		Status:          "success",
+		PayloadDigest:   "sha256:" + hexDigest(goodPayload),
+		Payload:         json.RawMessage(goodPayload),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Code != "WAIT_COMPLETED" || res.HTTPStatus != http.StatusAccepted {
+		t.Fatalf("satisfied res = %+v, want WAIT_COMPLETED (202)", res)
+	}
+
+	var recordedRoute string
+	if err := st.DB().QueryRowContext(ctx, `
+SELECT json_extract(payload, '$.route') FROM event
+WHERE run_id = ? AND type = 'node_finished' AND json_extract(payload, '$.node_key') = 'wait_ci'`,
+		runID).Scan(&recordedRoute); err != nil {
+		t.Fatal(err)
+	}
+	if recordedRoute != "success" {
+		t.Errorf("recordedRoute = %q, want success", recordedRoute)
+	}
+}
+
+// Terminal failure completions route to the declared failure edge even when the condition declares success
+func TestExternalWaitFailureStatusRoutesByFailureEdge(t *testing.T) {
+	ctx := context.Background()
+	graphYAML := `schema: proceed/v1
+name: test-failure-route
+nodes:
+  - id: wait_ci
+    type: task
+    contract: pure
+    executor:
+      kind: shell
+      command: ["echo", "wait"]
+  - id: merge_pr
+    type: task
+    contract: pure
+    terminal: true
+    executor:
+      kind: shell
+      command: ["echo", "merge"]
+  - id: fix_pr
+    type: task
+    contract: pure
+    terminal: true
+    executor:
+      kind: shell
+      command: ["echo", "fix"]
+edges:
+  - { from: wait_ci, to: merge_pr, type: routes_to, when: success }
+  - { from: wait_ci, to: fix_pr, type: routes_to, when: failure }
+`
+	st, _, runID := openTestStoreWithGraph(t, graphYAML)
+	pool := map[executor.Kind]executor.Executor{
+		executor.Shell: &testShellExecutor{},
+	}
+	ctrl := newTestController(t, st, pool, "ctrl-1")
+
+	waitID := ulid.Make().String()
+	corrKey := "repo=org/failroute;pr=22;head=sha256:fr1"
+	_, err := ctrl.RegisterExternalWait(ctx, ExternalWaitRequest{
+		RunID:             runID,
+		NodeKey:           "wait_ci",
+		EventType:         "ci.completed",
+		CorrelationKey:    corrKey,
+		ExpectedCondition: `{"status":"success"}`,
+		WaitID:            waitID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := ctrl.CompleteExternalWait(ctx, CompleteWaitRequest{
+		WaitID:          waitID,
+		ProviderEventID: "github:check_run:fail_1",
+		EventType:       "ci.completed",
+		Source:          "github",
+		CorrelationKey:  corrKey,
+		OccurredAt:      time.Now().UnixMilli(),
+		Status:          "failure",
+		PayloadDigest:   "sha256:" + hexDigest("{}"),
+		Payload:         json.RawMessage("{}"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Code != "WAIT_COMPLETED" || res.HTTPStatus != http.StatusAccepted {
+		t.Fatalf("failure res = %+v, want WAIT_COMPLETED (202)", res)
+	}
+
+	progressed, err := ctrl.Step(ctx, runID)
+	if err != nil || !progressed {
+		t.Fatalf("Step fix_pr: progressed=%v, err=%v", progressed, err)
+	}
+	_, _ = ctrl.Step(ctx, runID)
+
+	var fixStatus, mergeStatus string
+	_ = st.DB().QueryRowContext(ctx,
+		"SELECT status FROM run_node WHERE run_id = ? AND node_key = 'fix_pr'", runID).Scan(&fixStatus)
+	_ = st.DB().QueryRowContext(ctx,
+		"SELECT status FROM run_node WHERE run_id = ? AND node_key = 'merge_pr'", runID).Scan(&mergeStatus)
+	if fixStatus != "succeeded" {
+		t.Errorf("fix_pr status = %q, want succeeded", fixStatus)
+	}
+	if mergeStatus != "skipped" {
+		t.Errorf("merge_pr status = %q, want skipped", mergeStatus)
+	}
+}
+
+// Registering a wait on a cancelled run or terminal node is rejected inside the registration transaction
+func TestExternalWaitRegistrationGuards(t *testing.T) {
+	ctx := context.Background()
+	graphYAML := `schema: proceed/v1
+name: test-reg-guards
+nodes:
+  - id: wait_ci
+    type: task
+    contract: pure
+    executor:
+      kind: shell
+      command: ["echo", "wait"]
+  - id: fix_node
+    type: task
+    contract: pure
+    terminal: true
+    executor:
+      kind: shell
+      command: ["echo", "fix"]
+edges:
+  - { from: wait_ci, to: fix_node, type: routes_to, when: failure }
+`
+	st, _, runID := openTestStoreWithGraph(t, graphYAML)
+	pool := map[executor.Kind]executor.Executor{
+		executor.Shell: &testShellExecutor{},
+	}
+	ctrl := newTestController(t, st, pool, "ctrl-1")
+
+	// 1. Cancelled run rejects registration and leaves no pending wait
+	cancelWaitID := ulid.Make().String()
+	cancelCorr := "repo=org/regcancel;pr=30;head=sha256:rc1"
+	if err := ctrl.CancelRun(ctx, runID); err != nil {
+		t.Fatal(err)
+	}
+	_, err := ctrl.RegisterExternalWait(ctx, ExternalWaitRequest{
+		RunID:          runID,
+		NodeKey:        "wait_ci",
+		EventType:      "ci.completed",
+		CorrelationKey: cancelCorr,
+		WaitID:         cancelWaitID,
+	})
+	if err == nil {
+		t.Fatalf("expected error registering wait on cancelled run")
+	}
+	if w, _ := st.GetExternalWait(ctx, cancelWaitID); w != nil {
+		t.Errorf("wait row created for cancelled run: %+v", w)
+	}
+
+	// 2. Terminal node rejects registration even while the run is running
+	st2, _, runID2 := openTestStoreWithGraph(t, graphYAML)
+	ctrl2 := newTestController(t, st2, pool, "ctrl-2")
+
+	waitID := ulid.Make().String()
+	corrKey := "repo=org/regterm;pr=31;head=sha256:rt1"
+	if _, err := ctrl2.RegisterExternalWait(ctx, ExternalWaitRequest{
+		RunID:          runID2,
+		NodeKey:        "wait_ci",
+		EventType:      "ci.completed",
+		CorrelationKey: corrKey,
+		WaitID:         waitID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := ctrl2.CompleteExternalWait(ctx, CompleteWaitRequest{
+		WaitID:          waitID,
+		ProviderEventID: "github:check_run:regterm_1",
+		EventType:       "ci.completed",
+		Source:          "github",
+		CorrelationKey:  corrKey,
+		OccurredAt:      time.Now().UnixMilli(),
+		Status:          "failure",
+		PayloadDigest:   "sha256:" + hexDigest("{}"),
+		Payload:         json.RawMessage("{}"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Code != "WAIT_COMPLETED" {
+		t.Fatalf("res = %+v, want WAIT_COMPLETED", res)
+	}
+
+	terminalWaitID := ulid.Make().String()
+	_, err = ctrl2.RegisterExternalWait(ctx, ExternalWaitRequest{
+		RunID:          runID2,
+		NodeKey:        "wait_ci",
+		EventType:      "ci.completed",
+		CorrelationKey: "repo=org/regterm;pr=31;head=sha256:rt2",
+		WaitID:         terminalWaitID,
+	})
+	if err == nil {
+		t.Fatalf("expected error registering wait on terminal node")
+	}
+	if w, _ := st2.GetExternalWait(ctx, terminalWaitID); w != nil {
+		t.Errorf("wait row created for terminal node: %+v", w)
+	}
+
+	var nodeStatus string
+	if err := st2.DB().QueryRowContext(ctx,
+		"SELECT status FROM run_node WHERE run_id = ? AND node_key = 'wait_ci'", runID2).Scan(&nodeStatus); err != nil {
+		t.Fatal(err)
+	}
+	if nodeStatus != "succeeded" {
+		t.Errorf("nodeStatus = %q, want succeeded (terminal state must not revive)", nodeStatus)
+	}
+}
+
 type testShellExecutor struct{}
 
 func (e *testShellExecutor) Kind() executor.Kind { return executor.Shell }

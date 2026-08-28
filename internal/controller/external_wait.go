@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -49,6 +50,14 @@ type CompletionResult struct {
 	Details    map[string]any `json:"details,omitempty"`
 }
 
+func isTerminalNodeStatus(status string) bool {
+	switch status {
+	case "succeeded", "failed", "skipped", "cancelled":
+		return true
+	}
+	return false
+}
+
 func (c *Controller) RegisterExternalWait(ctx context.Context, req ExternalWaitRequest) (*store.ExternalWait, error) {
 	if req.RunID == "" || req.NodeKey == "" || req.EventType == "" || req.CorrelationKey == "" {
 		return nil, store.NewCodeError(store.CodeGraphInvalid, "run_id, node_key, event_type, and correlation_key are required")
@@ -67,9 +76,23 @@ func (c *Controller) RegisterExternalWait(ctx context.Context, req ExternalWaitR
 	if req.ExpectedCondition == "" {
 		req.ExpectedCondition = "{}"
 	}
+	var condShape map[string]any
+	if err := json.Unmarshal([]byte(req.ExpectedCondition), &condShape); err != nil || condShape == nil {
+		return nil, store.NewCodeError(store.CodeGraphInvalid, "expected_condition must be a JSON object")
+	}
 
 	nowMs := time.Now().UnixMilli()
 	err = c.store.WithTx(ctx, func(tx *sql.Tx) error {
+		var runStatus string
+		if err := tx.QueryRowContext(ctx,
+			"SELECT status FROM graph_run WHERE id = ?", req.RunID).Scan(&runStatus); err != nil {
+			return err
+		}
+		if runStatus != "running" {
+			return store.NewCodeError(store.CodeStoreConflict,
+				"run %s is %s, cannot register external wait", req.RunID, runStatus)
+		}
+
 		var existingCount int
 		err := tx.QueryRowContext(ctx,
 			"SELECT COUNT(*) FROM external_wait WHERE event_type = ? AND correlation_key = ? AND status = 'pending'",
@@ -83,18 +106,24 @@ func (c *Controller) RegisterExternalWait(ctx context.Context, req ExternalWaitR
 				req.EventType, req.CorrelationKey)
 		}
 
-		var nodeID string
-		err = tx.QueryRowContext(ctx, "SELECT id FROM run_node WHERE run_id = ? AND node_key = ?", req.RunID, req.NodeKey).Scan(&nodeID)
-		if err == sql.ErrNoRows {
+		var nodeID, nodeStatus string
+		err = tx.QueryRowContext(ctx,
+			"SELECT id, status FROM run_node WHERE run_id = ? AND node_key = ?", req.RunID, req.NodeKey).
+			Scan(&nodeID, &nodeStatus)
+		switch {
+		case err == sql.ErrNoRows:
 			nodeID = ulid.Make().String()
 			if _, err := tx.ExecContext(ctx, `
 INSERT INTO run_node (id, run_id, node_key, status, attempt_count)
-VALUES (?, ?, ?, 'waiting', 0) ON CONFLICT(run_id, node_key) DO UPDATE SET status = 'waiting'`,
+VALUES (?, ?, ?, 'waiting', 0) ON CONFLICT(run_id, node_key) DO NOTHING`,
 				nodeID, req.RunID, req.NodeKey); err != nil {
 				return err
 			}
-		} else if err != nil {
+		case err != nil:
 			return err
+		case isTerminalNodeStatus(nodeStatus):
+			return store.NewCodeError(store.CodeStoreConflict,
+				"node %s is %s, cannot register external wait", req.NodeKey, nodeStatus)
 		}
 
 		waitPayload := map[string]any{
@@ -147,6 +176,28 @@ var sensitiveKeyPatterns = []string{
 	"secret", "token", "password", "passwd", "auth", "key", "credential", "bearer", "private", "cert", "signature",
 }
 
+var sensitiveValuePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----`),
+	regexp.MustCompile(`(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{16,}`),
+	regexp.MustCompile(`github_pat_[A-Za-z0-9_]{20,}`),
+	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{20,}`),
+	regexp.MustCompile(`sk-(ant-)?[A-Za-z0-9_-]{20,}`),
+	regexp.MustCompile(`(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}`),
+	regexp.MustCompile(`xox[baprs]-[A-Za-z0-9-]{10,}`),
+	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+	regexp.MustCompile(`AIza[0-9A-Za-z_-]{30,}`),
+	regexp.MustCompile(`npm_[A-Za-z0-9]{30,}`),
+}
+
+const (
+	maxPayloadDepth    = 6
+	maxPayloadEntries  = 128
+	maxPayloadString   = 4096
+	maxPayloadKeyChars = 128
+)
+
+var payloadKeyPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
+
 func isSensitiveKey(k string) bool {
 	lower := strings.ToLower(k)
 	for _, p := range sensitiveKeyPatterns {
@@ -155,6 +206,52 @@ func isSensitiveKey(k string) bool {
 		}
 	}
 	return false
+}
+
+func isSensitiveValue(v string) bool {
+	for _, p := range sensitiveValuePatterns {
+		if p.MatchString(v) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateNormalizedPayload(v any, depth int) error {
+	if depth > maxPayloadDepth {
+		return fmt.Errorf("nesting deeper than %d levels", maxPayloadDepth)
+	}
+	switch val := v.(type) {
+	case map[string]any:
+		if len(val) > maxPayloadEntries {
+			return fmt.Errorf("more than %d keys in one object", maxPayloadEntries)
+		}
+		for k, item := range val {
+			if len(k) > maxPayloadKeyChars || !payloadKeyPattern.MatchString(k) {
+				return fmt.Errorf("key %q is not an allowed normalized field name", k)
+			}
+			if err := validateNormalizedPayload(item, depth+1); err != nil {
+				return err
+			}
+		}
+	case []any:
+		if len(val) > maxPayloadEntries {
+			return fmt.Errorf("more than %d entries in one array", maxPayloadEntries)
+		}
+		for _, item := range val {
+			if err := validateNormalizedPayload(item, depth+1); err != nil {
+				return err
+			}
+		}
+	case string:
+		if len(val) > maxPayloadString {
+			return fmt.Errorf("string value exceeds %d characters", maxPayloadString)
+		}
+	case float64, bool, nil:
+	default:
+		return fmt.Errorf("value type %T is not supported", v)
+	}
+	return nil
 }
 
 func redactSensitive(v any) any {
@@ -175,6 +272,11 @@ func redactSensitive(v any) any {
 			cleaned[i] = redactSensitive(item)
 		}
 		return cleaned
+	case string:
+		if isSensitiveValue(val) {
+			return "[REDACTED]"
+		}
+		return val
 	default:
 		return val
 	}
@@ -188,11 +290,17 @@ func (c *Controller) CompleteExternalWait(ctx context.Context, req CompleteWaitR
 		return nil, store.NewCodeError(store.CodeGraphInvalid, "provider_event_id, event_type, source, correlation_key, status, and payload_digest are required")
 	}
 
-	// 1. Parse and sanitize payload to prevent persisting sensitive values
+	// 1. Parse, validate, and sanitize payload to prevent persisting sensitive values
 	var rawParsed any
 	if len(req.Payload) > 0 {
 		if err := json.Unmarshal(req.Payload, &rawParsed); err != nil {
 			return nil, store.NewCodeError(store.CodeGraphInvalid, "payload must be valid JSON: %v", err)
+		}
+		if _, ok := rawParsed.(map[string]any); !ok {
+			return nil, store.NewCodeError(store.CodeGraphInvalid, "payload must be a JSON object of normalized provider fields")
+		}
+		if err := validateNormalizedPayload(rawParsed, 0); err != nil {
+			return nil, store.NewCodeError(store.CodeGraphInvalid, "payload is not a bounded normalized object: %v", err)
 		}
 	} else {
 		rawParsed = map[string]any{}
@@ -264,13 +372,14 @@ func (c *Controller) CompleteExternalWait(ctx context.Context, req CompleteWaitR
 			DefinitionDigest string
 			EventType        string
 			CorrelationKey   string
+			ExpectedCond     string
 			Status           string
 		}
 		err = tx.QueryRowContext(ctx, `
-SELECT run_id, run_node_id, graph_version_id, definition_digest, event_type, correlation_key, status
+SELECT run_id, run_node_id, graph_version_id, definition_digest, event_type, correlation_key, expected_condition, status
 FROM external_wait WHERE id = ?`, req.WaitID).
 			Scan(&wait.RunID, &wait.RunNodeID, &wait.GraphVersionID, &wait.DefinitionDigest,
-				&wait.EventType, &wait.CorrelationKey, &wait.Status)
+				&wait.EventType, &wait.CorrelationKey, &wait.ExpectedCond, &wait.Status)
 		if err == sql.ErrNoRows {
 			result = CompletionResult{
 				Code:       "WAIT_NOT_FOUND",
@@ -331,7 +440,44 @@ FROM external_wait WHERE id = ?`, req.WaitID).
 			return nil
 		}
 
-		// D. Accept completion atomically
+		// D. Non-terminal provider states leave the wait pending without
+		// consuming the provider event id, so the terminal delivery can still win.
+		if isNonTerminalProviderStatus(req.Status) {
+			_ = c.recordObservedEventTx(ctx, tx, wait.RunID, req,
+				fmt.Sprintf("provider status %q is non-terminal", req.Status), nowMs)
+			result = CompletionResult{
+				Code:       "WAIT_REJECTED",
+				HTTPStatus: http.StatusAccepted,
+				WaitID:     req.WaitID,
+				RunID:      wait.RunID,
+				NodeKey:    nodeKey,
+				Message:    fmt.Sprintf("provider status %q is non-terminal; wait remains pending", req.Status),
+			}
+			return nil
+		}
+
+		// E. Evaluate the declared expected condition before accepting.
+		satisfied, hasPredicate := evaluateExpectedCondition(wait.ExpectedCond, req.Status, sanitizedParsed)
+		route := req.Status
+		if hasPredicate {
+			if satisfied {
+				route = "success"
+			} else if req.Status == "success" {
+				_ = c.recordObservedEventTx(ctx, tx, wait.RunID, req,
+					"completion does not satisfy the declared expected condition", nowMs)
+				result = CompletionResult{
+					Code:       "WAIT_REJECTED",
+					HTTPStatus: http.StatusAccepted,
+					WaitID:     req.WaitID,
+					RunID:      wait.RunID,
+					NodeKey:    nodeKey,
+					Message:    fmt.Sprintf("completion does not satisfy the expected condition of wait %s", req.WaitID),
+				}
+				return nil
+			}
+		}
+
+		// F. Accept completion atomically
 		receivedEventID := ulid.Make().String()
 		completedEventID := ulid.Make().String()
 
@@ -400,7 +546,7 @@ FROM external_wait WHERE id = ?`, req.WaitID).
 		}
 
 		nodeResult := &executor.Result{
-			Route:  req.Status,
+			Route:  route,
 			Output: outputMap,
 		}
 
@@ -448,6 +594,64 @@ FROM external_wait WHERE id = ?`, req.WaitID).
 	return &result, nil
 }
 
+func isNonTerminalProviderStatus(status string) bool {
+	switch strings.ToLower(status) {
+	case "queued", "pending", "in_progress", "running", "started", "waiting":
+		return true
+	}
+	return false
+}
+
+func evaluateExpectedCondition(condJSON, status string, payload any) (satisfied, hasPredicate bool) {
+	var cond map[string]any
+	if err := json.Unmarshal([]byte(condJSON), &cond); err != nil || len(cond) == 0 {
+		return false, false
+	}
+	for k, want := range cond {
+		actual, ok := conditionLookup(k, status, payload)
+		if !ok || !conditionEqual(actual, want) {
+			return false, true
+		}
+	}
+	return true, true
+}
+
+func conditionLookup(key, status string, payload any) (any, bool) {
+	if key == "status" {
+		return status, true
+	}
+	cur := payload
+	for _, part := range strings.Split(key, ".") {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		v, exists := m[part]
+		if !exists {
+			return nil, false
+		}
+		cur = v
+	}
+	return cur, true
+}
+
+func conditionEqual(actual, want any) bool {
+	switch w := want.(type) {
+	case string:
+		s, ok := actual.(string)
+		return ok && s == w
+	case float64:
+		n, ok := actual.(float64)
+		return ok && n == w
+	case bool:
+		b, ok := actual.(bool)
+		return ok && b == w
+	case nil:
+		return actual == nil
+	}
+	return false
+}
+
 func (c *Controller) recordRejectedEventTx(ctx context.Context, tx *sql.Tx, runID string, req CompleteWaitRequest, reason string, nowMs int64) error {
 	_, err := c.appendWithin(ctx, tx, &store.Event{
 		EventID:        ulid.Make().String(),
@@ -471,6 +675,29 @@ func (c *Controller) recordRejectedEventTx(ctx context.Context, tx *sql.Tx, runI
 	if err != nil && store.ErrorCode(err) == store.CodeStoreConflict {
 		return nil
 	}
+	return err
+}
+
+func (c *Controller) recordObservedEventTx(ctx context.Context, tx *sql.Tx, runID string, req CompleteWaitRequest, reason string, nowMs int64) error {
+	_, err := c.appendWithin(ctx, tx, &store.Event{
+		EventID:       ulid.Make().String(),
+		RunID:         runID,
+		SchemaVersion: "proceed/v1",
+		Type:          "external_event_rejected",
+		OccurredAt:    nowMs,
+		RecordedAt:    nowMs,
+		ActorType:     "controller",
+		ActorID:       c.cfg.OwnerID,
+		CorrelationID: req.CorrelationKey,
+		Payload: payloadJSON(map[string]any{
+			"wait_id":           req.WaitID,
+			"provider_event_id": req.ProviderEventID,
+			"reason":            reason,
+			"event_type":        req.EventType,
+			"correlation_key":   req.CorrelationKey,
+			"status":            req.Status,
+		}),
+	})
 	return err
 }
 
