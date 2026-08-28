@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -121,7 +122,7 @@ func TestAPICompleteWaitAuthAndCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	payloadJSON := `{"conclusion":"success","secret_token":"REDACTED"}`
+	payloadJSON := `{"conclusion":"success","safe_key":"ok"}`
 	body := controller.CompleteWaitRequest{
 		ProviderEventID: "github:check_run:5555",
 		EventType:       "ci.completed",
@@ -194,5 +195,87 @@ func TestAPICompleteWaitAuthAndCompletion(t *testing.T) {
 	srv.ServeHTTP(rec5, req5)
 	if rec5.Code != http.StatusNotFound {
 		t.Errorf("unknown wait status = %d, want 404", rec5.Code)
+	}
+}
+
+// Proves sensitive fields (secret_token, api_key, password) are redacted before storage and absent in event log
+func TestAPICompleteWaitRedactsSecrets(t *testing.T) {
+	ctx := context.Background()
+	srv, st, ctrl, runID, _ := setupAPITestServer(t)
+
+	_, _ = ctrl.Step(ctx, runID)
+
+	waitID := ulid.Make().String()
+	corrKey := "repo=proceed/security;pr=77;head=sha256:sec777"
+	_, err := ctrl.RegisterExternalWait(ctx, controller.ExternalWaitRequest{
+		RunID:             runID,
+		NodeKey:           "wait_node",
+		EventType:         "ci.completed",
+		CorrelationKey:    corrKey,
+		ExpectedCondition: `{"status":"success"}`,
+		WaitID:            waitID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secretSentinel1 := "super-secret-token-value-XYZ"
+	secretSentinel2 := "super-private-key-12345"
+	rawPayloadMap := map[string]any{
+		"conclusion":   "success",
+		"secret_token": secretSentinel1,
+		"nested": map[string]any{
+			"api_key":    secretSentinel2,
+			"safe_field": "visible_data",
+		},
+	}
+	rawPayloadBytes, _ := json.Marshal(rawPayloadMap)
+
+	body := controller.CompleteWaitRequest{
+		WaitID:          waitID,
+		ProviderEventID: "github:check_run:sec_999",
+		EventType:       "ci.completed",
+		Source:          "github",
+		CorrelationKey:  corrKey,
+		OccurredAt:      time.Now().UnixMilli(),
+		Status:          "success",
+		PayloadDigest:   "sha256:" + hexDigest(string(rawPayloadBytes)),
+		Payload:         rawPayloadBytes,
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/waits/"+waitID+"/complete", bytes.NewReader(bodyBytes))
+	req.Header.Set("Authorization", "Bearer event-secret-token")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202. Body: %s", rec.Code, rec.Body.String())
+	}
+
+	// Query all event payloads from the database
+	rows, err := st.DB().QueryContext(ctx, "SELECT payload FROM event WHERE run_id = ?", runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	var sawRedacted bool
+	for rows.Next() {
+		var payloadStr string
+		if err := rows.Scan(&payloadStr); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(payloadStr, secretSentinel1) {
+			t.Fatalf("Found raw secretSentinel1 %q in event payload: %s", secretSentinel1, payloadStr)
+		}
+		if strings.Contains(payloadStr, secretSentinel2) {
+			t.Fatalf("Found raw secretSentinel2 %q in event payload: %s", secretSentinel2, payloadStr)
+		}
+		if strings.Contains(payloadStr, "[REDACTED]") {
+			sawRedacted = true
+		}
+	}
+	if !sawRedacted {
+		t.Fatalf("Expected to find [REDACTED] in stored event payloads, but did not")
 	}
 }

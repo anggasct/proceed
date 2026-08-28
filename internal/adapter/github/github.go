@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"proceed/internal/controller"
@@ -121,18 +122,84 @@ func NormalizeCheckRun(event *CheckRunEvent, waitID string, prOverride int64) (*
 	}, nil
 }
 
+type DeliveryTracker struct {
+	mu   sync.Mutex
+	seen map[string]time.Time
+	ttl  time.Duration
+}
+
+func NewDeliveryTracker(ttl time.Duration) *DeliveryTracker {
+	if ttl <= 0 {
+		ttl = 1 * time.Hour
+	}
+	return &DeliveryTracker{
+		seen: make(map[string]time.Time),
+		ttl:  ttl,
+	}
+}
+
+func (dt *DeliveryTracker) CheckAndRecord(deliveryID string) bool {
+	if deliveryID == "" {
+		return false
+	}
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+
+	now := time.Now()
+	for id, t := range dt.seen {
+		if now.Sub(t) > dt.ttl {
+			delete(dt.seen, id)
+		}
+	}
+	if _, exists := dt.seen[deliveryID]; exists {
+		return false
+	}
+	dt.seen[deliveryID] = now
+	return true
+}
+
 type Adapter struct {
-	BaseURL    string
-	Token      string
-	HTTPClient *http.Client
+	BaseURL     string
+	Token       string
+	HTTPClient  *http.Client
+	Tracker     *DeliveryTracker
+	MaxRetries  int
+	BackoffBase time.Duration
 }
 
 func NewAdapter(baseURL, token string) *Adapter {
 	return &Adapter{
-		BaseURL:    strings.TrimSuffix(baseURL, "/"),
-		Token:      token,
-		HTTPClient: &http.Client{Timeout: 10 * time.Second},
+		BaseURL:     strings.TrimSuffix(baseURL, "/"),
+		Token:       token,
+		HTTPClient:  &http.Client{Timeout: 10 * time.Second},
+		Tracker:     NewDeliveryTracker(1 * time.Hour),
+		MaxRetries:  3,
+		BackoffBase: 20 * time.Millisecond,
 	}
+}
+
+func (a *Adapter) ProcessVerifiedWebhook(ctx context.Context, secret, signatureHeader, deliveryID string, rawPayload []byte, waitID string, prOverride int64) (*controller.CompletionResult, error) {
+	if !VerifyWebhookSignature(secret, signatureHeader, rawPayload) {
+		return nil, fmt.Errorf("invalid or missing webhook signature")
+	}
+
+	if a.Tracker != nil {
+		if !a.Tracker.CheckAndRecord(deliveryID) {
+			return nil, fmt.Errorf("delivery %s already processed (replay detected)", deliveryID)
+		}
+	}
+
+	var event CheckRunEvent
+	if err := json.Unmarshal(rawPayload, &event); err != nil {
+		return nil, fmt.Errorf("unmarshal webhook payload: %w", err)
+	}
+
+	req, err := NormalizeCheckRun(&event, waitID, prOverride)
+	if err != nil {
+		return nil, err
+	}
+
+	return a.CompleteWait(ctx, *req)
 }
 
 func (a *Adapter) CompleteWait(ctx context.Context, req controller.CompleteWaitRequest) (*controller.CompletionResult, error) {
@@ -142,53 +209,83 @@ func (a *Adapter) CompleteWait(ctx context.Context, req controller.CompleteWaitR
 		return nil, err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, err
+	maxAttempts := a.MaxRetries
+	if maxAttempts <= 0 {
+		maxAttempts = 3
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if a.Token != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+a.Token)
+	backoff := a.BackoffBase
+	if backoff <= 0 {
+		backoff = 20 * time.Millisecond
 	}
 
-	resp, err := a.HTTPClient.Do(httpReq)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	var lastErr error
 
-	var result controller.CompletionResult
-	result.HTTPStatus = resp.StatusCode
-
-	if resp.StatusCode >= 400 {
-		var errResp struct {
-			Error struct {
-				Code    string         `json:"code"`
-				Message string         `json:"message"`
-				Details map[string]any `json:"details"`
-			} `json:"error"`
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff * (1 << (attempt - 1))):
+			}
 		}
-		_ = json.NewDecoder(resp.Body).Decode(&errResp)
-		result.Code = errResp.Error.Code
-		result.Message = errResp.Error.Message
-		result.Details = errResp.Error.Details
-		return &result, nil
-	}
 
-	var okResp struct {
-		WaitID  string `json:"wait_id"`
-		Status  string `json:"status"`
-		RunID   string `json:"run_id"`
-		NodeKey string `json:"node_key"`
-		Message string `json:"message"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&okResp); err == nil {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		if a.Token != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+a.Token)
+		}
+
+		resp, err := a.HTTPClient.Do(httpReq)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Transient 5xx server status codes -> retry with same provider_event_id
+		if resp.StatusCode >= 500 && resp.StatusCode <= 504 {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("server returned transient status %d", resp.StatusCode)
+			continue
+		}
+
+		var result controller.CompletionResult
+		result.HTTPStatus = resp.StatusCode
+
+		if resp.StatusCode >= 400 {
+			var errResp struct {
+				Error struct {
+					Code    string         `json:"code"`
+					Message string         `json:"message"`
+					Details map[string]any `json:"details"`
+				} `json:"error"`
+			}
+			_ = json.NewDecoder(resp.Body).Decode(&errResp)
+			resp.Body.Close()
+			result.Code = errResp.Error.Code
+			result.Message = errResp.Error.Message
+			result.Details = errResp.Error.Details
+			return &result, nil
+		}
+
+		var okResp struct {
+			WaitID  string `json:"wait_id"`
+			Status  string `json:"status"`
+			RunID   string `json:"run_id"`
+			NodeKey string `json:"node_key"`
+			Message string `json:"message"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&okResp)
+		resp.Body.Close()
 		result.WaitID = okResp.WaitID
 		result.Code = okResp.Status
 		result.RunID = okResp.RunID
 		result.NodeKey = okResp.NodeKey
 		result.Message = okResp.Message
+		return &result, nil
 	}
 
-	return &result, nil
+	return nil, fmt.Errorf("complete wait failed after %d attempts: %w", maxAttempts, lastErr)
 }

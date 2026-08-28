@@ -776,7 +776,7 @@ SET status = 'completed',
     completed_event_id = COALESCE(?, completed_event_id),
     payload_digest = COALESCE(?, payload_digest),
     completed_at = ?
-WHERE id = ?`,
+WHERE id = ? AND status = 'pending'`,
 		nullableOr(receivedEventID), nullableOr(p.PayloadDigest), ev.OccurredAt, waitID)
 	return err
 }
@@ -791,7 +791,7 @@ func onExternalWaitExpired(ctx context.Context, tx *sql.Tx, ev *Event) error {
 		waitID = ev.EventID
 	}
 	_, err := tx.ExecContext(ctx, `
-UPDATE external_wait SET status = 'expired', completed_at = ? WHERE id = ?`,
+UPDATE external_wait SET status = 'expired', completed_at = ? WHERE id = ? AND status = 'pending'`,
 		ev.OccurredAt, waitID)
 	return err
 }
@@ -806,7 +806,7 @@ func onExternalWaitCancelled(ctx context.Context, tx *sql.Tx, ev *Event) error {
 		waitID = ev.EventID
 	}
 	_, err := tx.ExecContext(ctx, `
-UPDATE external_wait SET status = 'cancelled', completed_at = ? WHERE id = ?`,
+UPDATE external_wait SET status = 'cancelled', completed_at = ? WHERE id = ? AND status = 'pending'`,
 		ev.OccurredAt, waitID)
 	return err
 }

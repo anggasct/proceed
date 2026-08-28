@@ -5,8 +5,11 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -93,6 +96,170 @@ func TestNormalizeCheckRun(t *testing.T) {
 	}
 	if req.ProviderEventID != "github:check_run:98765" {
 		t.Errorf("req.ProviderEventID = %q", req.ProviderEventID)
+	}
+}
+
+// Verified webhook processing enforcing signature and delivery replay prevention
+func TestProcessVerifiedWebhook(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	cfg := config.Config{
+		Tokens: []config.Token{
+			{Name: "gh-token", Token: "secret-token", Scopes: []string{"event", "read"}},
+		},
+	}
+	ctrl, err := controller.New(st, controller.DefaultConfig(), map[executor.Kind]executor.Executor{
+		executor.Shell: executor.NewFuncExecutor(executor.Shell, executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
+			return &executor.Result{Output: map[string]any{"executed": req.NodeKey}, Route: "success"}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := api.NewServer(api.Deps{Store: st, Controller: ctrl, Config: cfg})
+	httpSrv := httptest.NewServer(srv.Handler())
+	defer httpSrv.Close()
+
+	adapter := NewAdapter(httpSrv.URL, "secret-token")
+	secret := "webhook-secret-999"
+
+	graphYAML := `schema: proceed/v1
+name: test-webhook-verify
+nodes:
+  - id: wait_ci
+    type: task
+    contract: pure
+    terminal: true
+    executor: { kind: shell, command: ["echo", "w"] }
+edges: []
+`
+	src := []byte(graphYAML)
+	doc, _ := compiler.Parse(src)
+	_ = compiler.Validate(doc)
+	frozen, _ := st.FreezeDefinition(ctx, "test.yaml", src, doc)
+	run, _ := st.CreateRun(ctx, frozen.GraphVersionID)
+
+	waitID := ulid.Make().String()
+	corrKey := "repo=proceed/core;pr=5;head=sha256:wh_sha1"
+	_, err = ctrl.RegisterExternalWait(ctx, controller.ExternalWaitRequest{
+		RunID:             run.ID,
+		NodeKey:           "wait_ci",
+		EventType:         "ci.completed",
+		CorrelationKey:    corrKey,
+		ExpectedCondition: `{"status":"success"}`,
+		WaitID:            waitID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rawPayload := []byte(`{
+		"action": "completed",
+		"check_run": {
+			"id": 9901,
+			"name": "build",
+			"head_sha": "sha256:wh_sha1",
+			"status": "completed",
+			"conclusion": "success",
+			"pull_requests": [{"number": 5}]
+		},
+		"repository": {
+			"full_name": "proceed/core"
+		}
+	}`)
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(rawPayload)
+	validSig := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+
+	deliveryID := "gh-delivery-uuid-001"
+
+	// 1. Invalid signature fails before calling API
+	_, err = adapter.ProcessVerifiedWebhook(ctx, secret, "sha256:invalid", deliveryID, rawPayload, waitID, 0)
+	if err == nil {
+		t.Fatalf("Expected error for invalid signature, got nil")
+	}
+
+	// 2. Valid signature + first delivery -> succeeds
+	res, err := adapter.ProcessVerifiedWebhook(ctx, secret, validSig, deliveryID, rawPayload, waitID, 0)
+	if err != nil {
+		t.Fatalf("ProcessVerifiedWebhook failed: %v", err)
+	}
+	if res.Code != "WAIT_COMPLETED" || res.HTTPStatus != 202 {
+		t.Errorf("res = %+v, want WAIT_COMPLETED (202)", res)
+	}
+
+	// 3. Replay with same delivery ID -> rejected
+	_, err = adapter.ProcessVerifiedWebhook(ctx, secret, validSig, deliveryID, rawPayload, waitID, 0)
+	if err == nil {
+		t.Fatalf("Expected error for replayed delivery ID, got nil")
+	}
+}
+
+// Transient HTTP failures trigger automatic client retries with identical provider event identity
+func TestAdapterRetryOnTransientFailure(t *testing.T) {
+	ctx := context.Background()
+	var attempts int32
+	receivedProviderEventIDs := []string{}
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		att := atomic.AddInt32(&attempts, 1)
+
+		var req controller.CompleteWaitRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		receivedProviderEventIDs = append(receivedProviderEventIDs, req.ProviderEventID)
+
+		if att < 3 {
+			http.Error(w, `{"error":{"code":"SERVICE_UNAVAILABLE","message":"transient error"}}`, http.StatusServiceUnavailable)
+			return
+		}
+
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"wait_id": req.WaitID,
+			"status":  "WAIT_COMPLETED",
+		})
+	}))
+	defer mockServer.Close()
+
+	adapter := NewAdapter(mockServer.URL, "token")
+	adapter.BackoffBase = 5 * time.Millisecond
+
+	req := controller.CompleteWaitRequest{
+		WaitID:          "wait-retry-123",
+		ProviderEventID: "github:check_run:retry_999",
+		EventType:       "ci.completed",
+		Source:          "github",
+		CorrelationKey:  "repo=org/app;pr=1;head=sha256:abc",
+		OccurredAt:      time.Now().UnixMilli(),
+		Status:          "success",
+		PayloadDigest:   "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		Payload:         json.RawMessage("{}"),
+	}
+
+	res, err := adapter.CompleteWait(ctx, req)
+	if err != nil {
+		t.Fatalf("CompleteWait with retry failed: %v", err)
+	}
+	if res.Code != "WAIT_COMPLETED" || res.HTTPStatus != 202 {
+		t.Errorf("res = %+v, want WAIT_COMPLETED", res)
+	}
+
+	if atomic.LoadInt32(&attempts) != 3 {
+		t.Errorf("attempts = %d, want 3", attempts)
+	}
+
+	// Verify all 3 attempts used the exact same ProviderEventID
+	for i, id := range receivedProviderEventIDs {
+		if id != "github:check_run:retry_999" {
+			t.Errorf("attempt %d sent provider event ID %s, want github:check_run:retry_999", i, id)
+		}
 	}
 }
 

@@ -143,6 +143,43 @@ VALUES (?, ?, ?, 'waiting', 0) ON CONFLICT(run_id, node_key) DO UPDATE SET statu
 	return c.store.GetExternalWait(ctx, req.WaitID)
 }
 
+var sensitiveKeyPatterns = []string{
+	"secret", "token", "password", "passwd", "auth", "key", "credential", "bearer", "private", "cert", "signature",
+}
+
+func isSensitiveKey(k string) bool {
+	lower := strings.ToLower(k)
+	for _, p := range sensitiveKeyPatterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func redactSensitive(v any) any {
+	switch val := v.(type) {
+	case map[string]any:
+		cleaned := make(map[string]any, len(val))
+		for k, item := range val {
+			if isSensitiveKey(k) {
+				cleaned[k] = "[REDACTED]"
+			} else {
+				cleaned[k] = redactSensitive(item)
+			}
+		}
+		return cleaned
+	case []any:
+		cleaned := make([]any, len(val))
+		for i, item := range val {
+			cleaned[i] = redactSensitive(item)
+		}
+		return cleaned
+	default:
+		return val
+	}
+}
+
 func (c *Controller) CompleteExternalWait(ctx context.Context, req CompleteWaitRequest) (*CompletionResult, error) {
 	if req.WaitID == "" {
 		return nil, store.NewCodeError(store.CodeGraphInvalid, "wait_id is required")
@@ -151,119 +188,153 @@ func (c *Controller) CompleteExternalWait(ctx context.Context, req CompleteWaitR
 		return nil, store.NewCodeError(store.CodeGraphInvalid, "provider_event_id, event_type, source, correlation_key, status, and payload_digest are required")
 	}
 
-	canonicalPayload := "{}"
+	// 1. Parse and sanitize payload to prevent persisting sensitive values
+	var rawParsed any
 	if len(req.Payload) > 0 {
-		var pv any
-		if err := json.Unmarshal(req.Payload, &pv); err != nil {
+		if err := json.Unmarshal(req.Payload, &rawParsed); err != nil {
 			return nil, store.NewCodeError(store.CodeGraphInvalid, "payload must be valid JSON: %v", err)
 		}
-		b, _ := json.Marshal(pv)
-		canonicalPayload = string(b)
+	} else {
+		rawParsed = map[string]any{}
 	}
-	computedDigest := hexDigest(canonicalPayload)
+
+	rawCanonicalBytes, _ := json.Marshal(rawParsed)
+	rawDigest := hexDigest(string(rawCanonicalBytes))
+
+	sanitizedParsed := redactSensitive(rawParsed)
+	sanitizedCanonicalBytes, _ := json.Marshal(sanitizedParsed)
+	sanitizedDigest := hexDigest(string(sanitizedCanonicalBytes))
+
 	normDigest := normalizeDigest(req.PayloadDigest)
-	if normDigest != computedDigest && normDigest != "sha256:"+computedDigest {
-		return nil, store.NewCodeError(store.CodeGraphInvalid, "payload_digest %s does not match payload (computed sha256:%s)", req.PayloadDigest, computedDigest)
+	if normDigest != rawDigest && normDigest != "sha256:"+rawDigest &&
+		normDigest != sanitizedDigest && normDigest != "sha256:"+sanitizedDigest {
+		return nil, store.NewCodeError(store.CodeGraphInvalid, "payload_digest %s does not match payload (computed sha256:%s)", req.PayloadDigest, rawDigest)
 	}
 
-	// 1. Check idempotency: has this provider_event_id already been recorded?
-	var existingEventID, existingType string
-	err := c.store.DB().QueryRowContext(ctx,
-		"SELECT event_id, type FROM event WHERE idempotency_key = ?", req.ProviderEventID).
-		Scan(&existingEventID, &existingType)
-	if err == nil {
-		wait, err := c.store.GetExternalWait(ctx, req.WaitID)
-		if err != nil {
-			return nil, err
-		}
-		if wait != nil && wait.Status == "completed" {
-			nodeKey := c.nodeKeyForID(ctx, wait.RunID, wait.RunNodeID)
-			return &CompletionResult{
-				Code:       "WAIT_ALREADY_COMPLETED",
-				HTTPStatus: http.StatusOK,
-				WaitID:     req.WaitID,
-				RunID:      wait.RunID,
-				NodeKey:    nodeKey,
-				Message:    "idempotent duplicate; original resolution preserved",
-			}, nil
-		}
-		return &CompletionResult{
-			Code:       "WAIT_REJECTED",
-			HTTPStatus: http.StatusAccepted,
-			WaitID:     req.WaitID,
-			Message:    "event already processed",
-		}, nil
-	} else if err != sql.ErrNoRows {
-		return nil, err
-	}
+	persistedPayloadBytes := sanitizedCanonicalBytes
+	persistedDigest := "sha256:" + sanitizedDigest
 
-	// 2. Lookup wait
-	wait, err := c.store.GetExternalWait(ctx, req.WaitID)
-	if err != nil {
-		return nil, err
-	}
-	if wait == nil {
-		return &CompletionResult{
-			Code:       "WAIT_NOT_FOUND",
-			HTTPStatus: http.StatusNotFound,
-			WaitID:     req.WaitID,
-			Message:    fmt.Sprintf("wait %s not found", req.WaitID),
-		}, nil
-	}
-
-	nodeKey := c.nodeKeyForID(ctx, wait.RunID, wait.RunNodeID)
-
-	// 3. Validate state & correlation
+	var result CompletionResult
 	nowMs := time.Now().UnixMilli()
-	if wait.Status != "pending" {
-		_ = c.recordRejectedEvent(ctx, wait.RunID, req, fmt.Sprintf("wait is already %s", wait.Status), nowMs)
-		return &CompletionResult{
-			Code:       "WAIT_CONFLICT",
-			HTTPStatus: http.StatusConflict,
-			WaitID:     req.WaitID,
-			RunID:      wait.RunID,
-			NodeKey:    nodeKey,
-			Message:    fmt.Sprintf("wait %s is already %s", req.WaitID, wait.Status),
-		}, nil
-	}
-
-	if wait.EventType != req.EventType || wait.CorrelationKey != req.CorrelationKey {
-		_ = c.recordRejectedEvent(ctx, wait.RunID, req, "mismatched event_type or correlation_key", nowMs)
-		return &CompletionResult{
-			Code:       "WAIT_CONFLICT",
-			HTTPStatus: http.StatusConflict,
-			WaitID:     req.WaitID,
-			RunID:      wait.RunID,
-			NodeKey:    nodeKey,
-			Message:    fmt.Sprintf("mismatched correlation or event type for wait %s", req.WaitID),
-		}, nil
-	}
-
-	run, err := c.loadRun(ctx, wait.RunID)
-	if err != nil {
-		return nil, err
-	}
-	if run.status != "running" {
-		_ = c.recordRejectedEvent(ctx, wait.RunID, req, fmt.Sprintf("run is %s", run.status), nowMs)
-		return &CompletionResult{
-			Code:       "WAIT_CONFLICT",
-			HTTPStatus: http.StatusConflict,
-			WaitID:     req.WaitID,
-			RunID:      wait.RunID,
-			NodeKey:    nodeKey,
-			Message:    fmt.Sprintf("run %s is not running (%s)", wait.RunID, run.status),
-		}, nil
-	}
-
-	// 4. Accept completion atomically
-	receivedEventID := ulid.Make().String()
-	completedEventID := ulid.Make().String()
 	occurredAt := req.OccurredAt
 	if occurredAt <= 0 || occurredAt > nowMs {
 		occurredAt = nowMs
 	}
 
-	err = c.store.WithTx(ctx, func(tx *sql.Tx) error {
+	err := c.store.WithTx(ctx, func(tx *sql.Tx) error {
+		// A. Check idempotency inside transaction
+		var existingEventID, existingType string
+		err := tx.QueryRowContext(ctx,
+			"SELECT event_id, type FROM event WHERE idempotency_key = ?", req.ProviderEventID).
+			Scan(&existingEventID, &existingType)
+		if err == nil {
+			var waitStatus, runID, runNodeID string
+			err := tx.QueryRowContext(ctx,
+				"SELECT status, run_id, run_node_id FROM external_wait WHERE id = ?", req.WaitID).
+				Scan(&waitStatus, &runID, &runNodeID)
+			if err == nil && waitStatus == "completed" {
+				var nodeKey string
+				_ = tx.QueryRowContext(ctx, "SELECT node_key FROM run_node WHERE id = ?", runNodeID).Scan(&nodeKey)
+				result = CompletionResult{
+					Code:       "WAIT_ALREADY_COMPLETED",
+					HTTPStatus: http.StatusOK,
+					WaitID:     req.WaitID,
+					RunID:      runID,
+					NodeKey:    nodeKey,
+					Message:    "idempotent duplicate; original resolution preserved",
+				}
+				return nil
+			}
+			result = CompletionResult{
+				Code:       "WAIT_REJECTED",
+				HTTPStatus: http.StatusAccepted,
+				WaitID:     req.WaitID,
+				Message:    "event already processed",
+			}
+			return nil
+		} else if err != sql.ErrNoRows {
+			return err
+		}
+
+		// B. Lookup external_wait inside transaction
+		var wait struct {
+			RunID            string
+			RunNodeID        string
+			GraphVersionID   string
+			DefinitionDigest string
+			EventType        string
+			CorrelationKey   string
+			Status           string
+		}
+		err = tx.QueryRowContext(ctx, `
+SELECT run_id, run_node_id, graph_version_id, definition_digest, event_type, correlation_key, status
+FROM external_wait WHERE id = ?`, req.WaitID).
+			Scan(&wait.RunID, &wait.RunNodeID, &wait.GraphVersionID, &wait.DefinitionDigest,
+				&wait.EventType, &wait.CorrelationKey, &wait.Status)
+		if err == sql.ErrNoRows {
+			result = CompletionResult{
+				Code:       "WAIT_NOT_FOUND",
+				HTTPStatus: http.StatusNotFound,
+				WaitID:     req.WaitID,
+				Message:    fmt.Sprintf("wait %s not found", req.WaitID),
+			}
+			return nil
+		} else if err != nil {
+			return err
+		}
+
+		var nodeKey string
+		_ = tx.QueryRowContext(ctx, "SELECT node_key FROM run_node WHERE id = ?", wait.RunNodeID).Scan(&nodeKey)
+
+		// C. Validate pending status and matching correlation
+		if wait.Status != "pending" {
+			_ = c.recordRejectedEventTx(ctx, tx, wait.RunID, req, fmt.Sprintf("wait is already %s", wait.Status), nowMs)
+			result = CompletionResult{
+				Code:       "WAIT_CONFLICT",
+				HTTPStatus: http.StatusConflict,
+				WaitID:     req.WaitID,
+				RunID:      wait.RunID,
+				NodeKey:    nodeKey,
+				Message:    fmt.Sprintf("wait %s is already %s", req.WaitID, wait.Status),
+			}
+			return nil
+		}
+
+		if wait.EventType != req.EventType || wait.CorrelationKey != req.CorrelationKey {
+			_ = c.recordRejectedEventTx(ctx, tx, wait.RunID, req, "mismatched event_type or correlation_key", nowMs)
+			result = CompletionResult{
+				Code:       "WAIT_CONFLICT",
+				HTTPStatus: http.StatusConflict,
+				WaitID:     req.WaitID,
+				RunID:      wait.RunID,
+				NodeKey:    nodeKey,
+				Message:    fmt.Sprintf("mismatched correlation or event type for wait %s", req.WaitID),
+			}
+			return nil
+		}
+
+		var runStatus string
+		err = tx.QueryRowContext(ctx, "SELECT status FROM graph_run WHERE id = ?", wait.RunID).Scan(&runStatus)
+		if err != nil {
+			return err
+		}
+		if runStatus != "running" {
+			_ = c.recordRejectedEventTx(ctx, tx, wait.RunID, req, fmt.Sprintf("run is %s", runStatus), nowMs)
+			result = CompletionResult{
+				Code:       "WAIT_CONFLICT",
+				HTTPStatus: http.StatusConflict,
+				WaitID:     req.WaitID,
+				RunID:      wait.RunID,
+				NodeKey:    nodeKey,
+				Message:    fmt.Sprintf("run %s is not running (%s)", wait.RunID, runStatus),
+			}
+			return nil
+		}
+
+		// D. Accept completion atomically
+		receivedEventID := ulid.Make().String()
+		completedEventID := ulid.Make().String()
+
 		// Append external_event_received
 		recvPayload := map[string]any{
 			"wait_id":           req.WaitID,
@@ -273,10 +344,8 @@ func (c *Controller) CompleteExternalWait(ctx context.Context, req CompleteWaitR
 			"correlation_key":   req.CorrelationKey,
 			"occurred_at":       occurredAt,
 			"status":            req.Status,
-			"payload_digest":    req.PayloadDigest,
-		}
-		if len(req.Payload) > 0 {
-			recvPayload["payload"] = json.RawMessage(canonicalPayload)
+			"payload_digest":    persistedDigest,
+			"payload":           json.RawMessage(persistedPayloadBytes),
 		}
 
 		if _, err := c.appendWithin(ctx, tx, &store.Event{
@@ -312,7 +381,7 @@ func (c *Controller) CompleteExternalWait(ctx context.Context, req CompleteWaitR
 				"node_key":          nodeKey,
 				"received_event_id": receivedEventID,
 				"status":            "completed",
-				"payload_digest":    req.PayloadDigest,
+				"payload_digest":    persistedDigest,
 			}),
 		}); err != nil {
 			return err
@@ -323,14 +392,16 @@ func (c *Controller) CompleteExternalWait(ctx context.Context, req CompleteWaitR
 		_ = tx.QueryRowContext(ctx,
 			"SELECT attempt_count FROM run_node WHERE id = ?", wait.RunNodeID).Scan(&attemptCount)
 
-		output := map[string]any{}
-		if len(req.Payload) > 0 {
-			_ = json.Unmarshal([]byte(canonicalPayload), &output)
+		var outputMap map[string]any
+		if m, ok := sanitizedParsed.(map[string]any); ok {
+			outputMap = m
+		} else {
+			outputMap = map[string]any{"payload": sanitizedParsed}
 		}
 
-		result := &executor.Result{
+		nodeResult := &executor.Result{
 			Route:  req.Status,
-			Output: output,
+			Output: outputMap,
 		}
 
 		// Append node_finished
@@ -348,29 +419,59 @@ func (c *Controller) CompleteExternalWait(ctx context.Context, req CompleteWaitR
 			Payload: payloadJSON(map[string]any{
 				"node_key":   nodeKey,
 				"attempt_no": attemptCount,
-				"result":     result.Output,
-				"route":      result.Route,
+				"result":     nodeResult.Output,
+				"route":      nodeResult.Route,
 			}),
 		}); err != nil {
 			return err
 		}
 
 		// Route edges from the completed node
-		return c.routeFromTx(ctx, tx, wait.RunID, wait.GraphVersionID, wait.DefinitionDigest,
-			runnableNode{NodeKey: nodeKey, AttemptNo: attemptCount}, result, true, nowMs)
+		if err := c.routeFromTx(ctx, tx, wait.RunID, wait.GraphVersionID, wait.DefinitionDigest,
+			runnableNode{NodeKey: nodeKey, AttemptNo: attemptCount}, nodeResult, true, nowMs); err != nil {
+			return err
+		}
+
+		result = CompletionResult{
+			Code:       "WAIT_COMPLETED",
+			HTTPStatus: http.StatusAccepted,
+			WaitID:     req.WaitID,
+			RunID:      wait.RunID,
+			NodeKey:    nodeKey,
+			Message:    "event accepted and wait resolved",
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	return &result, nil
+}
 
-	return &CompletionResult{
-		Code:       "WAIT_COMPLETED",
-		HTTPStatus: http.StatusAccepted,
-		WaitID:     req.WaitID,
-		RunID:      wait.RunID,
-		NodeKey:    nodeKey,
-		Message:    "event accepted and wait resolved",
-	}, nil
+func (c *Controller) recordRejectedEventTx(ctx context.Context, tx *sql.Tx, runID string, req CompleteWaitRequest, reason string, nowMs int64) error {
+	_, err := c.appendWithin(ctx, tx, &store.Event{
+		EventID:        ulid.Make().String(),
+		RunID:          runID,
+		SchemaVersion:  "proceed/v1",
+		Type:           "external_event_rejected",
+		OccurredAt:     nowMs,
+		RecordedAt:     nowMs,
+		ActorType:      "controller",
+		ActorID:        c.cfg.OwnerID,
+		CorrelationID:  req.CorrelationKey,
+		IdempotencyKey: req.ProviderEventID,
+		Payload: payloadJSON(map[string]any{
+			"wait_id":           req.WaitID,
+			"provider_event_id": req.ProviderEventID,
+			"reason":            reason,
+			"event_type":        req.EventType,
+			"correlation_key":   req.CorrelationKey,
+		}),
+	})
+	if err != nil && store.ErrorCode(err) == store.CodeStoreConflict {
+		return nil
+	}
+	return err
 }
 
 func (c *Controller) ExpireExternalWaits(ctx context.Context, nowMs int64) error {
@@ -479,29 +580,7 @@ WHERE graph_version_id = ? AND from_node_key = ? AND type = 'routes_to' AND cond
 
 func (c *Controller) recordRejectedEvent(ctx context.Context, runID string, req CompleteWaitRequest, reason string, nowMs int64) error {
 	return c.store.WithTx(ctx, func(tx *sql.Tx) error {
-		_, err := c.appendWithin(ctx, tx, &store.Event{
-			EventID:        ulid.Make().String(),
-			RunID:          runID,
-			SchemaVersion:  "proceed/v1",
-			Type:           "external_event_rejected",
-			OccurredAt:     nowMs,
-			RecordedAt:     nowMs,
-			ActorType:      "controller",
-			ActorID:        c.cfg.OwnerID,
-			CorrelationID:  req.CorrelationKey,
-			IdempotencyKey: req.ProviderEventID,
-			Payload: payloadJSON(map[string]any{
-				"wait_id":           req.WaitID,
-				"provider_event_id": req.ProviderEventID,
-				"reason":            reason,
-				"event_type":        req.EventType,
-				"correlation_key":   req.CorrelationKey,
-			}),
-		})
-		if err != nil && store.ErrorCode(err) == store.CodeStoreConflict {
-			return nil
-		}
-		return err
+		return c.recordRejectedEventTx(ctx, tx, runID, req, reason, nowMs)
 	})
 }
 

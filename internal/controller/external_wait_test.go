@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -517,6 +518,217 @@ edges:
 	runStatus := runStatusOf(ctrl, ctx, runID)
 	if runStatus != "cancelled" {
 		t.Errorf("runStatus = %q, want cancelled", runStatus)
+	}
+}
+
+// Concurrent completions with distinct provider event IDs: exactly one wins
+func TestExternalWaitConcurrentCompletions(t *testing.T) {
+	ctx := context.Background()
+	graphYAML := `schema: proceed/v1
+name: test-concurrent-complete
+nodes:
+  - id: wait_ci
+    type: task
+    contract: pure
+    executor:
+      kind: shell
+      command: ["echo", "wait"]
+  - id: next_step
+    type: task
+    contract: pure
+    terminal: true
+    executor:
+      kind: shell
+      command: ["echo", "next"]
+edges:
+  - { from: wait_ci, to: next_step, type: routes_to, when: success }
+`
+	st, _, runID := openTestStoreWithGraph(t, graphYAML)
+	pool := map[executor.Kind]executor.Executor{
+		executor.Shell: &testShellExecutor{},
+	}
+	ctrl := newTestController(t, st, pool, "ctrl-1")
+
+	waitID := ulid.Make().String()
+	corrKey := "repo=org/concurrency;pr=10;head=sha256:conc123"
+	_, err := ctrl.RegisterExternalWait(ctx, ExternalWaitRequest{
+		RunID:             runID,
+		NodeKey:           "wait_ci",
+		EventType:         "ci.completed",
+		CorrelationKey:    corrKey,
+		ExpectedCondition: `{"status":"success"}`,
+		WaitID:            waitID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	concurrency := 10
+	results := make([]*CompletionResult, concurrency)
+	errs := make([]error, concurrency)
+
+	var wg sync.WaitGroup
+	startCh := make(chan struct{})
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-startCh
+			res, err := ctrl.CompleteExternalWait(ctx, CompleteWaitRequest{
+				WaitID:          waitID,
+				ProviderEventID: fmt.Sprintf("github:check_run:concurrent_%d", idx),
+				EventType:       "ci.completed",
+				Source:          "github",
+				CorrelationKey:  corrKey,
+				OccurredAt:      time.Now().UnixMilli(),
+				Status:          "success",
+				PayloadDigest:   "sha256:" + hexDigest("{}"),
+				Payload:         json.RawMessage("{}"),
+			})
+			results[idx] = res
+			errs[idx] = err
+		}(i)
+	}
+
+	close(startCh)
+	wg.Wait()
+
+	var successCount, conflictCount int
+	for i := 0; i < concurrency; i++ {
+		if errs[i] != nil {
+			t.Fatalf("goroutine %d returned error: %v", i, errs[i])
+		}
+		if results[i].Code == "WAIT_COMPLETED" && results[i].HTTPStatus == http.StatusAccepted {
+			successCount++
+		} else if results[i].Code == "WAIT_CONFLICT" && results[i].HTTPStatus == http.StatusConflict {
+			conflictCount++
+		} else {
+			t.Errorf("goroutine %d unexpected result: %+v", i, results[i])
+		}
+	}
+
+	if successCount != 1 {
+		t.Errorf("successCount = %d, want exactly 1", successCount)
+	}
+	if conflictCount != concurrency-1 {
+		t.Errorf("conflictCount = %d, want %d", conflictCount, concurrency-1)
+	}
+
+	// Verify only 1 external_wait_completed event was recorded
+	var completedEventCount int
+	if err := st.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM event WHERE run_id = ? AND type = 'external_wait_completed'", runID).Scan(&completedEventCount); err != nil {
+		t.Fatal(err)
+	}
+	if completedEventCount != 1 {
+		t.Errorf("completedEventCount = %d, want 1", completedEventCount)
+	}
+
+	// Verify only 1 node_finished event was recorded
+	var finishedNodeCount int
+	if err := st.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM event WHERE run_id = ? AND type = 'node_finished'", runID).Scan(&finishedNodeCount); err != nil {
+		t.Fatal(err)
+	}
+	if finishedNodeCount != 1 {
+		t.Errorf("finishedNodeCount = %d, want 1", finishedNodeCount)
+	}
+}
+
+// Completion racing expiry cannot revive terminal expired status
+func TestExternalWaitCompletionRacingExpiry(t *testing.T) {
+	ctx := context.Background()
+	graphYAML := `schema: proceed/v1
+name: test-race-expiry
+nodes:
+  - id: wait_ci
+    type: task
+    contract: pure
+    executor:
+      kind: shell
+      command: ["echo", "wait"]
+  - id: next_step
+    type: task
+    contract: pure
+    terminal: true
+    executor:
+      kind: shell
+      command: ["echo", "next"]
+edges:
+  - { from: wait_ci, to: next_step, type: routes_to, when: success }
+`
+	st, _, runID := openTestStoreWithGraph(t, graphYAML)
+	pool := map[executor.Kind]executor.Executor{
+		executor.Shell: &testShellExecutor{},
+	}
+	ctrl := newTestController(t, st, pool, "ctrl-1")
+
+	now := time.Now().UnixMilli() - 500
+	waitID := ulid.Make().String()
+	corrKey := "repo=org/race;pr=11;head=sha256:race456"
+	_, err := ctrl.RegisterExternalWait(ctx, ExternalWaitRequest{
+		RunID:             runID,
+		NodeKey:           "wait_ci",
+		EventType:         "ci.completed",
+		CorrelationKey:    corrKey,
+		ExpectedCondition: `{"status":"success"}`,
+		ExpiresAt:         now + 50,
+		WaitID:            waitID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Concurrently expire and complete
+	var wg sync.WaitGroup
+	startCh := make(chan struct{})
+
+	var compRes *CompletionResult
+	var compErr error
+	var expireErr error
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-startCh
+		expireErr = ctrl.ExpireExternalWaits(ctx, time.Now().UnixMilli())
+	}()
+
+	go func() {
+		defer wg.Done()
+		<-startCh
+		compRes, compErr = ctrl.CompleteExternalWait(ctx, CompleteWaitRequest{
+			WaitID:          waitID,
+			ProviderEventID: "github:check_run:race_expiry",
+			EventType:       "ci.completed",
+			Source:          "github",
+			CorrelationKey:  corrKey,
+			OccurredAt:      now + 20,
+			Status:          "success",
+			PayloadDigest:   "sha256:" + hexDigest("{}"),
+			Payload:         json.RawMessage("{}"),
+		})
+	}()
+
+	close(startCh)
+	wg.Wait()
+
+	if expireErr != nil {
+		t.Fatalf("ExpireExternalWaits error: %v", expireErr)
+	}
+	if compErr != nil {
+		t.Fatalf("CompleteExternalWait error: %v", compErr)
+	}
+
+	w, _ := st.GetExternalWait(ctx, waitID)
+	if w.Status != "completed" && w.Status != "expired" {
+		t.Fatalf("Unexpected wait status after race: %s", w.Status)
+	}
+
+	// If expired won, completion must have been rejected as conflict
+	if w.Status == "expired" {
+		if compRes.Code != "WAIT_CONFLICT" || compRes.HTTPStatus != http.StatusConflict {
+			t.Errorf("Expected WAIT_CONFLICT when expiry won, got %+v", compRes)
+		}
 	}
 }
 
