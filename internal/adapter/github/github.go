@@ -245,8 +245,39 @@ func (a *Adapter) ProcessVerifiedWebhook(ctx context.Context, secret, signatureH
 		return nil, err
 	}
 
-	completed = true
+	completed = res.Accepted()
 	return res, nil
+}
+
+// Only these HTTP/status pairings are recognized completion outcomes. Unknown
+// or mismatched pairings surface as errors so the delivery stays retryable
+// instead of being silently treated as handled.
+func validCompletionOutcome(httpStatus int, code string) bool {
+	switch {
+	case httpStatus == http.StatusAccepted && code == "WAIT_COMPLETED":
+		return true
+	case httpStatus == http.StatusOK && code == "WAIT_ALREADY_COMPLETED":
+		return true
+	case httpStatus == http.StatusAccepted && code == "WAIT_REJECTED":
+		return true
+	}
+	return false
+}
+
+func validErrorOutcome(httpStatus int, code string) bool {
+	switch {
+	case httpStatus == http.StatusBadRequest && code == "GRAPH_INVALID":
+		return true
+	case httpStatus == http.StatusUnauthorized && code == "UNAUTHORIZED":
+		return true
+	case httpStatus == http.StatusForbidden && code == "POLICY_DENIED":
+		return true
+	case httpStatus == http.StatusNotFound && (code == "WAIT_NOT_FOUND" || code == "RUN_NOT_FOUND"):
+		return true
+	case httpStatus == http.StatusConflict && (code == "WAIT_CONFLICT" || code == "STORE_CONFLICT"):
+		return true
+	}
+	return false
 }
 
 func (a *Adapter) CompleteWait(ctx context.Context, req controller.CompleteWaitRequest) (*controller.CompletionResult, error) {
@@ -314,8 +345,8 @@ func (a *Adapter) CompleteWait(ctx context.Context, req controller.CompleteWaitR
 			if decodeErr != nil {
 				return nil, fmt.Errorf("complete wait: status %d with undecodable error body: %w", resp.StatusCode, decodeErr)
 			}
-			if errResp.Error.Code == "" {
-				return nil, fmt.Errorf("complete wait: status %d error body lacks a typed error code", resp.StatusCode)
+			if !validErrorOutcome(resp.StatusCode, errResp.Error.Code) {
+				return nil, fmt.Errorf("complete wait: unrecognized error outcome %q with status %d", errResp.Error.Code, resp.StatusCode)
 			}
 			result.Code = errResp.Error.Code
 			result.Message = errResp.Error.Message
@@ -335,8 +366,8 @@ func (a *Adapter) CompleteWait(ctx context.Context, req controller.CompleteWaitR
 		if decodeErr != nil {
 			return nil, fmt.Errorf("complete wait: status %d with undecodable success body: %w", resp.StatusCode, decodeErr)
 		}
-		if okResp.Status == "" {
-			return nil, fmt.Errorf("complete wait: status %d success body lacks a typed completion status", resp.StatusCode)
+		if !validCompletionOutcome(resp.StatusCode, okResp.Status) {
+			return nil, fmt.Errorf("complete wait: unrecognized completion outcome %q with status %d", okResp.Status, resp.StatusCode)
 		}
 		result.WaitID = okResp.WaitID
 		result.Code = okResp.Status

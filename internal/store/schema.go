@@ -312,6 +312,9 @@ CREATE INDEX IF NOT EXISTS idx_proposal_target     ON policy_change_proposal(tar
 CREATE UNIQUE INDEX IF NOT EXISTS idx_external_wait_one_pending
   ON external_wait(event_type, correlation_key)
   WHERE status = 'pending';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_external_wait_one_pending_per_node
+  ON external_wait(run_id, run_node_id)
+  WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_external_wait_run
   ON external_wait(run_id, run_node_id, status);
 CREATE INDEX IF NOT EXISTS idx_external_wait_expiry

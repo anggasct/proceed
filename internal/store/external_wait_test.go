@@ -273,31 +273,7 @@ func TestExternalWaitExpiryAndCancellation(t *testing.T) {
 		t.Fatalf("append wait 1: %v", err)
 	}
 
-	// Wait 2 to be cancelled
-	req2, _ := json.Marshal(externalWaitRequestedPayload{
-		WaitID:            waitID2,
-		NodeKey:           "test",
-		EventType:         "deploy.completed",
-		CorrelationKey:    "env=prod",
-		ExpectedCondition: json.RawMessage(`{}`),
-		ExpiresAt:         now + 100000,
-	})
-	_, err = s.Append(ctx, Event{
-		EventID:       ulid.Make().String(),
-		RunID:         runID,
-		Sequence:      3,
-		SchemaVersion: "proceed/v1",
-		Type:          "external_wait_requested",
-		OccurredAt:    now,
-		ActorType:     "controller",
-		ActorID:       "controller",
-		Payload:       string(req2),
-	})
-	if err != nil {
-		t.Fatalf("append wait 2: %v", err)
-	}
-
-	// List expired waits
+	// List expired waits while wait 1 is still pending
 	expired, err := s.ListExpiredExternalWaits(ctx, now)
 	if err != nil {
 		t.Fatalf("ListExpiredExternalWaits: %v", err)
@@ -311,7 +287,7 @@ func TestExternalWaitExpiryAndCancellation(t *testing.T) {
 	_, err = s.Append(ctx, Event{
 		EventID:       ulid.Make().String(),
 		RunID:         runID,
-		Sequence:      4,
+		Sequence:      3,
 		SchemaVersion: "proceed/v1",
 		Type:          "external_wait_expired",
 		OccurredAt:    now + 50,
@@ -326,6 +302,30 @@ func TestExternalWaitExpiryAndCancellation(t *testing.T) {
 	w1, _ := s.GetExternalWait(ctx, waitID1)
 	if w1.Status != "expired" {
 		t.Errorf("w1.Status = %q, want expired", w1.Status)
+	}
+
+	// Wait 2 on the same node only after wait 1 reached a terminal state; to be cancelled
+	req2, _ := json.Marshal(externalWaitRequestedPayload{
+		WaitID:            waitID2,
+		NodeKey:           "test",
+		EventType:         "deploy.completed",
+		CorrelationKey:    "env=prod",
+		ExpectedCondition: json.RawMessage(`{}`),
+		ExpiresAt:         now + 100000,
+	})
+	_, err = s.Append(ctx, Event{
+		EventID:       ulid.Make().String(),
+		RunID:         runID,
+		Sequence:      4,
+		SchemaVersion: "proceed/v1",
+		Type:          "external_wait_requested",
+		OccurredAt:    now,
+		ActorType:     "controller",
+		ActorID:       "controller",
+		Payload:       string(req2),
+	})
+	if err != nil {
+		t.Fatalf("append wait 2: %v", err)
 	}
 
 	// Cancel wait 2

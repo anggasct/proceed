@@ -1122,6 +1122,120 @@ edges:
 	}
 }
 
+// A run node can hold at most one pending wait; a second registration is
+// rejected and cannot double-finish the node or traverse edges twice
+func TestExternalWaitOnePendingWaitPerNode(t *testing.T) {
+	ctx := context.Background()
+	graphYAML := `schema: proceed/v1
+name: test-one-wait-per-node
+nodes:
+  - id: wait_ci
+    type: task
+    contract: pure
+    executor:
+      kind: shell
+      command: ["echo", "wait"]
+  - id: next_step
+    type: task
+    contract: pure
+    terminal: true
+    executor:
+      kind: shell
+      command: ["echo", "next"]
+edges:
+  - { from: wait_ci, to: next_step, type: routes_to, when: success }
+`
+	st, _, runID := openTestStoreWithGraph(t, graphYAML)
+	pool := map[executor.Kind]executor.Executor{
+		executor.Shell: &testShellExecutor{},
+	}
+	ctrl := newTestController(t, st, pool, "ctrl-1")
+
+	waitA := ulid.Make().String()
+	corrA := "repo=org/pernode;pr=40;head=sha256:pn1"
+	if _, err := ctrl.RegisterExternalWait(ctx, ExternalWaitRequest{
+		RunID:             runID,
+		NodeKey:           "wait_ci",
+		EventType:         "ci.completed",
+		CorrelationKey:    corrA,
+		ExpectedCondition: `{"status":"success"}`,
+		WaitID:            waitA,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second wait with a distinct event identity on the same node is rejected
+	waitB := ulid.Make().String()
+	_, err := ctrl.RegisterExternalWait(ctx, ExternalWaitRequest{
+		RunID:          runID,
+		NodeKey:        "wait_ci",
+		EventType:      "deployment.finished",
+		CorrelationKey: "repo=org/pernode;env=prod",
+		WaitID:         waitB,
+	})
+	if err == nil {
+		t.Fatalf("expected error registering a second pending wait on the same node")
+	}
+	if w, _ := st.GetExternalWait(ctx, waitB); w != nil {
+		t.Errorf("second wait row must not exist: %+v", w)
+	}
+
+	// Completing the surviving wait and the phantom second wait yields one
+	// accepted completion, one node finish, and one downstream traversal
+	resA, err := ctrl.CompleteExternalWait(ctx, CompleteWaitRequest{
+		WaitID:          waitA,
+		ProviderEventID: "github:check_run:pernode_a",
+		EventType:       "ci.completed",
+		Source:          "github",
+		CorrelationKey:  corrA,
+		OccurredAt:      time.Now().UnixMilli(),
+		Status:          "success",
+		PayloadDigest:   "sha256:" + hexDigest("{}"),
+		Payload:         json.RawMessage("{}"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resA.Code != "WAIT_COMPLETED" {
+		t.Fatalf("resA = %+v, want WAIT_COMPLETED", resA)
+	}
+
+	resB, err := ctrl.CompleteExternalWait(ctx, CompleteWaitRequest{
+		WaitID:          waitB,
+		ProviderEventID: "github:deployment:pernode_b",
+		EventType:       "deployment.finished",
+		Source:          "github",
+		CorrelationKey:  "repo=org/pernode;env=prod",
+		OccurredAt:      time.Now().UnixMilli(),
+		Status:          "success",
+		PayloadDigest:   "sha256:" + hexDigest("{}"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resB.Code != "WAIT_NOT_FOUND" {
+		t.Errorf("resB = %+v, want WAIT_NOT_FOUND", resB)
+	}
+
+	for _, tc := range []struct {
+		typ  string
+		want int
+	}{
+		{"external_wait_completed", 1},
+		{"node_finished", 1},
+		{"edge_traversed", 1},
+	} {
+		var count int
+		if err := st.DB().QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM event WHERE run_id = ? AND type = ?", runID, tc.typ).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != tc.want {
+			t.Errorf("%s count = %d, want %d", tc.typ, count, tc.want)
+		}
+	}
+}
+
 type testShellExecutor struct{}
 
 func (e *testShellExecutor) Kind() executor.Kind { return executor.Shell }

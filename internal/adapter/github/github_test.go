@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -502,6 +503,156 @@ func TestProcessVerifiedWebhookMalformedResponseRetryable(t *testing.T) {
 func hexDigestOf(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
+}
+
+// Only recognized HTTP/status pairings are accepted as typed outcomes; unknown
+// outcomes surface errors and stay retryable
+func TestCompleteWaitValidatesOutcomeCodes(t *testing.T) {
+	ctx := context.Background()
+	type response struct {
+		status int
+		body   string
+	}
+	cases := []struct {
+		name     string
+		response response
+		wantErr  bool
+		wantCode string
+	}{
+		{"accepted completion", response{http.StatusAccepted, `{"wait_id":"w","status":"WAIT_COMPLETED"}`}, false, "WAIT_COMPLETED"},
+		{"idempotent duplicate", response{http.StatusOK, `{"wait_id":"w","status":"WAIT_ALREADY_COMPLETED"}`}, false, "WAIT_ALREADY_COMPLETED"},
+		{"typed rejection", response{http.StatusAccepted, `{"wait_id":"w","status":"WAIT_REJECTED"}`}, false, "WAIT_REJECTED"},
+		{"typed conflict", response{http.StatusConflict, `{"error":{"code":"WAIT_CONFLICT","message":"stale"}}`}, false, "WAIT_CONFLICT"},
+		{"typed not found", response{http.StatusNotFound, `{"error":{"code":"WAIT_NOT_FOUND","message":"nope"}}`}, false, "WAIT_NOT_FOUND"},
+		{"unknown success status", response{http.StatusAccepted, `{"wait_id":"w","status":"GREAT_SUCCESS"}`}, true, ""},
+		{"mismatched pairing", response{http.StatusOK, `{"wait_id":"w","status":"WAIT_COMPLETED"}`}, true, ""},
+		{"success body with error code", response{http.StatusAccepted, `{"status":"WAIT_CONFLICT"}`}, true, ""},
+		{"unknown error code", response{http.StatusBadRequest, `{"error":{"code":"MYSTERY","message":"?"}}`}, true, ""},
+		{"error code with wrong status", response{http.StatusTeapot, `{"error":{"code":"WAIT_CONFLICT","message":"?"}}`}, true, ""},
+	}
+
+	for i, tc := range cases {
+		mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(tc.response.status)
+			_, _ = w.Write([]byte(tc.response.body))
+		}))
+		adapter := NewAdapter(mockServer.URL, "token")
+		req := controller.CompleteWaitRequest{
+			WaitID:          "wait-outcome-" + strconv.Itoa(i),
+			ProviderEventID: "github:check_run:outcome_" + strconv.Itoa(i),
+			EventType:       "ci.completed",
+			Source:          "github",
+			CorrelationKey:  "repo=org/app;pr=9;head=sha256:outc1",
+			OccurredAt:      time.Now().UnixMilli(),
+			Status:          "success",
+			PayloadDigest:   "sha256:" + hexDigestOf("{}"),
+			Payload:         json.RawMessage("{}"),
+		}
+		res, err := adapter.CompleteWait(ctx, req)
+		mockServer.Close()
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("%s: expected error, got %+v", tc.name, res)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: unexpected error: %v", tc.name, err)
+			continue
+		}
+		if res.Code != tc.wantCode {
+			t.Errorf("%s: res.Code = %q, want %q", tc.name, res.Code, tc.wantCode)
+		}
+	}
+}
+
+// A typed but non-accepted outcome must not mark the delivery completed; the
+// same delivery stays retryable until an accepted outcome arrives
+func TestProcessVerifiedWebhookNonAcceptedOutcomeStaysRetryable(t *testing.T) {
+	ctx := context.Background()
+	var mode int32
+	modeRejected, modeNotFound, modeAccepted, modeReplay := int32(0), int32(1), int32(2), int32(3)
+	var acceptedCalls int32
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch atomic.LoadInt32(&mode) {
+		case modeRejected:
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"wait_id":"w","status":"WAIT_REJECTED","message":"condition unsatisfied"}`))
+		case modeNotFound:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"code":"WAIT_NOT_FOUND","message":"unknown wait"}}`))
+		case modeAccepted:
+			atomic.AddInt32(&acceptedCalls, 1)
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"wait_id":"w","status":"WAIT_COMPLETED"}`))
+		default:
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"wait_id":"w","status":"WAIT_ALREADY_COMPLETED"}`))
+		}
+	}))
+	defer mockServer.Close()
+
+	adapter := NewAdapter(mockServer.URL, "token")
+
+	secret := "webhook-secret-outcome"
+	deliveryID := "gh-delivery-uuid-outcome-001"
+	rawPayload := []byte(`{
+		"action": "completed",
+		"check_run": {
+			"id": 81001,
+			"name": "build",
+			"head_sha": "sha256:outc_sha",
+			"status": "completed",
+			"conclusion": "success",
+			"pull_requests": [{"number": 9}]
+		},
+		"repository": {"full_name": "org/repo"}
+	}`)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(rawPayload)
+	validSig := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+
+	// WAIT_REJECTED is a typed outcome but not an accepted completion
+	atomic.StoreInt32(&mode, modeRejected)
+	res, err := adapter.ProcessVerifiedWebhook(ctx, secret, validSig, deliveryID, rawPayload, "wait-outcome-1", 0)
+	if err != nil {
+		t.Fatalf("rejected outcome: %v", err)
+	}
+	if res.Code != "WAIT_REJECTED" || res.Accepted() {
+		t.Fatalf("res = %+v, want non-accepted WAIT_REJECTED", res)
+	}
+
+	// WAIT_NOT_FOUND likewise leaves the delivery retryable
+	atomic.StoreInt32(&mode, modeNotFound)
+	res, err = adapter.ProcessVerifiedWebhook(ctx, secret, validSig, deliveryID, rawPayload, "wait-outcome-1", 0)
+	if err != nil {
+		t.Fatalf("not-found outcome: %v", err)
+	}
+	if res.Code != "WAIT_NOT_FOUND" || res.Accepted() {
+		t.Fatalf("res = %+v, want non-accepted WAIT_NOT_FOUND", res)
+	}
+
+	// The same delivery still reaches the API and completes exactly once
+	atomic.StoreInt32(&mode, modeAccepted)
+	res, err = adapter.ProcessVerifiedWebhook(ctx, secret, validSig, deliveryID, rawPayload, "wait-outcome-1", 0)
+	if err != nil {
+		t.Fatalf("accepted outcome after rejections: %v", err)
+	}
+	if res.Code != "WAIT_COMPLETED" || !res.Accepted() {
+		t.Fatalf("res = %+v, want WAIT_COMPLETED", res)
+	}
+
+	// Once accepted, the delivery is replay-protected (idempotent duplicate class)
+	atomic.StoreInt32(&mode, modeReplay)
+	res, err = adapter.ProcessVerifiedWebhook(ctx, secret, validSig, deliveryID, rawPayload, "wait-outcome-1", 0)
+	if err == nil {
+		t.Fatalf("expected replay rejection after accepted outcome, got %+v", res)
+	}
+
+	if atomic.LoadInt32(&acceptedCalls) != 1 {
+		t.Errorf("acceptedCalls = %d, want 1", acceptedCalls)
+	}
 }
 
 // Full GitHub CI fixture

@@ -123,7 +123,7 @@ func TestAPICompleteWaitAuthAndCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	payloadJSON := `{"conclusion":"success","safe_key":"ok"}`
+	payloadJSON := `{"conclusion":"success"}`
 	body := controller.CompleteWaitRequest{
 		ProviderEventID: "github:check_run:5555",
 		EventType:       "ci.completed",
@@ -199,8 +199,8 @@ func TestAPICompleteWaitAuthAndCompletion(t *testing.T) {
 	}
 }
 
-// Proves sensitive fields (secret_token, api_key, password) are redacted before storage and absent in event log
-func TestAPICompleteWaitRedactsSecrets(t *testing.T) {
+// Proves payloads carrying secret fields are rejected outright and secret values never reach the event log
+func TestAPICompleteWaitRejectsSecretPayloads(t *testing.T) {
 	ctx := context.Background()
 	srv, st, ctrl, runID, _ := setupAPITestServer(t)
 
@@ -222,15 +222,11 @@ func TestAPICompleteWaitRedactsSecrets(t *testing.T) {
 
 	secretSentinel1 := "super-secret-token-value-XYZ"
 	secretSentinel2 := "super-private-key-12345"
-	rawPayloadMap := map[string]any{
-		"conclusion":   "success",
-		"secret_token": secretSentinel1,
-		"nested": map[string]any{
-			"api_key":    secretSentinel2,
-			"safe_field": "visible_data",
-		},
-	}
-	rawPayloadBytes, _ := json.Marshal(rawPayloadMap)
+	rawPayload := fmt.Sprintf(`{
+		"conclusion": "success",
+		"secret_token": %q,
+		"nested": {"api_key": %q, "check_name": "build"}
+	}`, secretSentinel1, secretSentinel2)
 
 	body := controller.CompleteWaitRequest{
 		WaitID:          waitID,
@@ -240,8 +236,8 @@ func TestAPICompleteWaitRedactsSecrets(t *testing.T) {
 		CorrelationKey:  corrKey,
 		OccurredAt:      time.Now().UnixMilli(),
 		Status:          "success",
-		PayloadDigest:   "sha256:" + hexDigest(string(rawPayloadBytes)),
-		Payload:         rawPayloadBytes,
+		PayloadDigest:   "sha256:" + hexDigest(rawPayload),
+		Payload:         json.RawMessage(rawPayload),
 	}
 	bodyBytes, _ := json.Marshal(body)
 
@@ -249,40 +245,21 @@ func TestAPICompleteWaitRedactsSecrets(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer event-secret-token")
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want 202. Body: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400. Body: %s", rec.Code, rec.Body.String())
 	}
 
-	// Query all event payloads from the database
-	rows, err := st.DB().QueryContext(ctx, "SELECT payload FROM event WHERE run_id = ?", runID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
+	assertNoEventContains(t, st, ctx, runID, secretSentinel1, secretSentinel2)
 
-	var sawRedacted bool
-	for rows.Next() {
-		var payloadStr string
-		if err := rows.Scan(&payloadStr); err != nil {
-			t.Fatal(err)
-		}
-		if strings.Contains(payloadStr, secretSentinel1) {
-			t.Fatalf("Found raw secretSentinel1 %q in event payload: %s", secretSentinel1, payloadStr)
-		}
-		if strings.Contains(payloadStr, secretSentinel2) {
-			t.Fatalf("Found raw secretSentinel2 %q in event payload: %s", secretSentinel2, payloadStr)
-		}
-		if strings.Contains(payloadStr, "[REDACTED]") {
-			sawRedacted = true
-		}
-	}
-	if !sawRedacted {
-		t.Fatalf("Expected to find [REDACTED] in stored event payloads, but did not")
+	w, _ := st.GetExternalWait(ctx, waitID)
+	if w == nil || w.Status != "pending" {
+		t.Fatalf("wait must remain pending after payload rejection, got %+v", w)
 	}
 }
 
-// Proves credential-shaped values are redacted even under innocuous keys like metadata or log
-func TestAPICompleteWaitRedactsSecretValuesUnderPlainKeys(t *testing.T) {
+// Proves a secret sentinel under an innocuous key that matches no credential
+// pattern is still rejected and absent from every persisted event payload
+func TestAPICompleteWaitRejectsUnprovablePayloadFields(t *testing.T) {
 	ctx := context.Background()
 	srv, st, ctrl, runID, _ := setupAPITestServer(t)
 
@@ -302,72 +279,62 @@ func TestAPICompleteWaitRedactsSecretValuesUnderPlainKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	githubToken := "ghp_AbCdEf0123456789BaSe64ToKeN"
-	bearerValue := "Bearer sx-JkRmVhbYW5kb21vbWNoYQ"
-	patToken := "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz0123456789B"
-	rawPayloadMap := map[string]any{
-		"conclusion": "success",
-		"metadata":   githubToken,
-		"log": map[string]any{
-			"output": bearerValue,
-			"line":   "build finished",
-		},
-		"details": map[string]any{
-			"build": patToken,
-		},
-	}
-	rawPayloadBytes, _ := json.Marshal(rawPayloadMap)
+	innocuousSentinel := "hunter2-my-plain-phrase-secret"
+	credentialSentinel := "ghp_AbCdEf0123456789BaSe64ToKeN"
 
-	body := controller.CompleteWaitRequest{
-		WaitID:          waitID,
-		ProviderEventID: "github:check_run:sec_778",
-		EventType:       "ci.completed",
-		Source:          "github",
-		CorrelationKey:  corrKey,
-		OccurredAt:      time.Now().UnixMilli(),
-		Status:          "success",
-		PayloadDigest:   "sha256:" + hexDigest(string(rawPayloadBytes)),
-		Payload:         rawPayloadBytes,
+	cases := []struct {
+		name    string
+		payload string
+	}{
+		{"innocuous key with plain secret", fmt.Sprintf(`{"metadata": %q}`, innocuousSentinel)},
+		{"log output with plain secret", fmt.Sprintf(`{"log": %q}`, innocuousSentinel)},
+		{"allowlisted field with credential value", fmt.Sprintf(`{"check_name": %q}`, credentialSentinel)},
+		{"array root", `[1,2,3]`},
+		{"scalar root", `"just a string"`},
+		{"oversized string", `{"check_name": "` + strings.Repeat("x", 5000) + `"}`},
 	}
-	bodyBytes, _ := json.Marshal(body)
-
-	req := httptest.NewRequest(http.MethodPost, "/v1/waits/"+waitID+"/complete", bytes.NewReader(bodyBytes))
-	req.Header.Set("Authorization", "Bearer event-secret-token")
-	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want 202. Body: %s", rec.Code, rec.Body.String())
+	for i, tc := range cases {
+		body := controller.CompleteWaitRequest{
+			WaitID:          waitID,
+			ProviderEventID: fmt.Sprintf("github:check_run:unprov_%d", i),
+			EventType:       "ci.completed",
+			Source:          "github",
+			CorrelationKey:  corrKey,
+			OccurredAt:      time.Now().UnixMilli(),
+			Status:          "success",
+			PayloadDigest:   "sha256:" + hexDigest(tc.payload),
+			Payload:         json.RawMessage(tc.payload),
+		}
+		bodyBytes, _ := json.Marshal(body)
+		req := httptest.NewRequest(http.MethodPost, "/v1/waits/"+waitID+"/complete", bytes.NewReader(bodyBytes))
+		req.Header.Set("Authorization", "Bearer event-secret-token")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400. Body: %s", tc.name, rec.Code, rec.Body.String())
+		}
 	}
 
+	assertNoEventContains(t, st, ctx, runID, innocuousSentinel, credentialSentinel)
+}
+
+func assertNoEventContains(t *testing.T, st *store.Store, ctx context.Context, runID string, sentinels ...string) {
+	t.Helper()
 	rows, err := st.DB().QueryContext(ctx, "SELECT payload FROM event WHERE run_id = ?", runID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rows.Close()
-
-	var sawRedacted, sawSafeValue bool
 	for rows.Next() {
 		var payloadStr string
 		if err := rows.Scan(&payloadStr); err != nil {
 			t.Fatal(err)
 		}
-		for _, sentinel := range []string{githubToken, bearerValue, patToken} {
+		for _, sentinel := range sentinels {
 			if strings.Contains(payloadStr, sentinel) {
-				t.Fatalf("Found raw secret %q in event payload: %s", sentinel, payloadStr)
+				t.Fatalf("Found sentinel %q in persisted event payload: %s", sentinel, payloadStr)
 			}
 		}
-		if strings.Contains(payloadStr, "[REDACTED]") {
-			sawRedacted = true
-		}
-		if strings.Contains(payloadStr, "build finished") {
-			sawSafeValue = true
-		}
-	}
-	if !sawRedacted {
-		t.Fatalf("Expected [REDACTED] in stored event payloads")
-	}
-	if !sawSafeValue {
-		t.Fatalf("Expected non-sensitive value to survive redaction")
 	}
 }
 

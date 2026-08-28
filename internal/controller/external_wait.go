@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"regexp"
 	"strings"
@@ -48,6 +49,12 @@ type CompletionResult struct {
 	RunID      string         `json:"run_id,omitempty"`
 	NodeKey    string         `json:"node_key,omitempty"`
 	Details    map[string]any `json:"details,omitempty"`
+}
+
+// Accepted reports whether the outcome resolved the wait. Every other typed
+// outcome leaves the delivery retryable at the provider boundary.
+func (r *CompletionResult) Accepted() bool {
+	return r != nil && (r.Code == "WAIT_COMPLETED" || r.Code == "WAIT_ALREADY_COMPLETED")
 }
 
 func isTerminalNodeStatus(status string) bool {
@@ -126,6 +133,17 @@ VALUES (?, ?, ?, 'waiting', 0) ON CONFLICT(run_id, node_key) DO NOTHING`,
 				"node %s is %s, cannot register external wait", req.NodeKey, nodeStatus)
 		}
 
+		var pendingForNode int
+		if err := tx.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM external_wait WHERE run_node_id = ? AND status = 'pending' AND id <> ?",
+			nodeID, req.WaitID).Scan(&pendingForNode); err != nil {
+			return err
+		}
+		if pendingForNode > 0 {
+			return store.NewCodeError(store.CodeStoreConflict,
+				"node %s already has a pending external wait", req.NodeKey)
+		}
+
 		waitPayload := map[string]any{
 			"wait_id":            req.WaitID,
 			"node_key":           req.NodeKey,
@@ -172,16 +190,15 @@ VALUES (?, ?, ?, 'waiting', 0) ON CONFLICT(run_id, node_key) DO NOTHING`,
 	return c.store.GetExternalWait(ctx, req.WaitID)
 }
 
-var sensitiveKeyPatterns = []string{
-	"secret", "token", "password", "passwd", "auth", "key", "credential", "bearer", "private", "cert", "signature",
-}
-
+// Credential-shaped values are rejected even inside allowlisted fields: a
+// normalized provider field carrying a verifiable secret form is not provably
+// safe to persist.
 var sensitiveValuePatterns = []*regexp.Regexp{
 	regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----`),
 	regexp.MustCompile(`(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{16,}`),
 	regexp.MustCompile(`github_pat_[A-Za-z0-9_]{20,}`),
 	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{20,}`),
-	regexp.MustCompile(`sk-(ant-)?[A-Za-z0-9_-]{20,}`),
+	regexp.MustCompile(`sk-(ant-)?[A-Za-z0-9]{40,}`),
 	regexp.MustCompile(`(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}`),
 	regexp.MustCompile(`xox[baprs]-[A-Za-z0-9-]{10,}`),
 	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
@@ -190,22 +207,26 @@ var sensitiveValuePatterns = []*regexp.Regexp{
 }
 
 const (
-	maxPayloadDepth    = 6
-	maxPayloadEntries  = 128
-	maxPayloadString   = 4096
-	maxPayloadKeyChars = 128
+	maxPayloadStringLen     = 256
+	maxPayloadURLLen        = 2048
+	maxPayloadKeyLen        = 128
+	maxRequiredCheckEntries = 64
+	maxPayloadNumber        = 1e15
 )
 
-var payloadKeyPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
-
-func isSensitiveKey(k string) bool {
-	lower := strings.ToLower(k)
-	for _, p := range sensitiveKeyPatterns {
-		if strings.Contains(lower, p) {
-			return true
-		}
-	}
-	return false
+// The completion payload admits only these normalized provider fields. Any
+// other field is rejected before hashing or persistence: its safety cannot be
+// proven and it is not part of the normalized contract.
+var allowedConclusionValues = map[string]bool{
+	"success":         true,
+	"failure":         true,
+	"neutral":         true,
+	"skipped":         true,
+	"cancelled":       true,
+	"timed_out":       true,
+	"action_required": true,
+	"startup_failure": true,
+	"stale":           true,
 }
 
 func isSensitiveValue(v string) bool {
@@ -217,69 +238,86 @@ func isSensitiveValue(v string) bool {
 	return false
 }
 
-func validateNormalizedPayload(v any, depth int) error {
-	if depth > maxPayloadDepth {
-		return fmt.Errorf("nesting deeper than %d levels", maxPayloadDepth)
+func hasControlChars(s string) bool {
+	return strings.ContainsFunc(s, func(r rune) bool { return r < 0x20 || r == 0x7f })
+}
+
+func normalizedStringField(field string, v any, maxLen int) error {
+	s, ok := v.(string)
+	if !ok {
+		return fmt.Errorf("field %q must be a string", field)
 	}
-	switch val := v.(type) {
-	case map[string]any:
-		if len(val) > maxPayloadEntries {
-			return fmt.Errorf("more than %d keys in one object", maxPayloadEntries)
-		}
-		for k, item := range val {
-			if len(k) > maxPayloadKeyChars || !payloadKeyPattern.MatchString(k) {
-				return fmt.Errorf("key %q is not an allowed normalized field name", k)
-			}
-			if err := validateNormalizedPayload(item, depth+1); err != nil {
-				return err
-			}
-		}
-	case []any:
-		if len(val) > maxPayloadEntries {
-			return fmt.Errorf("more than %d entries in one array", maxPayloadEntries)
-		}
-		for _, item := range val {
-			if err := validateNormalizedPayload(item, depth+1); err != nil {
-				return err
-			}
-		}
-	case string:
-		if len(val) > maxPayloadString {
-			return fmt.Errorf("string value exceeds %d characters", maxPayloadString)
-		}
-	case float64, bool, nil:
-	default:
-		return fmt.Errorf("value type %T is not supported", v)
+	if len(s) == 0 || len(s) > maxLen || hasControlChars(s) {
+		return fmt.Errorf("field %q is not a bounded normalized string", field)
+	}
+	if isSensitiveValue(s) {
+		return fmt.Errorf("field %q carries a credential-shaped value", field)
 	}
 	return nil
 }
 
-func redactSensitive(v any) any {
-	switch val := v.(type) {
-	case map[string]any:
-		cleaned := make(map[string]any, len(val))
-		for k, item := range val {
-			if isSensitiveKey(k) {
-				cleaned[k] = "[REDACTED]"
-			} else {
-				cleaned[k] = redactSensitive(item)
-			}
-		}
-		return cleaned
-	case []any:
-		cleaned := make([]any, len(val))
-		for i, item := range val {
-			cleaned[i] = redactSensitive(item)
-		}
-		return cleaned
-	case string:
-		if isSensitiveValue(val) {
-			return "[REDACTED]"
-		}
-		return val
-	default:
-		return val
+func normalizedNumberField(field string, v any) error {
+	n, ok := v.(float64)
+	if !ok || n != math.Trunc(n) || n < 0 || n > maxPayloadNumber {
+		return fmt.Errorf("field %q must be a non-negative integer", field)
 	}
+	return nil
+}
+
+func validateNormalizedPayload(v any) error {
+	root, ok := v.(map[string]any)
+	if !ok {
+		return fmt.Errorf("payload must be a JSON object of normalized provider fields")
+	}
+	if len(root) > maxRequiredCheckEntries {
+		return fmt.Errorf("payload exceeds %d fields", maxRequiredCheckEntries)
+	}
+	for k, val := range root {
+		switch k {
+		case "repository", "head_sha", "check_name":
+			if err := normalizedStringField(k, val, maxPayloadStringLen); err != nil {
+				return err
+			}
+		case "url":
+			s, ok := val.(string)
+			if !ok {
+				return fmt.Errorf("field %q must be a string", k)
+			}
+			if len(s) > maxPayloadURLLen || hasControlChars(s) || strings.ContainsAny(s, " \t@") ||
+				!(strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")) {
+				return fmt.Errorf("field %q is not a bounded normalized URL", k)
+			}
+		case "pull_request", "check_run_id", "started_at", "completed_at":
+			if err := normalizedNumberField(k, val); err != nil {
+				return err
+			}
+		case "conclusion":
+			s, ok := val.(string)
+			if !ok || !allowedConclusionValues[s] {
+				return fmt.Errorf("field %q must be a known provider conclusion", k)
+			}
+		case "required_checks":
+			m, ok := val.(map[string]any)
+			if !ok {
+				return fmt.Errorf("field %q must be an object", k)
+			}
+			if len(m) > maxRequiredCheckEntries {
+				return fmt.Errorf("field %q exceeds %d entries", k, maxRequiredCheckEntries)
+			}
+			for name, conclusion := range m {
+				if len(name) == 0 || len(name) > maxPayloadKeyLen || hasControlChars(name) {
+					return fmt.Errorf("field %q has a non-normalized check name", k)
+				}
+				s, ok := conclusion.(string)
+				if !ok || !allowedConclusionValues[s] {
+					return fmt.Errorf("field %q has a non-conclusion value for check %q", k, name)
+				}
+			}
+		default:
+			return fmt.Errorf("field %q is not part of the normalized payload contract", k)
+		}
+	}
+	return nil
 }
 
 func (c *Controller) CompleteExternalWait(ctx context.Context, req CompleteWaitRequest) (*CompletionResult, error) {
@@ -289,38 +327,43 @@ func (c *Controller) CompleteExternalWait(ctx context.Context, req CompleteWaitR
 	if req.ProviderEventID == "" || req.EventType == "" || req.Source == "" || req.CorrelationKey == "" || req.Status == "" || req.PayloadDigest == "" {
 		return nil, store.NewCodeError(store.CodeGraphInvalid, "provider_event_id, event_type, source, correlation_key, status, and payload_digest are required")
 	}
+	for field, value := range map[string]string{
+		"provider_event_id": req.ProviderEventID,
+		"event_type":        req.EventType,
+		"source":            req.Source,
+		"correlation_key":   req.CorrelationKey,
+		"status":            req.Status,
+		"payload_digest":    req.PayloadDigest,
+	} {
+		if len(value) > 512 || hasControlChars(value) {
+			return nil, store.NewCodeError(store.CodeGraphInvalid, "%s must be a bounded single-line string", field)
+		}
+	}
 
-	// 1. Parse, validate, and sanitize payload to prevent persisting sensitive values
+	// 1. Payload must be a proven-safe allowlisted normalized object before
+	// hashing or persistence; anything unprovable is rejected outright.
 	var rawParsed any
 	if len(req.Payload) > 0 {
 		if err := json.Unmarshal(req.Payload, &rawParsed); err != nil {
 			return nil, store.NewCodeError(store.CodeGraphInvalid, "payload must be valid JSON: %v", err)
 		}
-		if _, ok := rawParsed.(map[string]any); !ok {
-			return nil, store.NewCodeError(store.CodeGraphInvalid, "payload must be a JSON object of normalized provider fields")
-		}
-		if err := validateNormalizedPayload(rawParsed, 0); err != nil {
-			return nil, store.NewCodeError(store.CodeGraphInvalid, "payload is not a bounded normalized object: %v", err)
-		}
 	} else {
 		rawParsed = map[string]any{}
+	}
+	if err := validateNormalizedPayload(rawParsed); err != nil {
+		return nil, store.NewCodeError(store.CodeGraphInvalid, "payload rejected: %v", err)
 	}
 
 	rawCanonicalBytes, _ := json.Marshal(rawParsed)
 	rawDigest := hexDigest(string(rawCanonicalBytes))
 
-	sanitizedParsed := redactSensitive(rawParsed)
-	sanitizedCanonicalBytes, _ := json.Marshal(sanitizedParsed)
-	sanitizedDigest := hexDigest(string(sanitizedCanonicalBytes))
-
 	normDigest := normalizeDigest(req.PayloadDigest)
-	if normDigest != rawDigest && normDigest != "sha256:"+rawDigest &&
-		normDigest != sanitizedDigest && normDigest != "sha256:"+sanitizedDigest {
+	if normDigest != rawDigest && normDigest != "sha256:"+rawDigest {
 		return nil, store.NewCodeError(store.CodeGraphInvalid, "payload_digest %s does not match payload (computed sha256:%s)", req.PayloadDigest, rawDigest)
 	}
 
-	persistedPayloadBytes := sanitizedCanonicalBytes
-	persistedDigest := "sha256:" + sanitizedDigest
+	persistedPayloadBytes := rawCanonicalBytes
+	persistedDigest := "sha256:" + rawDigest
 
 	var result CompletionResult
 	nowMs := time.Now().UnixMilli()
@@ -457,7 +500,7 @@ FROM external_wait WHERE id = ?`, req.WaitID).
 		}
 
 		// E. Evaluate the declared expected condition before accepting.
-		satisfied, hasPredicate := evaluateExpectedCondition(wait.ExpectedCond, req.Status, sanitizedParsed)
+		satisfied, hasPredicate := evaluateExpectedCondition(wait.ExpectedCond, req.Status, rawParsed)
 		route := req.Status
 		if hasPredicate {
 			if satisfied {
@@ -539,10 +582,10 @@ FROM external_wait WHERE id = ?`, req.WaitID).
 			"SELECT attempt_count FROM run_node WHERE id = ?", wait.RunNodeID).Scan(&attemptCount)
 
 		var outputMap map[string]any
-		if m, ok := sanitizedParsed.(map[string]any); ok {
+		if m, ok := rawParsed.(map[string]any); ok {
 			outputMap = m
 		} else {
-			outputMap = map[string]any{"payload": sanitizedParsed}
+			outputMap = map[string]any{"payload": rawParsed}
 		}
 
 		nodeResult := &executor.Result{
