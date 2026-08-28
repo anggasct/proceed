@@ -263,6 +263,84 @@ func TestAdapterRetryOnTransientFailure(t *testing.T) {
 	}
 }
 
+// Webhook delivery outage recovery allows resubmission of the same delivery ID and completes exactly once
+func TestProcessVerifiedWebhookRetryAfterOutage(t *testing.T) {
+	ctx := context.Background()
+	var serviceAvailable int32
+	var completionCalls int32
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.LoadInt32(&serviceAvailable) == 0 {
+			http.Error(w, `{"error":{"code":"SERVICE_UNAVAILABLE","message":"server down"}}`, http.StatusServiceUnavailable)
+			return
+		}
+
+		atomic.AddInt32(&completionCalls, 1)
+		var req controller.CompleteWaitRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"wait_id": req.WaitID,
+			"status":  "WAIT_COMPLETED",
+		})
+	}))
+	defer mockServer.Close()
+
+	adapter := NewAdapter(mockServer.URL, "token")
+	adapter.MaxRetries = 2
+	adapter.BackoffBase = 5 * time.Millisecond
+
+	secret := "test-secret-123"
+	deliveryID := "gh-delivery-uuid-outage-001"
+	rawPayload := []byte(`{
+		"action": "completed",
+		"check_run": {
+			"id": 88001,
+			"name": "build",
+			"head_sha": "sha256:abc1234",
+			"status": "completed",
+			"conclusion": "success",
+			"pull_requests": [{"number": 10}]
+		},
+		"repository": {
+			"full_name": "org/repo"
+		}
+	}`)
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(rawPayload)
+	validSig := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+
+	// 1. Initial attempt fails due to service outage (all retries exhausted)
+	_, err := adapter.ProcessVerifiedWebhook(ctx, secret, validSig, deliveryID, rawPayload, "wait-outage-1", 0)
+	if err == nil {
+		t.Fatalf("expected initial delivery to fail during outage, got nil")
+	}
+
+	// 2. Service recovers
+	atomic.StoreInt32(&serviceAvailable, 1)
+
+	// 3. Resubmit exact same signed payload and delivery ID -> must succeed and complete
+	res, err := adapter.ProcessVerifiedWebhook(ctx, secret, validSig, deliveryID, rawPayload, "wait-outage-1", 0)
+	if err != nil {
+		t.Fatalf("ProcessVerifiedWebhook failed after service recovery: %v", err)
+	}
+	if res.Code != "WAIT_COMPLETED" || res.HTTPStatus != 202 {
+		t.Errorf("res = %+v, want WAIT_COMPLETED (202)", res)
+	}
+
+	if atomic.LoadInt32(&completionCalls) != 1 {
+		t.Errorf("completionCalls = %d, want 1", completionCalls)
+	}
+
+	// 4. Subsequent submission of the same delivery ID is rejected as replay
+	_, err = adapter.ProcessVerifiedWebhook(ctx, secret, validSig, deliveryID, rawPayload, "wait-outage-1", 0)
+	if err == nil {
+		t.Fatalf("expected replay rejection for already completed delivery ID, got nil")
+	}
+}
+
 // Full GitHub CI fixture
 // Maps completed required-check to wait, routes success to merge node, routes failure to fix node, rejects older head SHA
 func TestGitHubAdapterIntegration(t *testing.T) {

@@ -123,9 +123,10 @@ func NormalizeCheckRun(event *CheckRunEvent, waitID string, prOverride int64) (*
 }
 
 type DeliveryTracker struct {
-	mu   sync.Mutex
-	seen map[string]time.Time
-	ttl  time.Duration
+	mu        sync.Mutex
+	completed map[string]time.Time
+	inFlight  map[string]time.Time
+	ttl       time.Duration
 }
 
 func NewDeliveryTracker(ttl time.Duration) *DeliveryTracker {
@@ -133,28 +134,55 @@ func NewDeliveryTracker(ttl time.Duration) *DeliveryTracker {
 		ttl = 1 * time.Hour
 	}
 	return &DeliveryTracker{
-		seen: make(map[string]time.Time),
-		ttl:  ttl,
+		completed: make(map[string]time.Time),
+		inFlight:  make(map[string]time.Time),
+		ttl:       ttl,
 	}
 }
 
-func (dt *DeliveryTracker) CheckAndRecord(deliveryID string) bool {
+func (dt *DeliveryTracker) Begin(deliveryID string) (func(bool), bool) {
 	if deliveryID == "" {
-		return false
+		return nil, false
 	}
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
 
 	now := time.Now()
-	for id, t := range dt.seen {
+	for id, t := range dt.completed {
 		if now.Sub(t) > dt.ttl {
-			delete(dt.seen, id)
+			delete(dt.completed, id)
 		}
 	}
-	if _, exists := dt.seen[deliveryID]; exists {
+	for id, t := range dt.inFlight {
+		if now.Sub(t) > dt.ttl {
+			delete(dt.inFlight, id)
+		}
+	}
+	if _, exists := dt.completed[deliveryID]; exists {
+		return nil, false
+	}
+	if _, exists := dt.inFlight[deliveryID]; exists {
+		return nil, false
+	}
+	dt.inFlight[deliveryID] = now
+
+	done := func(completed bool) {
+		dt.mu.Lock()
+		defer dt.mu.Unlock()
+		delete(dt.inFlight, deliveryID)
+		if completed {
+			dt.completed[deliveryID] = time.Now()
+		}
+	}
+	return done, true
+}
+
+func (dt *DeliveryTracker) CheckAndRecord(deliveryID string) bool {
+	done, ok := dt.Begin(deliveryID)
+	if !ok {
 		return false
 	}
-	dt.seen[deliveryID] = now
+	done(true)
 	return true
 }
 
@@ -183,11 +211,21 @@ func (a *Adapter) ProcessVerifiedWebhook(ctx context.Context, secret, signatureH
 		return nil, fmt.Errorf("invalid or missing webhook signature")
 	}
 
+	var done func(bool)
 	if a.Tracker != nil {
-		if !a.Tracker.CheckAndRecord(deliveryID) {
+		var ok bool
+		done, ok = a.Tracker.Begin(deliveryID)
+		if !ok {
 			return nil, fmt.Errorf("delivery %s already processed (replay detected)", deliveryID)
 		}
 	}
+
+	completed := false
+	defer func() {
+		if done != nil {
+			done(completed)
+		}
+	}()
 
 	var event CheckRunEvent
 	if err := json.Unmarshal(rawPayload, &event); err != nil {
@@ -199,7 +237,13 @@ func (a *Adapter) ProcessVerifiedWebhook(ctx context.Context, secret, signatureH
 		return nil, err
 	}
 
-	return a.CompleteWait(ctx, *req)
+	res, err := a.CompleteWait(ctx, *req)
+	if err != nil {
+		return nil, err
+	}
+
+	completed = true
+	return res, nil
 }
 
 func (a *Adapter) CompleteWait(ctx context.Context, req controller.CompleteWaitRequest) (*controller.CompletionResult, error) {
