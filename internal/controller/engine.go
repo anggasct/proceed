@@ -289,7 +289,7 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 			return c.cancelledNode(ctx, runID, n.NodeKey, n.AttemptNo)
 		}
 		if n.NodeType == "gate" {
-			return c.waitingNode(ctx, runID, n.NodeKey)
+			return c.handleGateNode(ctx, runID, graphVersionID, digest, n)
 		}
 		return c.commitNodeSuccess(ctx, runID, graphVersionID, digest, n, &executor.Result{}, "")
 	}

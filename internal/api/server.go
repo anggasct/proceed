@@ -31,6 +31,7 @@ func NewServer(deps Deps) *Server {
 	s.mux.HandleFunc("GET /v1/runs/{id}", s.handleGetRun)
 	s.mux.HandleFunc("GET /v1/runs/{id}/graph", s.handleGetRun)
 	s.mux.HandleFunc("POST /v1/runs/{id}/cancel", s.handleCancelRun)
+	s.mux.HandleFunc("POST /v1/waits/{id}/complete", s.handleCompleteWait)
 	s.mux.HandleFunc("POST /v1/runs/{id}/approve", s.handleReserved("approve"))
 	s.mux.HandleFunc("POST /v1/runs/{id}/reconcile", s.handleReserved("admin"))
 	s.mux.HandleFunc("GET /v1/runs/{id}/export", s.handleReserved("read"))
@@ -159,6 +160,50 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleCompleteWait(w http.ResponseWriter, r *http.Request) {
+	if !s.authorize(w, r, "event") {
+		return
+	}
+	waitID := r.PathValue("id")
+	if waitID == "" {
+		writeError(w, http.StatusBadRequest, "GRAPH_INVALID", "wait id is required", nil)
+		return
+	}
+
+	var body controller.CompleteWaitRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "GRAPH_INVALID", "request body must be valid JSON: "+err.Error(), nil)
+		return
+	}
+
+	body.WaitID = waitID
+	result, err := s.deps.Controller.CompleteExternalWait(r.Context(), body)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+
+	if result.HTTPStatus >= 400 {
+		writeError(w, result.HTTPStatus, result.Code, result.Message, result.Details)
+		return
+	}
+
+	resp := map[string]any{
+		"wait_id": result.WaitID,
+		"status":  result.Code,
+	}
+	if result.RunID != "" {
+		resp["run_id"] = result.RunID
+	}
+	if result.NodeKey != "" {
+		resp["node_key"] = result.NodeKey
+	}
+	if result.Message != "" {
+		resp["message"] = result.Message
+	}
+	writeJSON(w, result.HTTPStatus, resp)
+}
+
 func freezeGraph(ctx context.Context, st *store.Store, path string) (string, error) {
 	src, err := os.ReadFile(path)
 	if err != nil {
@@ -205,13 +250,13 @@ func writeStoreError(w http.ResponseWriter, err error) {
 	}
 	code := store.ErrorCode(err)
 	switch code {
-	case "RUN_NOT_FOUND":
+	case "RUN_NOT_FOUND", "WAIT_NOT_FOUND":
 		writeError(w, http.StatusNotFound, code, err.Error(), nil)
 	case store.CodeGraphInvalid:
 		writeError(w, http.StatusBadRequest, code, err.Error(), nil)
 	case store.CodeStoreBusy:
 		writeError(w, http.StatusConflict, code, err.Error(), nil)
-	case store.CodeStoreConflict:
+	case store.CodeStoreConflict, "WAIT_CONFLICT":
 		writeError(w, http.StatusConflict, code, err.Error(), nil)
 	default:
 		writeError(w, http.StatusInternalServerError, "INTERNAL", err.Error(), nil)

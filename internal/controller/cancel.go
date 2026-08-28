@@ -125,6 +125,46 @@ FROM run_node WHERE run_id = ?`, runID)
 			}
 		}
 
+		waitRows, err := tx.QueryContext(ctx, `
+SELECT id, run_node_id FROM external_wait WHERE run_id = ? AND status = 'pending'`, runID)
+		if err != nil {
+			return err
+		}
+		type pendingWait struct {
+			id, runNodeID string
+		}
+		var pendingWaits []pendingWait
+		for waitRows.Next() {
+			var pw pendingWait
+			if err := waitRows.Scan(&pw.id, &pw.runNodeID); err != nil {
+				waitRows.Close()
+				return err
+			}
+			pendingWaits = append(pendingWaits, pw)
+		}
+		waitRows.Close()
+		if err := waitRows.Err(); err != nil {
+			return err
+		}
+		for _, pw := range pendingWaits {
+			nodeKey := c.nodeKeyForID(ctx, runID, pw.runNodeID)
+			if _, err := c.appendWithin(ctx, tx, &store.Event{
+				EventID:       ulid.Make().String(),
+				RunID:         runID,
+				SchemaVersion: "proceed/v1",
+				Type:          "external_wait_cancelled",
+				OccurredAt:    nowMs,
+				ActorType:     "controller",
+				ActorID:       c.cfg.OwnerID,
+				Payload: payloadJSON(map[string]any{
+					"wait_id":  pw.id,
+					"node_key": nodeKey,
+				}),
+			}); err != nil {
+				return err
+			}
+		}
+
 		var active int
 		if err := tx.QueryRowContext(ctx, `
 SELECT COUNT(*) FROM run_node WHERE run_id = ?

@@ -270,6 +270,24 @@ CREATE TABLE IF NOT EXISTS proposal_metric (
   PRIMARY KEY (proposal_id, metric_id)
 );
 
+CREATE TABLE IF NOT EXISTS external_wait (
+  id                 TEXT PRIMARY KEY,
+  run_id             TEXT NOT NULL REFERENCES graph_run(id),
+  run_node_id        TEXT NOT NULL REFERENCES run_node(id),
+  graph_version_id   TEXT NOT NULL REFERENCES graph_version(id),
+  definition_digest  TEXT NOT NULL,
+  event_type         TEXT NOT NULL,
+  correlation_key    TEXT NOT NULL,
+  expected_condition TEXT NOT NULL,
+  status             TEXT NOT NULL CHECK (status IN ('pending','completed','expired','cancelled')),
+  expires_at         INTEGER,
+  completed_event_id TEXT UNIQUE REFERENCES event(event_id),
+  payload_digest     TEXT,
+  created_at         INTEGER NOT NULL,
+  completed_at       INTEGER,
+  UNIQUE (run_id, run_node_id, id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_graph_node_version ON graph_node(graph_version_id);
 CREATE INDEX IF NOT EXISTS idx_graph_edge_version ON graph_edge(graph_version_id);
 CREATE INDEX IF NOT EXISTS idx_policy_version ON policy(graph_version_id);
@@ -291,6 +309,13 @@ CREATE INDEX IF NOT EXISTS idx_causal_citation     ON causal_link(citation_type,
 CREATE INDEX IF NOT EXISTS idx_approval_pending    ON approval(run_id, decision, expires_at);
 CREATE INDEX IF NOT EXISTS idx_metric_anchor       ON metric(anchor_id);
 CREATE INDEX IF NOT EXISTS idx_proposal_target     ON policy_change_proposal(target_graph_version_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_external_wait_one_pending
+  ON external_wait(event_type, correlation_key)
+  WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_external_wait_run
+  ON external_wait(run_id, run_node_id, status);
+CREATE INDEX IF NOT EXISTS idx_external_wait_expiry
+  ON external_wait(status, expires_at);
 `
 
 func (s *Store) SchemaVersion() int {

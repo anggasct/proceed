@@ -19,6 +19,9 @@ func (c *Controller) Step(ctx context.Context, runID string) (bool, error) {
 	if run.status != "running" {
 		return false, nil
 	}
+	if err := c.ExpireExternalWaits(ctx, time.Now().UnixMilli()); err != nil {
+		return false, err
+	}
 	nodes, err := c.eligibleNodes(ctx, runID, run.graphVersionID)
 	if err != nil {
 		return false, err
