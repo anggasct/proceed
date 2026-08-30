@@ -87,12 +87,18 @@ func (c *Controller) RegisterExternalWait(ctx context.Context, req ExternalWaitR
 	if err := json.Unmarshal([]byte(req.ExpectedCondition), &condShape); err != nil || condShape == nil {
 		return nil, store.NewCodeError(store.CodeGraphInvalid, "expected_condition must be a JSON object")
 	}
+	canonicalCondition, err := json.Marshal(condShape)
+	if err != nil {
+		return nil, store.NewCodeError(store.CodeGraphInvalid, "expected_condition must be canonical JSON: %v", err)
+	}
+	req.ExpectedCondition = string(canonicalCondition)
 
 	nowMs := time.Now().UnixMilli()
 	err = c.store.WithTx(ctx, func(tx *sql.Tx) error {
-		var runStatus string
+		var runStatus, graphVersionID, definitionDigest string
 		if err := tx.QueryRowContext(ctx,
-			"SELECT status FROM graph_run WHERE id = ?", req.RunID).Scan(&runStatus); err != nil {
+			"SELECT status, graph_version_id, definition_digest FROM graph_run WHERE id = ?", req.RunID).
+			Scan(&runStatus, &graphVersionID, &definitionDigest); err != nil {
 			return err
 		}
 		if runStatus != "running" {
@@ -100,8 +106,43 @@ func (c *Controller) RegisterExternalWait(ctx context.Context, req ExternalWaitR
 				"run %s is %s, cannot register external wait", req.RunID, runStatus)
 		}
 
+		var existing struct {
+			RunID            string
+			NodeKey          string
+			GraphVersionID   string
+			DefinitionDigest string
+			EventType        string
+			CorrelationKey   string
+			ExpectedCond     string
+			Status           string
+			ExpiresAt        sql.NullInt64
+		}
+		err := tx.QueryRowContext(ctx, `
+SELECT ew.run_id, rn.node_key, ew.graph_version_id, ew.definition_digest,
+       ew.event_type, ew.correlation_key, ew.expected_condition, ew.status, ew.expires_at
+FROM external_wait ew
+JOIN run_node rn ON rn.id = ew.run_node_id
+WHERE ew.id = ?`, req.WaitID).Scan(
+			&existing.RunID, &existing.NodeKey, &existing.GraphVersionID,
+			&existing.DefinitionDigest, &existing.EventType, &existing.CorrelationKey,
+			&existing.ExpectedCond, &existing.Status, &existing.ExpiresAt)
+		if err == nil {
+			if existing.Status == "pending" &&
+				existing.RunID == req.RunID && existing.NodeKey == req.NodeKey &&
+				existing.GraphVersionID == graphVersionID && existing.DefinitionDigest == definitionDigest &&
+				existing.EventType == req.EventType && existing.CorrelationKey == req.CorrelationKey &&
+				existing.ExpectedCond == req.ExpectedCondition && sameExpiry(existing.ExpiresAt, req.ExpiresAt) {
+				return nil
+			}
+			return store.NewCodeError(store.CodeStoreConflict,
+				"external wait %s is already registered with a different contract or terminal state", req.WaitID)
+		}
+		if err != sql.ErrNoRows {
+			return err
+		}
+
 		var existingCount int
-		err := tx.QueryRowContext(ctx,
+		err = tx.QueryRowContext(ctx,
 			"SELECT COUNT(*) FROM external_wait WHERE event_type = ? AND correlation_key = ? AND status = 'pending'",
 			req.EventType, req.CorrelationKey).Scan(&existingCount)
 		if err != nil {
@@ -188,6 +229,13 @@ VALUES (?, ?, ?, 'waiting', 0) ON CONFLICT(run_id, node_key) DO NOTHING`,
 	}
 
 	return c.store.GetExternalWait(ctx, req.WaitID)
+}
+
+func sameExpiry(existing sql.NullInt64, requested int64) bool {
+	if requested <= 0 {
+		return !existing.Valid
+	}
+	return existing.Valid && existing.Int64 == requested
 }
 
 // Credential-shaped values are rejected even inside allowlisted fields: a
@@ -283,8 +331,8 @@ func validateNormalizedPayload(v any) error {
 			if !ok {
 				return fmt.Errorf("field %q must be a string", k)
 			}
-			if len(s) > maxPayloadURLLen || hasControlChars(s) || strings.ContainsAny(s, " \t@") ||
-				!(strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")) {
+			if len(s) > maxPayloadURLLen || hasControlChars(s) || strings.ContainsAny(s, " 	@") ||
+				!(strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")) || isSensitiveValue(s) {
 				return fmt.Errorf("field %q is not a bounded normalized URL", k)
 			}
 		case "pull_request", "check_run_id", "started_at", "completed_at":

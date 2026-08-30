@@ -1164,6 +1164,26 @@ edges:
 		t.Fatal(err)
 	}
 
+	// Re-registering the same deterministic wait is an idempotent no-op.
+	if _, err := ctrl.RegisterExternalWait(ctx, ExternalWaitRequest{
+		RunID:             runID,
+		NodeKey:           "wait_ci",
+		EventType:         "ci.completed",
+		CorrelationKey:    corrA,
+		ExpectedCondition: `{"status":"success"}`,
+		WaitID:            waitA,
+	}); err != nil {
+		t.Fatalf("idempotent re-registration: %v", err)
+	}
+	var requestedCount int
+	if err := st.DB().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM event WHERE run_id = ? AND type = 'external_wait_requested'", runID).Scan(&requestedCount); err != nil {
+		t.Fatal(err)
+	}
+	if requestedCount != 1 {
+		t.Fatalf("external_wait_requested count = %d, want 1 after idempotent re-registration", requestedCount)
+	}
+
 	// Second wait with a distinct event identity on the same node is rejected
 	waitB := ulid.Make().String()
 	_, err := ctrl.RegisterExternalWait(ctx, ExternalWaitRequest{

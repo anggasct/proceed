@@ -289,6 +289,7 @@ func TestAPICompleteWaitRejectsUnprovablePayloadFields(t *testing.T) {
 		{"innocuous key with plain secret", fmt.Sprintf(`{"metadata": %q}`, innocuousSentinel)},
 		{"log output with plain secret", fmt.Sprintf(`{"log": %q}`, innocuousSentinel)},
 		{"allowlisted field with credential value", fmt.Sprintf(`{"check_name": %q}`, credentialSentinel)},
+		{"url with credential-shaped path", fmt.Sprintf(`{"url": "https://example.test/%s"}`, credentialSentinel)},
 		{"array root", `[1,2,3]`},
 		{"scalar root", `"just a string"`},
 		{"oversized string", `{"check_name": "` + strings.Repeat("x", 5000) + `"}`},
