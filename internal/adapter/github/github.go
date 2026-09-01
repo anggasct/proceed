@@ -61,6 +61,10 @@ func CorrelationKey(repo string, pr int64, headSHA string) string {
 }
 
 func NormalizeCheckRun(event *CheckRunEvent, waitID string, prOverride int64) (*controller.CompleteWaitRequest, error) {
+	return NormalizeCheckRunWithAggregated(event, waitID, prOverride, nil)
+}
+
+func NormalizeCheckRunWithAggregated(event *CheckRunEvent, waitID string, prOverride int64, aggregated map[string]string) (*controller.CompleteWaitRequest, error) {
 	if event == nil {
 		return nil, fmt.Errorf("check run event is nil")
 	}
@@ -89,6 +93,20 @@ func NormalizeCheckRun(event *CheckRunEvent, waitID string, prOverride int64) (*
 	if event.CheckRun.Conclusion == "success" {
 		status = "success"
 	}
+	if aggregated != nil {
+		hasFailure := false
+		for _, conc := range aggregated {
+			if conc != "success" {
+				hasFailure = true
+				break
+			}
+		}
+		if hasFailure {
+			status = "failure"
+		} else {
+			status = "success"
+		}
+	}
 
 	normPayload := map[string]any{
 		"repository":   event.Repository.FullName,
@@ -96,6 +114,9 @@ func NormalizeCheckRun(event *CheckRunEvent, waitID string, prOverride int64) (*
 		"head_sha":     event.CheckRun.HeadSHA,
 		"check_name":   event.CheckRun.Name,
 		"conclusion":   event.CheckRun.Conclusion,
+	}
+	if aggregated != nil && len(aggregated) > 0 {
+		normPayload["required_checks"] = aggregated
 	}
 	payloadBytes, err := json.Marshal(normPayload)
 	if err != nil {
@@ -123,6 +144,60 @@ func NormalizeCheckRun(event *CheckRunEvent, waitID string, prOverride int64) (*
 		PayloadDigest:   "sha256:" + digest,
 		Payload:         json.RawMessage(payloadBytes),
 	}, nil
+}
+
+func (a *Adapter) fetchAggregatedChecks(ctx context.Context, repo, headSHA string) (map[string]string, error) {
+	if a.FetchChecks != nil {
+		return a.FetchChecks(ctx, repo, headSHA)
+	}
+	if a.GitHubAPIBaseURL == "" {
+		return nil, nil
+	}
+	url := fmt.Sprintf("%s/repos/%s/commits/%s/check-runs", strings.TrimSuffix(a.GitHubAPIBaseURL, "/"), repo, headSHA)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if a.GitHubToken != "" {
+		req.Header.Set("Authorization", "Bearer "+a.GitHubToken)
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	client := a.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("github check-runs API returned %d", resp.StatusCode)
+	}
+	var body struct {
+		CheckRuns []struct {
+			Name       string `json:"name"`
+			Status     string `json:"status"`
+			Conclusion string `json:"conclusion"`
+		} `json:"check_runs"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+	if len(body.CheckRuns) == 0 {
+		return nil, nil
+	}
+	aggregated := make(map[string]string, len(body.CheckRuns))
+	for _, cr := range body.CheckRuns {
+		if cr.Status != "completed" {
+			return nil, fmt.Errorf("not all checks completed")
+		}
+		if cr.Conclusion == "" {
+			cr.Conclusion = "neutral"
+		}
+		aggregated[cr.Name] = cr.Conclusion
+	}
+	return aggregated, nil
 }
 
 type DeliveryTracker struct {
@@ -190,12 +265,19 @@ func (dt *DeliveryTracker) CheckAndRecord(deliveryID string) bool {
 }
 
 type Adapter struct {
-	BaseURL     string
-	Token       string
-	HTTPClient  *http.Client
-	Tracker     *DeliveryTracker
-	MaxRetries  int
-	BackoffBase time.Duration
+	BaseURL          string
+	Token            string
+	HTTPClient       *http.Client
+	Tracker          *DeliveryTracker
+	MaxRetries       int
+	BackoffBase      time.Duration
+	GitHubAPIBaseURL string
+	GitHubToken      string
+	FetchChecks      func(ctx context.Context, repo, headSHA string) (map[string]string, error)
+	Store            interface {
+		IsWebhookDeliverySeen(ctx context.Context, deliveryID string) (bool, error)
+		RecordWebhookDelivery(ctx context.Context, deliveryID string) error
+	}
 }
 
 func NewAdapter(baseURL, token string) *Adapter {
@@ -214,6 +296,13 @@ func (a *Adapter) ProcessVerifiedWebhook(ctx context.Context, secret, signatureH
 		return nil, fmt.Errorf("invalid or missing webhook signature")
 	}
 
+	if a.Store != nil {
+		seen, err := a.Store.IsWebhookDeliverySeen(ctx, deliveryID)
+		if err == nil && seen {
+			return nil, fmt.Errorf("delivery %s already processed (replay detected)", deliveryID)
+		}
+	}
+
 	var done func(bool)
 	if a.Tracker != nil {
 		var ok bool
@@ -228,6 +317,9 @@ func (a *Adapter) ProcessVerifiedWebhook(ctx context.Context, secret, signatureH
 		if done != nil {
 			done(completed)
 		}
+		if completed && a.Store != nil && deliveryID != "" {
+			_ = a.Store.RecordWebhookDelivery(ctx, deliveryID)
+		}
 	}()
 
 	var event CheckRunEvent
@@ -235,7 +327,12 @@ func (a *Adapter) ProcessVerifiedWebhook(ctx context.Context, secret, signatureH
 		return nil, fmt.Errorf("unmarshal webhook payload: %w", err)
 	}
 
-	req, err := NormalizeCheckRun(&event, waitID, prOverride)
+	aggregated, err := a.fetchAggregatedChecks(ctx, event.Repository.FullName, event.CheckRun.HeadSHA)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := NormalizeCheckRunWithAggregated(&event, waitID, prOverride, aggregated)
 	if err != nil {
 		return nil, err
 	}

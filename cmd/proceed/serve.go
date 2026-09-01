@@ -103,6 +103,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 			if err := c.RecoverAll(context.Background()); err != nil {
 				fmt.Fprintf(stderr, "proceed: recovery scan: %v\n", err)
 			}
+			_ = c.DrainServeTick(context.Background())
 		}
 	}
 }

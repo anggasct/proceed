@@ -59,7 +59,7 @@ func (r *CompletionResult) Accepted() bool {
 
 func isTerminalNodeStatus(status string) bool {
 	switch status {
-	case "succeeded", "failed", "skipped", "cancelled":
+	case "succeeded", "failed", "skipped", "cancelled", "cancel_requested":
 		return true
 	}
 	return false
@@ -77,9 +77,6 @@ func (c *Controller) RegisterExternalWait(ctx context.Context, req ExternalWaitR
 		return nil, store.NewCodeError(store.CodeStoreConflict, "run %s is %s, cannot register external wait", req.RunID, run.status)
 	}
 
-	if req.WaitID == "" {
-		req.WaitID = ulid.Make().String()
-	}
 	if req.ExpectedCondition == "" {
 		req.ExpectedCondition = "{}"
 	}
@@ -104,6 +101,32 @@ func (c *Controller) RegisterExternalWait(ctx context.Context, req ExternalWaitR
 		if runStatus != "running" {
 			return store.NewCodeError(store.CodeStoreConflict,
 				"run %s is %s, cannot register external wait", req.RunID, runStatus)
+		}
+
+		if req.WaitID == "" {
+			var existingID string
+			err := tx.QueryRowContext(ctx, `
+SELECT ew.id FROM external_wait ew
+JOIN run_node rn ON rn.id = ew.run_node_id
+WHERE ew.run_id = ? AND rn.node_key = ? AND ew.event_type = ? AND ew.correlation_key = ? AND ew.status = 'pending' LIMIT 1`,
+				req.RunID, req.NodeKey, req.EventType, req.CorrelationKey).Scan(&existingID)
+			if err == nil {
+				req.WaitID = existingID
+				return nil
+			}
+			if err != sql.ErrNoRows {
+				return err
+			}
+			req.WaitID = ulid.Make().String()
+		}
+
+		var existsGraphNode int
+		if err := tx.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM graph_node WHERE graph_version_id = ? AND node_key = ?", graphVersionID, req.NodeKey).Scan(&existsGraphNode); err != nil {
+			return err
+		}
+		if existsGraphNode == 0 {
+			return store.NewCodeError(store.CodeGraphInvalid, "unknown node %q for graph version %s", req.NodeKey, graphVersionID)
 		}
 
 		var existing struct {
@@ -131,7 +154,7 @@ WHERE ew.id = ?`, req.WaitID).Scan(
 				existing.RunID == req.RunID && existing.NodeKey == req.NodeKey &&
 				existing.GraphVersionID == graphVersionID && existing.DefinitionDigest == definitionDigest &&
 				existing.EventType == req.EventType && existing.CorrelationKey == req.CorrelationKey &&
-				existing.ExpectedCond == req.ExpectedCondition && sameExpiry(existing.ExpiresAt, req.ExpiresAt) {
+				existing.ExpectedCond == req.ExpectedCondition {
 				return nil
 			}
 			return store.NewCodeError(store.CodeStoreConflict,
@@ -231,13 +254,6 @@ VALUES (?, ?, ?, 'waiting', 0) ON CONFLICT(run_id, node_key) DO NOTHING`,
 	return c.store.GetExternalWait(ctx, req.WaitID)
 }
 
-func sameExpiry(existing sql.NullInt64, requested int64) bool {
-	if requested <= 0 {
-		return !existing.Valid
-	}
-	return existing.Valid && existing.Int64 == requested
-}
-
 // Credential-shaped values are rejected even inside allowlisted fields: a
 // normalized provider field carrying a verifiable secret form is not provably
 // safe to persist.
@@ -332,7 +348,7 @@ func validateNormalizedPayload(v any) error {
 				return fmt.Errorf("field %q must be a string", k)
 			}
 			if len(s) > maxPayloadURLLen || hasControlChars(s) || strings.ContainsAny(s, " 	@") ||
-				!(strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")) || isSensitiveValue(s) {
+				(!strings.HasPrefix(s, "http://") && !strings.HasPrefix(s, "https://")) || isSensitiveValue(s) {
 				return fmt.Errorf("field %q is not a bounded normalized URL", k)
 			}
 		case "pull_request", "check_run_id", "started_at", "completed_at":
@@ -353,7 +369,7 @@ func validateNormalizedPayload(v any) error {
 				return fmt.Errorf("field %q exceeds %d entries", k, maxRequiredCheckEntries)
 			}
 			for name, conclusion := range m {
-				if len(name) == 0 || len(name) > maxPayloadKeyLen || hasControlChars(name) {
+				if len(name) == 0 || len(name) > maxPayloadKeyLen || hasControlChars(name) || isSensitiveValue(name) {
 					return fmt.Errorf("field %q has a non-normalized check name", k)
 				}
 				s, ok := conclusion.(string)
@@ -383,7 +399,7 @@ func (c *Controller) CompleteExternalWait(ctx context.Context, req CompleteWaitR
 		"status":            req.Status,
 		"payload_digest":    req.PayloadDigest,
 	} {
-		if len(value) > 512 || hasControlChars(value) {
+		if len(value) > 512 || hasControlChars(value) || isSensitiveValue(value) {
 			return nil, store.NewCodeError(store.CodeGraphInvalid, "%s must be a bounded single-line string", field)
 		}
 	}
@@ -834,21 +850,18 @@ func (c *Controller) ExpireExternalWaits(ctx context.Context, nowMs int64) error
 				return err
 			}
 
-			// Check if there is a timeout/expired route
-			var hasTimeoutRoute bool
-			var count int
+			var expiryRoute string
 			_ = tx.QueryRowContext(ctx, `
-SELECT COUNT(*) FROM graph_edge
-WHERE graph_version_id = ? AND from_node_key = ? AND type = 'routes_to' AND condition IN ('timeout', 'expired')`,
-				w.GraphVersionID, nodeKey).Scan(&count)
-			hasTimeoutRoute = count > 0
+SELECT condition FROM graph_edge
+WHERE graph_version_id = ? AND from_node_key = ? AND type = 'routes_to' AND condition IN ('timeout', 'expired') LIMIT 1`,
+				w.GraphVersionID, nodeKey).Scan(&expiryRoute)
 
 			var attemptCount int64
 			_ = tx.QueryRowContext(ctx,
 				"SELECT attempt_count FROM run_node WHERE id = ?", w.RunNodeID).Scan(&attemptCount)
 
-			if hasTimeoutRoute {
-				result := &executor.Result{Route: "timeout"}
+			if expiryRoute != "" {
+				result := &executor.Result{Route: expiryRoute}
 				if _, err := c.appendWithin(ctx, tx, &store.Event{
 					EventID:       ulid.Make().String(),
 					RunID:         w.RunID,
@@ -860,7 +873,7 @@ WHERE graph_version_id = ? AND from_node_key = ? AND type = 'routes_to' AND cond
 					Payload: payloadJSON(map[string]any{
 						"node_key":   nodeKey,
 						"attempt_no": attemptCount,
-						"route":      "timeout",
+						"route":      expiryRoute,
 					}),
 				}); err != nil {
 					return err
@@ -894,12 +907,6 @@ WHERE graph_version_id = ? AND from_node_key = ? AND type = 'routes_to' AND cond
 		}
 	}
 	return nil
-}
-
-func (c *Controller) recordRejectedEvent(ctx context.Context, runID string, req CompleteWaitRequest, reason string, nowMs int64) error {
-	return c.store.WithTx(ctx, func(tx *sql.Tx) error {
-		return c.recordRejectedEventTx(ctx, tx, runID, req, reason, nowMs)
-	})
 }
 
 func (c *Controller) handleGateNode(ctx context.Context, runID, graphVersionID, digest string, n runnableNode) error {

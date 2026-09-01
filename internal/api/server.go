@@ -188,6 +188,10 @@ func (s *Server) handleCompleteWait(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if result.Accepted() && result.RunID != "" {
+		_ = s.deps.Controller.ResumeRun(r.Context(), result.RunID)
+	}
+
 	resp := map[string]any{
 		"wait_id": result.WaitID,
 		"status":  result.Code,

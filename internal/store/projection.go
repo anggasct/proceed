@@ -203,14 +203,6 @@ type externalWaitCancelledPayload struct {
 	NodeKey string `json:"node_key,omitempty"`
 }
 
-type externalEventRejectedPayload struct {
-	WaitID          string `json:"wait_id,omitempty"`
-	ProviderEventID string `json:"provider_event_id,omitempty"`
-	Reason          string `json:"reason,omitempty"`
-	EventType       string `json:"event_type,omitempty"`
-	CorrelationKey  string `json:"correlation_key,omitempty"`
-}
-
 func decodePayload(ev *Event, dst any) error {
 	if err := json.Unmarshal([]byte(ev.Payload), dst); err != nil {
 		return storeErr(CodeGraphInvalid, "event %s payload does not decode for type %s: %v",

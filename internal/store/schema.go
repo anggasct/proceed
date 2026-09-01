@@ -319,6 +319,11 @@ CREATE INDEX IF NOT EXISTS idx_external_wait_run
   ON external_wait(run_id, run_node_id, status);
 CREATE INDEX IF NOT EXISTS idx_external_wait_expiry
   ON external_wait(status, expires_at);
+CREATE TABLE IF NOT EXISTS webhook_delivery (
+  delivery_id  TEXT PRIMARY KEY,
+  completed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_delivery_age ON webhook_delivery(completed_at);
 `
 
 func (s *Store) SchemaVersion() int {
