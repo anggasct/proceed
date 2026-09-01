@@ -9,8 +9,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/oklog/ulid/v2"
+	"github.com/xeipuuv/gojsonschema"
 
 	"proceed/internal/compiler"
 	"proceed/internal/store"
@@ -158,6 +160,97 @@ func TestMermaidValidFlowchart(t *testing.T) {
 	}
 }
 
+func TestMermaidEscaping(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	graphID := stID()
+	versionID := stID()
+	digest := "test-escape-digest"
+	if _, err := st.DB().ExecContext(ctx, "INSERT INTO graph (id, name) VALUES (?, ?)", graphID, "escape-test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx, "INSERT INTO graph_version (id, graph_id, definition_digest, source_schema_version, compiled_schema_version, source_metadata, extras, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'frozen', ?)", versionID, graphID, digest, "proceed/v1", "v1", "{}", "{}", time.Now().UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	dangerousKeys := []string{`a"b|c[d]`, `normal`, `with-dash`, `with.dot`, `with space`, `123numeric`}
+	for _, k := range dangerousKeys {
+		if _, err := st.DB().ExecContext(ctx, "INSERT INTO graph_node (id, graph_version_id, node_key, type, config) VALUES (?, ?, ?, ?, ?)", stID(), versionID, k, "task", "{}"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runID := stID()
+	if _, err := st.DB().ExecContext(ctx, "INSERT INTO graph_run (id, graph_version_id, definition_digest, status, created_at) VALUES (?, ?, ?, 'running', ?)", runID, versionID, digest, time.Now().UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range dangerousKeys {
+		if _, err := st.DB().ExecContext(ctx, "INSERT INTO run_node (id, run_id, node_key, status, attempt_count) VALUES (?, ?, ?, ?, 1) ON CONFLICT(run_id, node_key) DO UPDATE SET status = excluded.status", stID(), runID, k, "succeeded"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := Export(ctx, st, runID, "mermaid")
+	if err != nil {
+		t.Fatalf("Export mermaid with dangerous keys: %v", err)
+	}
+	s := string(out)
+	if !strings.HasPrefix(s, "flowchart TD") {
+		t.Fatalf("mermaid must start with 'flowchart TD', got %q", s)
+	}
+	if strings.Contains(s, `a"b`) {
+		t.Fatalf("mermaid output contains unescaped quote: %s", s)
+	}
+	if strings.Contains(s, `|c[`) {
+		t.Fatalf("mermaid output contains unescaped pipe/bracket: %s", s)
+	}
+	lines := strings.Split(s, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "[\"") {
+			start := strings.Index(line, "[\"")
+			end := strings.LastIndex(line, "\"]")
+			if start == -1 || end == -1 || end <= start {
+				continue
+			}
+			label := line[start+2 : end]
+			if strings.Contains(label, "\"") {
+				t.Fatalf("label contains unescaped quote: %q line %q", label, line)
+			}
+		}
+	}
+	for _, k := range dangerousKeys {
+		safe := sanitizeMermaidID(k)
+		if !strings.Contains(s, safe) {
+			t.Fatalf("mermaid missing sanitized id %q (from %q) in %s", safe, k, s)
+		}
+	}
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || trimmed == "flowchart TD" {
+			continue
+		}
+		if idx := strings.Index(trimmed, "[\""); idx != -1 {
+			idPart := strings.TrimSpace(trimmed[:idx])
+			for _, k := range dangerousKeys {
+				if k == idPart && sanitizeMermaidID(k) != k {
+					t.Fatalf("mermaid contains unsanitized raw id %q as node id %q", k, idPart)
+				}
+			}
+			if idPart != "" {
+				for _, r := range idPart {
+					if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_') {
+						t.Fatalf("node id %q contains invalid char %q", idPart, string(r))
+					}
+				}
+				if idPart[0] >= '0' && idPart[0] <= '9' {
+					t.Fatalf("node id %q starts with digit", idPart)
+				}
+			}
+		}
+	}
+	escaped := escapeMermaidLabel(`a"b|c[d]`)
+	if strings.Contains(escaped, "\"") || strings.Contains(escaped, "|") || strings.Contains(escaped, "[") || strings.Contains(escaped, "]") {
+		t.Fatalf("escapeMermaidLabel failed to escape: %q", escaped)
+	}
+}
+
 func TestJSONValidatesSchema(t *testing.T) {
 	ctx := context.Background()
 	st, runID := fixtureRun(t)
@@ -182,7 +275,6 @@ func TestJSONValidatesSchema(t *testing.T) {
 	if !ok || len(edges) == 0 {
 		t.Fatalf("edges must be non-empty array")
 	}
-	// Check that traversed edges have route labels
 	foundTraversed := false
 	for _, e := range edges {
 		m, _ := e.(map[string]any)
@@ -196,10 +288,8 @@ func TestJSONValidatesSchema(t *testing.T) {
 	if !foundTraversed {
 		t.Fatalf("expected at least one traversed edge")
 	}
-	// Check schema file exists and is valid JSON
 	schemaPath := filepath.Join("schema.json")
 	if _, err := os.Stat(schemaPath); err != nil {
-		// try alternative path when running from worktree root
 		schemaPath = filepath.Join("internal", "query", "export", "schema.json")
 		if _, err2 := os.Stat(schemaPath); err2 != nil {
 			t.Fatalf("schema.json not found: %v / %v", err, err2)
@@ -212,6 +302,35 @@ func TestJSONValidatesSchema(t *testing.T) {
 	var schema map[string]any
 	if err := json.Unmarshal(data, &schema); err != nil {
 		t.Fatalf("schema invalid json: %v", err)
+	}
+	absSchemaPath, err := filepath.Abs(schemaPath)
+	if err != nil {
+		t.Fatalf("abs schema path: %v", err)
+	}
+	schemaLoader := gojsonschema.NewReferenceLoader("file://" + absSchemaPath)
+	documentLoader := gojsonschema.NewBytesLoader(out)
+	result, err := gojsonschema.Validate(schemaLoader, documentLoader)
+	if err != nil {
+		t.Fatalf("schema validation error: %v", err)
+	}
+	if !result.Valid() {
+		var msgs []string
+		for _, e := range result.Errors() {
+			msgs = append(msgs, e.String())
+		}
+		t.Fatalf("export json does not validate against schema.json: %s\npayload: %s", strings.Join(msgs, "; "), string(out))
+	}
+	invalidPayload := map[string]any{
+		"run_id": "x",
+	}
+	invalidBytes, _ := json.Marshal(invalidPayload)
+	invalidLoader := gojsonschema.NewBytesLoader(invalidBytes)
+	invalidResult, err := gojsonschema.Validate(schemaLoader, invalidLoader)
+	if err != nil {
+		t.Fatalf("invalid payload validation error: %v", err)
+	}
+	if invalidResult.Valid() {
+		t.Fatalf("schema validator must reject payload missing required fields")
 	}
 }
 

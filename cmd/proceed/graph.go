@@ -126,12 +126,10 @@ func cmdGraphExport(args []string, stdout, stderr io.Writer) int {
 }
 
 func validateExportFormat(format string) error {
-	switch format {
-	case "mermaid", "json":
-		return nil
-	default:
+	if err := export.ValidateFormat(format); err != nil {
 		return fmt.Errorf("proceed graph export: unknown format %q: must be mermaid or json", format)
 	}
+	return nil
 }
 
 func runExport(ctx context.Context, st *store.Store, runID, format string) ([]byte, error) {

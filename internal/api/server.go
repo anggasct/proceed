@@ -222,6 +222,7 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	if format == "" {
 		format = "json"
 	}
+	format = strings.ToLower(format)
 	if err := export.ValidateFormat(format); err != nil {
 		writeError(w, http.StatusBadRequest, store.CodeGraphInvalid, err.Error(), nil)
 		return

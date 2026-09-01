@@ -82,8 +82,17 @@ type artifactRef struct {
 }
 
 func fetchExportData(ctx context.Context, s *store.Store, runID string) (*exportData, error) {
+	tx, err := s.DB().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		tx, err = s.DB().BeginTx(ctx, nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	var g exportData
-	err := s.DB().QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		"SELECT id, graph_version_id, definition_digest, status FROM graph_run WHERE id = ?",
 		runID).Scan(&g.RunID, &g.GraphVersionID, &g.DefinitionDigest, &g.Status)
 	if err != nil {
@@ -93,7 +102,7 @@ func fetchExportData(ctx context.Context, s *store.Store, runID string) (*export
 		return nil, err
 	}
 
-	nodeRows, err := s.DB().QueryContext(ctx, `
+	nodeRows, err := tx.QueryContext(ctx, `
 SELECT COALESCE(rn.node_key, gn.node_key), COALESCE(rn.status, 'pending'), COALESCE(rn.attempt_count, 0), gn.type
 FROM graph_node gn
 LEFT JOIN run_node rn ON rn.node_key = gn.node_key AND rn.run_id = ?
@@ -114,7 +123,7 @@ ORDER BY gn.node_key`, runID, g.GraphVersionID)
 		return nil, err
 	}
 
-	edgeRows, err := s.DB().QueryContext(ctx, `
+	edgeRows, err := tx.QueryContext(ctx, `
 SELECT ge.from_node_key, ge.to_node_key, ge.type, COALESCE(ge.condition, ''), COALESCE(re.route, ''), EXISTS(SELECT 1 FROM run_edge re2 WHERE re2.run_id = ? AND re2.edge_id = ge.id)
 FROM graph_edge ge
 LEFT JOIN run_edge re ON re.edge_id = ge.id AND re.run_id = ?
@@ -137,7 +146,7 @@ ORDER BY ge.from_node_key, ge.to_node_key`, runID, runID, g.GraphVersionID)
 		return nil, err
 	}
 
-	artRows, err := s.DB().QueryContext(ctx, `
+	artRows, err := tx.QueryContext(ctx, `
 SELECT produced_by_node_key, name, path, content_hash, media_type, size_bytes, truncated
 FROM artifact WHERE run_id = ? ORDER BY produced_by_node_key, name`, runID)
 	if err != nil {
@@ -171,6 +180,10 @@ FROM artifact WHERE run_id = ? ORDER BY produced_by_node_key, name`, runID)
 		return g.Artifacts[i].NodeKey < g.Artifacts[j].NodeKey
 	})
 
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
 	return &g, nil
 }
 
@@ -179,9 +192,11 @@ func renderMermaid(data *exportData) string {
 	b.WriteString("flowchart TD\n")
 	for _, n := range data.Nodes {
 		safeKey := sanitizeMermaidID(n.NodeKey)
-		label := fmt.Sprintf("%s<br/>%s", n.NodeKey, n.Status)
+		escapedKey := escapeMermaidLabel(n.NodeKey)
+		escapedStatus := escapeMermaidLabel(n.Status)
+		label := fmt.Sprintf("%s<br/>%s", escapedKey, escapedStatus)
 		if n.AttemptCount > 0 {
-			label = fmt.Sprintf("%s<br/>%s (attempt %d)", n.NodeKey, n.Status, n.AttemptCount)
+			label = fmt.Sprintf("%s<br/>%s (attempt %d)", escapedKey, escapedStatus, n.AttemptCount)
 		}
 		b.WriteString(fmt.Sprintf("  %s[\"%s\"]\n", safeKey, label))
 	}
@@ -192,6 +207,7 @@ func renderMermaid(data *exportData) string {
 		if e.Route != "" {
 			routeLabel = e.Route
 		}
+		routeLabel = escapeMermaidLabel(routeLabel)
 		if routeLabel != "" && e.Traversed {
 			b.WriteString(fmt.Sprintf("  %s -->|%s| %s\n", from, routeLabel, to))
 		} else if routeLabel != "" {
@@ -205,9 +221,56 @@ func renderMermaid(data *exportData) string {
 	return b.String()
 }
 
+func escapeMermaidLabel(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString("#quot;")
+		case '|':
+			b.WriteString("_")
+		case '[':
+			b.WriteString("(")
+		case ']':
+			b.WriteString(")")
+		case '{':
+			b.WriteString("(")
+		case '}':
+			b.WriteString(")")
+		case '<':
+			b.WriteString("&lt;")
+		case '>':
+			b.WriteString("&gt;")
+		case '#':
+			b.WriteString("#35;")
+		case '&':
+			b.WriteString("&amp;")
+		case '\n', '\r':
+			b.WriteRune(' ')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 func sanitizeMermaidID(id string) string {
-	r := strings.NewReplacer("-", "_", ".", "_", " ", "_")
-	return r.Replace(id)
+	var b strings.Builder
+	for _, r := range id {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	s := b.String()
+	if s == "" {
+		return "_"
+	}
+	if s[0] >= '0' && s[0] <= '9' {
+		s = "_" + s
+	}
+	return s
 }
 
 type jsonExport struct {
