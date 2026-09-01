@@ -164,6 +164,45 @@ type runTerminalPayload struct {
 	Detail string `json:"detail"`
 }
 
+type externalWaitRequestedPayload struct {
+	WaitID            string          `json:"wait_id,omitempty"`
+	NodeKey           string          `json:"node_key"`
+	EventType         string          `json:"event_type"`
+	CorrelationKey    string          `json:"correlation_key"`
+	ExpectedCondition json.RawMessage `json:"expected_condition"`
+	ExpiresAt         int64           `json:"expires_at,omitempty"`
+}
+
+type externalEventReceivedPayload struct {
+	WaitID          string          `json:"wait_id,omitempty"`
+	ProviderEventID string          `json:"provider_event_id"`
+	EventType       string          `json:"event_type"`
+	Source          string          `json:"source"`
+	CorrelationKey  string          `json:"correlation_key"`
+	OccurredAt      int64           `json:"occurred_at"`
+	Status          string          `json:"status"`
+	PayloadDigest   string          `json:"payload_digest"`
+	Payload         json.RawMessage `json:"payload,omitempty"`
+}
+
+type externalWaitCompletedPayload struct {
+	WaitID          string `json:"wait_id"`
+	NodeKey         string `json:"node_key,omitempty"`
+	ReceivedEventID string `json:"received_event_id,omitempty"`
+	Status          string `json:"status,omitempty"`
+	PayloadDigest   string `json:"payload_digest,omitempty"`
+}
+
+type externalWaitExpiredPayload struct {
+	WaitID  string `json:"wait_id"`
+	NodeKey string `json:"node_key,omitempty"`
+}
+
+type externalWaitCancelledPayload struct {
+	WaitID  string `json:"wait_id"`
+	NodeKey string `json:"node_key,omitempty"`
+}
+
 func decodePayload(ev *Event, dst any) error {
 	if err := json.Unmarshal([]byte(ev.Payload), dst); err != nil {
 		return storeErr(CodeGraphInvalid, "event %s payload does not decode for type %s: %v",
@@ -676,14 +715,106 @@ func finishedAt(ev *Event, typ string) any {
 	}
 }
 
+func onExternalWaitRequested(ctx context.Context, tx *sql.Tx, ev *Event) error {
+	var p externalWaitRequestedPayload
+	if err := decodePayload(ev, &p); err != nil {
+		return err
+	}
+	nodeID, err := ensureRunNode(ctx, tx, ev.RunID, p.NodeKey)
+	if err != nil {
+		return err
+	}
+	var versionID, definitionDigest string
+	if err := tx.QueryRowContext(ctx,
+		"SELECT graph_version_id, definition_digest FROM graph_run WHERE id = ?", ev.RunID).Scan(&versionID, &definitionDigest); err != nil {
+		return err
+	}
+	waitID := p.WaitID
+	if waitID == "" {
+		waitID = ev.EventID
+	}
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO external_wait (id, run_id, run_node_id, graph_version_id, definition_digest,
+                           event_type, correlation_key, expected_condition, status,
+                           expires_at, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+ON CONFLICT(id) DO NOTHING`,
+		waitID, ev.RunID, nodeID, versionID, definitionDigest,
+		p.EventType, p.CorrelationKey, rawOr(p.ExpectedCondition, "{}"),
+		nullableInt(p.ExpiresAt), ev.OccurredAt)
+	return err
+}
+
+func onExternalEventReceived(ctx context.Context, tx *sql.Tx, ev *Event) error {
+	return nil
+}
+
+func onExternalWaitCompleted(ctx context.Context, tx *sql.Tx, ev *Event) error {
+	var p externalWaitCompletedPayload
+	if err := decodePayload(ev, &p); err != nil {
+		return err
+	}
+	waitID := p.WaitID
+	if waitID == "" {
+		waitID = ev.EventID
+	}
+	receivedEventID := p.ReceivedEventID
+	if receivedEventID == "" {
+		receivedEventID = ev.CausationID
+	}
+	_, err := tx.ExecContext(ctx, `
+UPDATE external_wait
+SET status = 'completed',
+    completed_event_id = COALESCE(?, completed_event_id),
+    payload_digest = COALESCE(?, payload_digest),
+    completed_at = ?
+WHERE id = ? AND status = 'pending'`,
+		nullableOr(receivedEventID), nullableOr(p.PayloadDigest), ev.OccurredAt, waitID)
+	return err
+}
+
+func onExternalWaitExpired(ctx context.Context, tx *sql.Tx, ev *Event) error {
+	var p externalWaitExpiredPayload
+	if err := decodePayload(ev, &p); err != nil {
+		return err
+	}
+	waitID := p.WaitID
+	if waitID == "" {
+		waitID = ev.EventID
+	}
+	_, err := tx.ExecContext(ctx, `
+UPDATE external_wait SET status = 'expired', completed_at = ? WHERE id = ? AND status = 'pending'`,
+		ev.OccurredAt, waitID)
+	return err
+}
+
+func onExternalWaitCancelled(ctx context.Context, tx *sql.Tx, ev *Event) error {
+	var p externalWaitCancelledPayload
+	if err := decodePayload(ev, &p); err != nil {
+		return err
+	}
+	waitID := p.WaitID
+	if waitID == "" {
+		waitID = ev.EventID
+	}
+	_, err := tx.ExecContext(ctx, `
+UPDATE external_wait SET status = 'cancelled', completed_at = ? WHERE id = ? AND status = 'pending'`,
+		ev.OccurredAt, waitID)
+	return err
+}
+
+func onExternalEventRejected(ctx context.Context, tx *sql.Tx, ev *Event) error {
+	return nil
+}
+
 var wipeOrder = []string{
-	"causal_link", "decision", "evaluation", "effect", "artifact", "outcome", "anchor",
+	"external_wait", "causal_link", "decision", "evaluation", "effect", "artifact", "outcome", "anchor",
 	"approval", "node_attempt", "run_edge", "run_node", "graph_run",
 }
 
 var digestTables = []string{
 	"graph_run", "run_node", "run_edge", "node_attempt", "artifact", "evaluation",
-	"effect", "decision", "causal_link", "approval", "outcome", "anchor",
+	"effect", "decision", "causal_link", "approval", "outcome", "anchor", "external_wait",
 }
 
 type RebuildReport struct {
@@ -826,28 +957,34 @@ FROM event ORDER BY run_id, sequence`)
 type projectionHandler func(ctx context.Context, tx *sql.Tx, ev *Event) error
 
 var projectedHandlers = map[string]projectionHandler{
-	"run_started":           onRunStarted,
-	"node_started":          onNodeStarted,
-	"node_finished":         onNodeTerminal,
-	"node_failed":           onNodeTerminal,
-	"node_uncertain":        onNodeTerminal,
-	"node_cancel_requested": onNodeCancelRequested,
-	"node_skipped":          onNodeSkipped,
-	"node_cancelled":        onNodeCancelled,
-	"node_requeued":         onNodeRequeued,
-	"node_waiting":          onNodeWaiting,
-	"node_reconciling":      onNodeReconciling,
-	"node_attempt_failed":   onNodeAttemptFailed,
-	"edge_traversed":        onEdgeTraversed,
-	"artifact_published":    onArtifactPublished,
-	"evaluation_failed":     onEvaluationFailed,
-	"effect_intent":         onEffectIntent,
-	"effect_receipt":        onEffectReceipt,
-	"approval_requested":    onApprovalRequested,
-	"approval_granted":      onApprovalDecided,
-	"approval_denied":       onApprovalDecided,
-	"decision_recorded":     onDecisionRecorded,
-	"run_completed":         onRunTerminal,
-	"run_failed":            onRunTerminal,
-	"run_cancelled":         onRunTerminal,
+	"run_started":             onRunStarted,
+	"node_started":            onNodeStarted,
+	"node_finished":           onNodeTerminal,
+	"node_failed":             onNodeTerminal,
+	"node_uncertain":          onNodeTerminal,
+	"node_cancel_requested":   onNodeCancelRequested,
+	"node_skipped":            onNodeSkipped,
+	"node_cancelled":          onNodeCancelled,
+	"node_requeued":           onNodeRequeued,
+	"node_waiting":            onNodeWaiting,
+	"node_reconciling":        onNodeReconciling,
+	"node_attempt_failed":     onNodeAttemptFailed,
+	"edge_traversed":          onEdgeTraversed,
+	"artifact_published":      onArtifactPublished,
+	"evaluation_failed":       onEvaluationFailed,
+	"effect_intent":           onEffectIntent,
+	"effect_receipt":          onEffectReceipt,
+	"approval_requested":      onApprovalRequested,
+	"approval_granted":        onApprovalDecided,
+	"approval_denied":         onApprovalDecided,
+	"decision_recorded":       onDecisionRecorded,
+	"run_completed":           onRunTerminal,
+	"run_failed":              onRunTerminal,
+	"run_cancelled":           onRunTerminal,
+	"external_wait_requested": onExternalWaitRequested,
+	"external_event_received": onExternalEventReceived,
+	"external_wait_completed": onExternalWaitCompleted,
+	"external_wait_expired":   onExternalWaitExpired,
+	"external_wait_cancelled": onExternalWaitCancelled,
+	"external_event_rejected": onExternalEventRejected,
 }

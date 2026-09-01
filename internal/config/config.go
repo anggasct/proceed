@@ -16,7 +16,7 @@ const (
 )
 
 var validScopes = map[string]bool{
-	"read": true, "run": true, "approve": true, "admin": true,
+	"read": true, "run": true, "approve": true, "admin": true, "event": true,
 }
 
 type Token struct {

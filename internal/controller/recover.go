@@ -56,6 +56,9 @@ JOIN graph_node gn ON gn.node_key = rn.node_key AND gn.graph_version_id = (
 			return err
 		}
 	}
+	if err := c.ExpireExternalWaits(ctx, nowMs); err != nil {
+		return err
+	}
 	return nil
 }
 

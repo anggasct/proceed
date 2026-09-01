@@ -19,6 +19,9 @@ func (c *Controller) Step(ctx context.Context, runID string) (bool, error) {
 	if run.status != "running" {
 		return false, nil
 	}
+	if err := c.ExpireExternalWaits(ctx, time.Now().UnixMilli()); err != nil {
+		return false, err
+	}
 	nodes, err := c.eligibleNodes(ctx, runID, run.graphVersionID)
 	if err != nil {
 		return false, err
@@ -107,6 +110,52 @@ func (c *Controller) Drain(ctx context.Context, runID string) error {
 			return settle(nil)
 		}
 	}
+}
+
+func (c *Controller) ResumeRun(ctx context.Context, runID string) error {
+	if err := c.leaseValid(ctx); err != nil {
+		if err := c.acquireLease(ctx, time.Now()); err != nil {
+			return err
+		}
+		defer func() {
+			if runStatusOf(c, context.Background(), runID) != "running" {
+				c.releaseLease(context.Background())
+			}
+		}()
+	}
+	for {
+		progressed, err := c.Step(ctx, runID)
+		if err != nil {
+			return err
+		}
+		if !progressed {
+			return nil
+		}
+	}
+}
+
+func (c *Controller) DrainServeTick(ctx context.Context) error {
+	rows, err := c.store.DB().QueryContext(ctx, "SELECT id FROM graph_run WHERE status = 'running'")
+	if err != nil {
+		return err
+	}
+	var runIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		runIDs = append(runIDs, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, runID := range runIDs {
+		_ = c.ResumeRun(ctx, runID)
+	}
+	return nil
 }
 
 func runStatusOf(c *Controller, ctx context.Context, runID string) string {
