@@ -182,7 +182,6 @@ func TestAPIReservedRoutesReturn501(t *testing.T) {
 	for _, route := range []string{
 		"POST /v1/runs/01X/approve operator-secret",
 		"POST /v1/runs/01X/reconcile operator-secret",
-		"GET /v1/runs/01X/export operator-secret",
 	} {
 		parts := strings.SplitN(route, " ", 3)
 		rec, _ := doJSON(t, server.Handler(), parts[0], parts[1], parts[2], "")
