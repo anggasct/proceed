@@ -52,6 +52,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return cmdServe(args[1:], stdout, stderr)
 		case "graph":
 			return cmdGraph(args[1:], stdout, stderr)
+		case "approve":
+			return cmdApprove(args[1:], stdout, stderr)
 		case "store":
 			return cmdStore(args[1:], stdout, stderr)
 		default:

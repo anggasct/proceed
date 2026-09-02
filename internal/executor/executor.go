@@ -104,6 +104,7 @@ var (
 	ErrCancelled       = errors.New("RUN_CANCELLED")
 	ErrUncertain       = errors.New("EFFECT_UNCERTAIN")
 	ErrNotReconcilable = errors.New("EFFECT_UNCERTAIN")
+	ErrWaitRequested   = errors.New("APPROVAL_REQUIRED")
 )
 
 type Executor interface {

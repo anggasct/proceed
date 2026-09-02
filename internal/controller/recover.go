@@ -59,7 +59,7 @@ JOIN graph_node gn ON gn.node_key = rn.node_key AND gn.graph_version_id = (
 	if err := c.ExpireExternalWaits(ctx, nowMs); err != nil {
 		return err
 	}
-	return nil
+	return c.ExpireApprovals(ctx, nowMs)
 }
 
 func (c *Controller) recoverNode(ctx context.Context, runID, nodeKey, config, status string) error {
