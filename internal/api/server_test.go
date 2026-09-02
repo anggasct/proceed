@@ -176,6 +176,96 @@ edges: []
 	}
 }
 
+func TestAPIExportEndpoint(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Tokens = append(cfg.Tokens, config.Token{Name: "writer", Token: "writer-secret", Scopes: []string{"run"}})
+	server, _, _ := testServer(t, cfg)
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	defer target.Close()
+
+	graphPath := filepath.Join(cfg.DataDir, "graph.yaml")
+	graphYAML := fmt.Sprintf(`schema: proceed/v1
+name: api-export
+nodes:
+  - id: call
+    type: task
+    executor:
+      kind: http
+      method: GET
+      url: %s
+    contract: reconcilable
+    terminal: true
+    capability:
+      network:
+        allowlisted_hosts: [127.0.0.1]
+edges: []
+`, target.URL)
+	if err := os.WriteFile(graphPath, []byte(graphYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, payload := doJSON(t, server.Handler(), "POST", "/v1/runs", "operator-secret",
+		`{"graph":`+jsonString(graphPath)+`}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body = %v", rec.Code, payload)
+	}
+	runID := payload["run_id"].(string)
+
+	rec, payload = doJSON(t, server.Handler(), "GET", "/v1/runs/"+runID+"/export", "writer-secret", "")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("no-read-scope export status = %d, want 403", rec.Code)
+	}
+	if payload["error"].(map[string]any)["code"] != "POLICY_DENIED" {
+		t.Fatalf("envelope = %v", payload)
+	}
+
+	rec, payload = doJSON(t, server.Handler(), "GET", "/v1/runs/"+runID+"/export?format=yaml", "viewer-secret", "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown-format export status = %d, want 400", rec.Code)
+	}
+	if payload["error"].(map[string]any)["code"] != "GRAPH_INVALID" {
+		t.Fatalf("envelope = %v", payload)
+	}
+
+	rec, payload = doJSON(t, server.Handler(), "GET", "/v1/runs/01Unknown/export?format=json", "viewer-secret", "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown-run export status = %d, want 404", rec.Code)
+	}
+	if payload["error"].(map[string]any)["code"] != "RUN_NOT_FOUND" {
+		t.Fatalf("envelope = %v", payload)
+	}
+
+	rec, _ = doJSON(t, server.Handler(), "GET", "/v1/runs/"+runID+"/export?format=mermaid", "viewer-secret", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mermaid export status = %d", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "text/plain; charset=utf-8" {
+		t.Fatalf("mermaid content type = %q", got)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "flowchart TD") || !strings.Contains(body, "call") {
+		t.Fatalf("mermaid body = %q", body)
+	}
+
+	rec, payload = doJSON(t, server.Handler(), "GET", "/v1/runs/"+runID+"/export?format=json", "viewer-secret", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("json export status = %d", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("json content type = %q", got)
+	}
+	if payload["run_id"] != runID || payload["status"] != "completed" {
+		t.Fatalf("json payload = %v", payload)
+	}
+
+	rec, _ = doJSON(t, server.Handler(), "GET", "/v1/runs/"+runID+"/export", "viewer-secret", "")
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("default format status = %d content type = %q", rec.Code, rec.Header().Get("Content-Type"))
+	}
+}
+
 func TestAPIReservedRoutesReturn501(t *testing.T) {
 	cfg := testConfig(t)
 	server, _, _ := testServer(t, cfg)
