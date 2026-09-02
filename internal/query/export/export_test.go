@@ -18,13 +18,13 @@ import (
 	"proceed/internal/store"
 )
 
-func openTestStore(t *testing.T) *store.Store {
-	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
+func openTestStore(tb testing.TB) *store.Store {
+	tb.Helper()
+	st, err := store.Open(filepath.Join(tb.TempDir(), "proceed.db"))
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
-	t.Cleanup(func() { _ = st.Close() })
+	tb.Cleanup(func() { _ = st.Close() })
 	return st
 }
 
@@ -74,14 +74,7 @@ edges:
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Simulate a completed run by inserting run_node and run_edge and artifacts via events?
-	// Use store's event log to drive projections: create run, then manually advance via RunGraph? Simpler: use controller to run? But to keep test lightweight, we will directly insert via events using the store's projection path.
-	// Instead, we will use the controller's drain? For this test we need a fixture that has nodes with states and edges traversed.
-	// We can manually create run_nodes and run_edges via direct SQL to simulate completed run fixture without invoking controller.
-	// However, the export reads from graph_node + run_node + graph_edge + run_edge + artifact, so we need at least run_node rows with statuses and run_edge rows.
-	// We'll insert them directly.
 	db := st.DB()
-	// Get graph nodes
 	rows, err := db.QueryContext(ctx, "SELECT node_key FROM graph_node WHERE graph_version_id = ?", frozen.GraphVersionID)
 	if err != nil {
 		t.Fatal(err)
@@ -105,7 +98,6 @@ edges:
 		if status == "" {
 			status = "pending"
 		}
-		// Use the test helper: insert run_node via store's internal? We'll insert directly.
 		_, err := db.ExecContext(ctx, "INSERT INTO run_node (id, run_id, node_key, status, attempt_count) VALUES (?, ?, ?, ?, 1) ON CONFLICT(run_id, node_key) DO UPDATE SET status = excluded.status", stID(), run.ID, k, status)
 		if err != nil {
 			t.Fatal(err)
@@ -411,7 +403,7 @@ func TestUnknownRunAndFormat(t *testing.T) {
 	}
 }
 
-func TestLargeRunStreaming(t *testing.T) {
+func TestLargeRun(t *testing.T) {
 	ctx := context.Background()
 	st := openTestStore(t)
 	graphYAML := "schema: proceed/v1\nname: large-run\nnodes:\n"
@@ -455,5 +447,145 @@ func TestInFlightSnapshot(t *testing.T) {
 	_ = json.Unmarshal(out, &v)
 	if v["run_id"] != runID {
 		t.Fatalf("run_id mismatch")
+	}
+}
+
+func insertExportFixtureGraph(tb testing.TB, st *store.Store, nodes []string, edges [][4]string) (string, string) {
+	tb.Helper()
+	ctx := context.Background()
+	db := st.DB()
+	graphID, versionID := stID(), stID()
+	if _, err := db.ExecContext(ctx, "INSERT INTO graph (id, name) VALUES (?, ?)", graphID, "export-fixture-graph"); err != nil {
+		tb.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO graph_version (id, graph_id, definition_digest, source_schema_version, compiled_schema_version, source_metadata, extras, status, created_at) VALUES (?, ?, ?, 'proceed/v1', 'v1', '{}', '{}', 'frozen', ?)", versionID, graphID, "digest-"+versionID, time.Now().UnixMilli()); err != nil {
+		tb.Fatal(err)
+	}
+	for _, k := range nodes {
+		if _, err := db.ExecContext(ctx, "INSERT INTO graph_node (id, graph_version_id, node_key, type, config) VALUES (?, ?, ?, 'task', '{}')", stID(), versionID, k); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	for _, e := range edges {
+		cond := e[3]
+		if _, err := db.ExecContext(ctx, "INSERT INTO graph_edge (id, graph_version_id, from_node_key, to_node_key, type, condition, extras) VALUES (?, ?, ?, ?, 'routes_to', ?, '{}')", e[0], versionID, e[1], e[2], cond); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	return versionID, graphID
+}
+
+func TestCycleEdgeTraversals(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	versionID, _ := insertExportFixtureGraph(t, st,
+		[]string{"a", "b"},
+		[][4]string{{"edge-loop", "a", "a", "success"}},
+	)
+	db := st.DB()
+	runID := stID()
+	if _, err := db.ExecContext(ctx, "INSERT INTO graph_run (id, graph_version_id, definition_digest, status, created_at) VALUES (?, ?, 'digest', 'completed', ?)", runID, versionID, time.Now().UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	for _, trav := range [][2]string{{"success", "1"}, {"failure", "2"}} {
+		if _, err := db.ExecContext(ctx, "INSERT INTO run_edge (id, run_id, edge_id, route, sequence_in_run, traversed_at) VALUES (?, ?, 'edge-loop', ?, ?, ?)", stID(), runID, trav[0], trav[1], 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	out, err := Export(ctx, st, runID, "json")
+	if err != nil {
+		t.Fatalf("json export: %v", err)
+	}
+	var v map[string]any
+	if err := json.Unmarshal(out, &v); err != nil {
+		t.Fatal(err)
+	}
+	edges, _ := v["edges"].([]any)
+	if len(edges) != 1 {
+		t.Fatalf("expected 1 edge entry for a definition edge traversed twice, got %d: %s", len(edges), string(out))
+	}
+	e, _ := edges[0].(map[string]any)
+	if e["from"] != "a" || e["to"] != "a" || e["traversed"] != true {
+		t.Fatalf("unexpected edge entry: %+v", e)
+	}
+	if e["route"] != "success,failure" {
+		t.Fatalf("route must list distinct traversals in traversal order, got %q", e["route"])
+	}
+
+	m, err := Export(ctx, st, runID, "mermaid")
+	if err != nil {
+		t.Fatalf("mermaid export: %v", err)
+	}
+	s := string(m)
+	want := "  a -->|success,failure| a\n"
+	if strings.Count(s, "a -->|") != 1 {
+		t.Fatalf("expected exactly one edge line for the loop, got:\n%s", s)
+	}
+	if !strings.Contains(s, want) {
+		t.Fatalf("expected edge line %q in:\n%s", want, s)
+	}
+}
+
+func TestMermaidDistinctKeysNoCollision(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	versionID, _ := insertExportFixtureGraph(t, st,
+		[]string{"a-b", "a_b"},
+		nil,
+	)
+	db := st.DB()
+	runID := stID()
+	if _, err := db.ExecContext(ctx, "INSERT INTO graph_run (id, graph_version_id, definition_digest, status, created_at) VALUES (?, ?, 'digest', 'running', ?)", runID, versionID, time.Now().UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	out, err := Export(ctx, st, runID, "mermaid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	nodeLines := 0
+	for _, line := range strings.Split(s, "\n") {
+		if strings.Contains(line, "[\"") {
+			nodeLines++
+		}
+	}
+	if nodeLines != 2 {
+		t.Fatalf("distinct keys a-b and a_b must render as 2 nodes, got %d:\n%s", nodeLines, s)
+	}
+	if !strings.Contains(s, "  a_b[\"") || !strings.Contains(s, "  a_b_2[\"") {
+		t.Fatalf("collision must be resolved with deterministic suffixes:\n%s", s)
+	}
+}
+
+func BenchmarkExportLargeRun(b *testing.B) {
+	ctx := context.Background()
+	st := openTestStore(b)
+	const n = 5000
+	nodes := make([]string, n)
+	for i := range nodes {
+		nodes[i] = fmt.Sprintf("n%d", i)
+	}
+	edges := make([][4]string, 0, n-1)
+	edgeIDs := make([]string, 0, n-1)
+	for i := 0; i < n-1; i++ {
+		edgeIDs = append(edgeIDs, stID())
+		edges = append(edges, [4]string{edgeIDs[i], nodes[i], nodes[i+1], ""})
+	}
+	versionID, _ := insertExportFixtureGraph(b, st, nodes, edges)
+	db := st.DB()
+	runID := stID()
+	if _, err := db.ExecContext(ctx, "INSERT INTO graph_run (id, graph_version_id, definition_digest, status, created_at) VALUES (?, ?, 'digest', 'completed', ?)", runID, versionID, time.Now().UnixMilli()); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out, err := Export(ctx, st, runID, "json")
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(out) == 0 {
+			b.Fatal("empty export")
+		}
 	}
 }

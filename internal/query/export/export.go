@@ -27,6 +27,9 @@ func ValidateFormat(format string) error {
 	}
 }
 
+// Export renders a run snapshot in the requested format. The whole document
+// is materialized in memory, so peak memory scales with run size rather than
+// being bounded during streaming.
 func Export(ctx context.Context, s *store.Store, runID, format string) ([]byte, error) {
 	if err := ValidateFormat(format); err != nil {
 		return nil, store.NewCodeError("GRAPH_INVALID", "%v", err)
@@ -123,23 +126,52 @@ ORDER BY gn.node_key`, runID, g.GraphVersionID)
 		return nil, err
 	}
 
+	travRows, err := tx.QueryContext(ctx, `
+SELECT edge_id, COALESCE(route, '') FROM run_edge WHERE run_id = ? ORDER BY edge_id, sequence_in_run`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer travRows.Close()
+	traversedRoutes := make(map[string][]string)
+	for travRows.Next() {
+		var edgeID, route string
+		if err := travRows.Scan(&edgeID, &route); err != nil {
+			return nil, err
+		}
+		seen := false
+		for _, r := range traversedRoutes[edgeID] {
+			if r == route {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			traversedRoutes[edgeID] = append(traversedRoutes[edgeID], route)
+		}
+	}
+	if err := travRows.Err(); err != nil {
+		return nil, err
+	}
+
 	edgeRows, err := tx.QueryContext(ctx, `
-SELECT ge.from_node_key, ge.to_node_key, ge.type, COALESCE(ge.condition, ''), COALESCE(re.route, ''), EXISTS(SELECT 1 FROM run_edge re2 WHERE re2.run_id = ? AND re2.edge_id = ge.id)
-FROM graph_edge ge
-LEFT JOIN run_edge re ON re.edge_id = ge.id AND re.run_id = ?
-WHERE ge.graph_version_id = ?
-ORDER BY ge.from_node_key, ge.to_node_key`, runID, runID, g.GraphVersionID)
+SELECT id, from_node_key, to_node_key, type, COALESCE(condition, '')
+FROM graph_edge
+WHERE graph_version_id = ?
+ORDER BY from_node_key, to_node_key`, g.GraphVersionID)
 	if err != nil {
 		return nil, err
 	}
 	defer edgeRows.Close()
 	for edgeRows.Next() {
+		var edgeID string
 		var e edgeWithRoute
-		var traversed int
-		if err := edgeRows.Scan(&e.From, &e.To, &e.Type, &e.Condition, &e.Route, &traversed); err != nil {
+		if err := edgeRows.Scan(&edgeID, &e.From, &e.To, &e.Type, &e.Condition); err != nil {
 			return nil, err
 		}
-		e.Traversed = traversed != 0
+		if routes := traversedRoutes[edgeID]; len(routes) > 0 {
+			e.Traversed = true
+			e.Route = strings.Join(routes, ",")
+		}
 		g.Edges = append(g.Edges, e)
 	}
 	if err := edgeRows.Err(); err != nil {
@@ -188,10 +220,11 @@ FROM artifact WHERE run_id = ? ORDER BY produced_by_node_key, name`, runID)
 }
 
 func renderMermaid(data *exportData) string {
+	ids := resolveMermaidIDs(data)
 	var b strings.Builder
 	b.WriteString("flowchart TD\n")
 	for _, n := range data.Nodes {
-		safeKey := sanitizeMermaidID(n.NodeKey)
+		safeKey := ids[n.NodeKey]
 		escapedKey := escapeMermaidLabel(n.NodeKey)
 		escapedStatus := escapeMermaidLabel(n.Status)
 		label := fmt.Sprintf("%s<br/>%s", escapedKey, escapedStatus)
@@ -201,8 +234,8 @@ func renderMermaid(data *exportData) string {
 		b.WriteString(fmt.Sprintf("  %s[\"%s\"]\n", safeKey, label))
 	}
 	for _, e := range data.Edges {
-		from := sanitizeMermaidID(e.From)
-		to := sanitizeMermaidID(e.To)
+		from := ids[e.From]
+		to := ids[e.To]
 		routeLabel := e.Condition
 		if e.Route != "" {
 			routeLabel = e.Route
@@ -252,6 +285,36 @@ func escapeMermaidLabel(s string) string {
 		}
 	}
 	return b.String()
+}
+
+func resolveMermaidIDs(data *exportData) map[string]string {
+	var keys []string
+	seen := make(map[string]bool)
+	addKey := func(k string) {
+		if !seen[k] {
+			seen[k] = true
+			keys = append(keys, k)
+		}
+	}
+	for _, n := range data.Nodes {
+		addKey(n.NodeKey)
+	}
+	for _, e := range data.Edges {
+		addKey(e.From)
+		addKey(e.To)
+	}
+	ids := make(map[string]string, len(keys))
+	used := make(map[string]bool)
+	for _, k := range keys {
+		base := sanitizeMermaidID(k)
+		id := base
+		for n := 2; used[id]; n++ {
+			id = fmt.Sprintf("%s_%d", base, n)
+		}
+		used[id] = true
+		ids[k] = id
+	}
+	return ids
 }
 
 func sanitizeMermaidID(id string) string {
