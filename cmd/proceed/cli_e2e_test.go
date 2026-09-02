@@ -298,6 +298,77 @@ func TestCLIGraphInspect(t *testing.T) {
 	}
 }
 
+func TestCLIGraphExport(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	defer server.Close()
+	graph := writeGraph(t, dir, httpNodeGraph(server.URL, "reconcilable"))
+
+	code, _, stderr := runCLI(t, "run", graph, "--data-dir", dataDir)
+	if code != 0 {
+		t.Fatalf("run exit = %d stderr = %q", code, stderr)
+	}
+
+	st, err := store.Open(filepath.Join(dataDir, "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	var runID string
+	if err := st.DB().QueryRow("SELECT id FROM graph_run LIMIT 1").Scan(&runID); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, stderr = runCLI(t, "graph", "export", runID, "--data-dir", dataDir)
+	if code != 2 {
+		t.Fatalf("export missing --format exit = %d, want 2, stderr = %q", code, stderr)
+	}
+	if !strings.Contains(stderr, "--format mermaid|json is required") {
+		t.Fatalf("stderr = %q, want missing-format usage text", stderr)
+	}
+
+	code, _, stderr = runCLI(t, "graph", "export", runID, "--format", "bogus", "--data-dir", dataDir)
+	if code != 2 {
+		t.Fatalf("export unknown format exit = %d, want 2, stderr = %q", code, stderr)
+	}
+	if !strings.Contains(stderr, "unknown format") {
+		t.Fatalf("stderr = %q, want unknown-format usage text", stderr)
+	}
+
+	code, _, stderr = runCLI(t, "graph", "export", "01NOSUCHRUN", "--format", "json", "--data-dir", dataDir)
+	if code != 12 {
+		t.Fatalf("export unknown run exit = %d, want 12, stderr = %q", code, stderr)
+	}
+	if !strings.Contains(stderr, "RUN_NOT_FOUND") {
+		t.Fatalf("stderr = %q, want RUN_NOT_FOUND", stderr)
+	}
+
+	code, stdout, stderr := runCLI(t, "graph", "export", runID, "--format", "mermaid", "--data-dir", dataDir)
+	if code != 0 {
+		t.Fatalf("export mermaid exit = %d stderr = %q", code, stderr)
+	}
+	if !strings.Contains(stdout, "flowchart TD") {
+		t.Fatalf("mermaid stdout = %q, want flowchart document", stdout)
+	}
+
+	code, stdout, _ = runCLI(t, "graph", "export", runID, "--format", "json", "--data-dir", dataDir)
+	if code != 0 {
+		t.Fatalf("export json exit = %d", code)
+	}
+	var payload struct {
+		RunID string `json:"run_id"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+		t.Fatalf("export output not JSON: %q", stdout)
+	}
+	if payload.RunID != runID {
+		t.Fatalf("export run_id = %q, want %q", payload.RunID, runID)
+	}
+}
+
 func TestExitCodeMatrixComplete(t *testing.T) {
 	canon := []string{
 		"GRAPH_INVALID", "POLICY_DENIED", "RUN_NOT_FOUND",
