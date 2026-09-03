@@ -14,6 +14,7 @@ import (
 	"proceed/internal/config"
 	"proceed/internal/controller"
 	"proceed/internal/executor"
+	agentexec "proceed/internal/executor/agent"
 	approvalexec "proceed/internal/executor/approval"
 	httpexec "proceed/internal/executor/http"
 	"proceed/internal/executor/shell"
@@ -94,11 +95,12 @@ func resolveConfig(f cliFlags) (config.Config, error) {
 	return cfg, nil
 }
 
-func buildPool() map[executor.Kind]executor.Executor {
+func buildPool(agentCLIs map[string]string) map[executor.Kind]executor.Executor {
 	return map[executor.Kind]executor.Executor{
 		executor.Shell:         shell.New(),
 		executor.HTTP:          httpexec.New(),
 		executor.HumanApproval: approvalexec.New(),
+		executor.AgentCLI:      agentexec.New(agentCLIs),
 	}
 }
 
@@ -133,7 +135,7 @@ func cmdRun(args []string, stdout, stderr io.Writer) int {
 	}
 	defer st.Close()
 
-	c, err := controller.New(st, controller.DefaultConfig(), buildPool())
+	c, err := controller.New(st, controller.DefaultConfig(), buildPool(cfg.AgentCLIs))
 	if err != nil {
 		fmt.Fprintf(stderr, "proceed: %v\n", err)
 		return exitUnclassified

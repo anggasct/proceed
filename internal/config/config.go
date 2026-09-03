@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -26,15 +27,17 @@ type Token struct {
 }
 
 type Config struct {
-	DataDir string  `yaml:"data_dir"`
-	Bind    string  `yaml:"bind"`
-	Tokens  []Token `yaml:"tokens"`
+	DataDir   string            `yaml:"data_dir"`
+	Bind      string            `yaml:"bind"`
+	Tokens    []Token           `yaml:"tokens"`
+	AgentCLIs map[string]string `yaml:"agent_clis"`
 }
 
 type fileConfig struct {
-	DataDir string  `yaml:"data_dir"`
-	Bind    string  `yaml:"bind"`
-	Tokens  []Token `yaml:"tokens"`
+	DataDir   string            `yaml:"data_dir"`
+	Bind      string            `yaml:"bind"`
+	Tokens    []Token           `yaml:"tokens"`
+	AgentCLIs map[string]string `yaml:"agent_clis"`
 }
 
 func Resolve(path string, getenv func(string) string) (Config, error) {
@@ -54,6 +57,7 @@ func Resolve(path string, getenv func(string) string) (Config, error) {
 				cfg.Bind = fc.Bind
 			}
 			cfg.Tokens = fc.Tokens
+			cfg.AgentCLIs = fc.AgentCLIs
 		case os.IsNotExist(err):
 		default:
 			return Config{}, err
@@ -99,6 +103,14 @@ func (c *Config) validate() error {
 			if !validScopes[scope] {
 				return fmt.Errorf("token %q has unknown scope %q", token.Name, scope)
 			}
+		}
+	}
+	for name, path := range c.AgentCLIs {
+		if name == "" {
+			return fmt.Errorf("agent CLI entries require a name")
+		}
+		if path == "" || !filepath.IsAbs(path) {
+			return fmt.Errorf("agent CLI %q requires an absolute binary path", name)
 		}
 	}
 	return nil

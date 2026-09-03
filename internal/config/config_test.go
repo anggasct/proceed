@@ -126,3 +126,28 @@ tokens:
 		t.Fatal("scopeless token must fail")
 	}
 }
+
+func TestAgentCLIAllowlist(t *testing.T) {
+	cfg, err := Resolve(writeConfig(t, `
+agent_clis:
+  helper: /usr/local/bin/helper
+`), func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if cfg.AgentCLIs["helper"] != "/usr/local/bin/helper" {
+		t.Fatalf("AgentCLIs = %v", cfg.AgentCLIs)
+	}
+	if _, err := Resolve(writeConfig(t, `
+agent_clis:
+  helper: relative/path
+`), func(string) string { return "" }); err == nil {
+		t.Fatal("relative agent CLI path must fail")
+	}
+	if _, err := Resolve(writeConfig(t, `
+agent_clis:
+  "": /usr/local/bin/helper
+`), func(string) string { return "" }); err == nil {
+		t.Fatal("empty agent CLI name must fail")
+	}
+}
