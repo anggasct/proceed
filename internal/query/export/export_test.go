@@ -350,9 +350,12 @@ func TestByteIdentical(t *testing.T) {
 func TestReadOnlyNoWrites(t *testing.T) {
 	ctx := context.Background()
 	st, runID := fixtureRun(t)
+	beforeDigest, err := st.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	beforeEvents, _ := countEvents(t, st, runID)
-	beforeNodes, _ := countRunNodes(t, st, runID)
-	_, err := Export(ctx, st, runID, "json")
+	_, err = Export(ctx, st, runID, "json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,13 +363,16 @@ func TestReadOnlyNoWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	afterDigest, err := st.ProjectionDigest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	afterEvents, _ := countEvents(t, st, runID)
-	afterNodes, _ := countRunNodes(t, st, runID)
 	if beforeEvents != afterEvents {
 		t.Fatalf("export mutated events: before %d after %d", beforeEvents, afterEvents)
 	}
-	if beforeNodes != afterNodes {
-		t.Fatalf("export mutated run_nodes: before %d after %d", beforeNodes, afterNodes)
+	if beforeDigest != afterDigest {
+		t.Fatalf("export mutated projections: digest before %q after %q", beforeDigest, afterDigest)
 	}
 }
 
@@ -374,13 +380,6 @@ func countEvents(t *testing.T, st *store.Store, runID string) (int, error) {
 	t.Helper()
 	var c int
 	err := st.DB().QueryRowContext(context.Background(), "SELECT COUNT(*) FROM event WHERE run_id = ?", runID).Scan(&c)
-	return c, err
-}
-
-func countRunNodes(t *testing.T, st *store.Store, runID string) (int, error) {
-	t.Helper()
-	var c int
-	err := st.DB().QueryRowContext(context.Background(), "SELECT COUNT(*) FROM run_node WHERE run_id = ?", runID).Scan(&c)
 	return c, err
 }
 
