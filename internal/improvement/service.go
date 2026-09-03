@@ -93,6 +93,9 @@ func (s *Service) RecordMetric(ctx context.Context, m Metric) (*Metric, error) {
 	}
 	var dimStr any = nil
 	if len(m.Dimensions) > 0 && string(m.Dimensions) != "null" {
+		if !json.Valid(m.Dimensions) {
+			return nil, errors.New("metric dimensions must be well-formed JSON")
+		}
 		dimStr = string(m.Dimensions)
 	}
 
@@ -239,21 +242,6 @@ func (s *Service) CreateProposal(ctx context.Context, req CreateProposalRequest)
 		return nil, errors.New("proposed_change is required")
 	}
 
-	var versionStatus, digest string
-	err := s.st.DB().QueryRowContext(ctx, `
-SELECT status, definition_digest FROM graph_version WHERE id = ?`, req.TargetGraphVersionID).
-		Scan(&versionStatus, &digest)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("target graph version %s does not exist", req.TargetGraphVersionID)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	if versionStatus == "superseded" && strings.TrimSpace(req.SupersedesProposalID) == "" {
-		return nil, errors.New("proposal targeting a superseded version must explicitly specify supersedes_proposal_id")
-	}
-
 	status := ProposalStatusDraft
 	if req.Status == ProposalStatusProposed {
 		status = ProposalStatusProposed
@@ -269,35 +257,65 @@ SELECT status, definition_digest FROM graph_version WHERE id = ?`, req.TargetGra
 		supersedesRef = strings.TrimSpace(req.SupersedesProposalID)
 	}
 
-	_, err = s.st.DB().ExecContext(ctx, `
+	var created *PolicyChangeProposal
+	err := s.st.WithTx(ctx, func(tx *sql.Tx) error {
+		var versionStatus, digest string
+		err := tx.QueryRowContext(ctx, `
+SELECT status, definition_digest FROM graph_version WHERE id = ?`, req.TargetGraphVersionID).
+			Scan(&versionStatus, &digest)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("target graph version %s does not exist", req.TargetGraphVersionID)
+		}
+		if err != nil {
+			return err
+		}
+
+		if versionStatus == "superseded" && strings.TrimSpace(req.SupersedesProposalID) == "" {
+			return errors.New("proposal targeting a superseded version must explicitly specify supersedes_proposal_id")
+		}
+
+		if _, err := tx.ExecContext(ctx, `
 INSERT INTO policy_change_proposal (id, target_graph_version_id, status, rationale, proposed_change, supersedes_proposal_id, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		proposalID, req.TargetGraphVersionID, string(status), req.Rationale, req.ProposedChange, supersedesRef, now)
+			proposalID, req.TargetGraphVersionID, string(status), req.Rationale, req.ProposedChange, supersedesRef, now); err != nil {
+			return err
+		}
+
+		var supersedesPtr *string
+		if supersedesRef != nil {
+			sVal := supersedesRef.(string)
+			supersedesPtr = &sVal
+		}
+
+		created = &PolicyChangeProposal{
+			ID:                   proposalID,
+			TargetGraphVersionID: req.TargetGraphVersionID,
+			TargetDigest:         digest,
+			Status:               status,
+			Rationale:            req.Rationale,
+			ProposedChange:       req.ProposedChange,
+			SupersedesProposalID: supersedesPtr,
+			CreatedAt:            now,
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	var supersedesPtr *string
-	if supersedesRef != nil {
-		sVal := supersedesRef.(string)
-		supersedesPtr = &sVal
-	}
-
-	return &PolicyChangeProposal{
-		ID:                   proposalID,
-		TargetGraphVersionID: req.TargetGraphVersionID,
-		TargetDigest:         digest,
-		Status:               status,
-		Rationale:            req.Rationale,
-		ProposedChange:       req.ProposedChange,
-		SupersedesProposalID: supersedesPtr,
-		CreatedAt:            now,
-	}, nil
+	return created, nil
 }
 
 func (s *Service) GetProposal(ctx context.Context, id string) (*PolicyChangeProposal, error) {
-	row := s.st.DB().QueryRowContext(ctx, `
-SELECT p.id, p.target_graph_version_id, gv.definition_digest, p.status, p.rationale,
+	return queryProposal(ctx, s.st.DB(), id)
+}
+
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func queryProposal(ctx context.Context, q rowQuerier, id string) (*PolicyChangeProposal, error) {
+	row := q.QueryRowContext(ctx, `
+SELECT p.id, p.target_graph_version_id, gv.definition_digest, p.status, p.rationale, p.rejection_reason,
        p.proposed_change, p.approval_id, p.supersedes_proposal_id, p.created_at, p.decided_at
 FROM policy_change_proposal p
 JOIN graph_version gv ON gv.id = p.target_graph_version_id
@@ -305,10 +323,10 @@ WHERE p.id = ?`, id)
 
 	var p PolicyChangeProposal
 	var status string
-	var appID, supID sql.NullString
+	var appID, supID, rejection sql.NullString
 	var decAt sql.NullInt64
 
-	if err := row.Scan(&p.ID, &p.TargetGraphVersionID, &p.TargetDigest, &status, &p.Rationale,
+	if err := row.Scan(&p.ID, &p.TargetGraphVersionID, &p.TargetDigest, &status, &p.Rationale, &rejection,
 		&p.ProposedChange, &appID, &supID, &p.CreatedAt, &decAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -322,6 +340,9 @@ WHERE p.id = ?`, id)
 	}
 	if supID.Valid {
 		p.SupersedesProposalID = &supID.String
+	}
+	if rejection.Valid {
+		p.RejectionReason = &rejection.String
 	}
 	if decAt.Valid {
 		p.DecidedAt = &decAt.Int64
@@ -362,42 +383,66 @@ func (s *Service) ApproveProposal(ctx context.Context, proposalID, approvalID st
 		return nil, errors.New("approval reference is required to approve proposal")
 	}
 
-	p, err := s.GetProposal(ctx, proposalID)
-	if err != nil {
-		return nil, err
-	}
-	if p == nil {
-		return nil, fmt.Errorf("proposal %s not found", proposalID)
-	}
-	if p.Status != ProposalStatusProposed {
-		return nil, fmt.Errorf("cannot approve proposal with status %s; must be in proposed", p.Status)
-	}
-
-	var appDecision sql.NullString
-	err = s.st.DB().QueryRowContext(ctx, `SELECT decision FROM approval WHERE id = ?`, approvalID).Scan(&appDecision)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("referenced approval %s does not exist", approvalID)
-	}
-	if err != nil {
-		return nil, err
-	}
-	if !appDecision.Valid || appDecision.String != "grant" {
-		return nil, fmt.Errorf("referenced approval %s decision is not grant (got %v)", approvalID, appDecision.String)
-	}
-
 	now := time.Now().UnixMilli()
-	_, err = s.st.DB().ExecContext(ctx, `
+	var approved *PolicyChangeProposal
+	err := s.st.WithTx(ctx, func(tx *sql.Tx) error {
+		p, err := queryProposal(ctx, tx, proposalID)
+		if err != nil {
+			return err
+		}
+		if p == nil {
+			return fmt.Errorf("proposal %s not found", proposalID)
+		}
+		if p.Status != ProposalStatusProposed {
+			return fmt.Errorf("cannot approve proposal with status %s; must be in proposed", p.Status)
+		}
+
+		var decision sql.NullString
+		var approvalVersion string
+		var expiresAt int64
+		err = tx.QueryRowContext(ctx, `SELECT decision, graph_version_id, expires_at FROM approval WHERE id = ?`, approvalID).
+			Scan(&decision, &approvalVersion, &expiresAt)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("referenced approval %s does not exist", approvalID)
+		}
+		if err != nil {
+			return err
+		}
+		if !decision.Valid || decision.String != "grant" {
+			return fmt.Errorf("referenced approval %s decision is not grant (got %v)", approvalID, decision)
+		}
+		if approvalVersion != p.TargetGraphVersionID {
+			return fmt.Errorf("referenced approval %s is bound to graph version %s, not the proposal's target version %s", approvalID, approvalVersion, p.TargetGraphVersionID)
+		}
+		if expiresAt <= now {
+			return fmt.Errorf("referenced approval %s expired at %d", approvalID, expiresAt)
+		}
+
+		res, err := tx.ExecContext(ctx, `
 UPDATE policy_change_proposal
 SET status = 'approved', approval_id = ?, decided_at = ?
 WHERE id = ? AND status = 'proposed'`, approvalID, now, proposalID)
+		if err != nil {
+			return err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			return fmt.Errorf("proposal %s was not updated; it is no longer in proposed", proposalID)
+		}
+
+		p.Status = ProposalStatusApproved
+		p.ApprovalID = &approvalID
+		p.DecidedAt = &now
+		approved = p
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	p.Status = ProposalStatusApproved
-	p.ApprovalID = &approvalID
-	p.DecidedAt = &now
-	return p, nil
+	return approved, nil
 }
 
 func (s *Service) RejectProposal(ctx context.Context, proposalID, rationale string) (*PolicyChangeProposal, error) {
@@ -405,56 +450,105 @@ func (s *Service) RejectProposal(ctx context.Context, proposalID, rationale stri
 		return nil, errors.New("rejection rationale is required")
 	}
 
-	p, err := s.GetProposal(ctx, proposalID)
-	if err != nil {
-		return nil, err
-	}
-	if p == nil {
-		return nil, fmt.Errorf("proposal %s not found", proposalID)
-	}
-	if p.Status != ProposalStatusProposed {
-		return nil, fmt.Errorf("cannot reject proposal with status %s; must be in proposed", p.Status)
-	}
-
 	now := time.Now().UnixMilli()
-	_, err = s.st.DB().ExecContext(ctx, `
+	var rejected *PolicyChangeProposal
+	err := s.st.WithTx(ctx, func(tx *sql.Tx) error {
+		p, err := queryProposal(ctx, tx, proposalID)
+		if err != nil {
+			return err
+		}
+		if p == nil {
+			return fmt.Errorf("proposal %s not found", proposalID)
+		}
+		if p.Status != ProposalStatusProposed {
+			return fmt.Errorf("cannot reject proposal with status %s; must be in proposed", p.Status)
+		}
+
+		res, err := tx.ExecContext(ctx, `
 UPDATE policy_change_proposal
-SET status = 'rejected', rationale = ?, decided_at = ?
+SET status = 'rejected', rejection_reason = ?, decided_at = ?
 WHERE id = ? AND status = 'proposed'`, rationale, now, proposalID)
+		if err != nil {
+			return err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			return fmt.Errorf("proposal %s was not updated; it is no longer in proposed", proposalID)
+		}
+
+		p.Status = ProposalStatusRejected
+		p.RejectionReason = &rationale
+		p.DecidedAt = &now
+		rejected = p
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	p.Status = ProposalStatusRejected
-	p.Rationale = rationale
-	p.DecidedAt = &now
-	return p, nil
+	return rejected, nil
 }
 
 func (s *Service) SupersedeProposal(ctx context.Context, proposalID string, supersedingProposalID string) (*PolicyChangeProposal, error) {
-	p, err := s.GetProposal(ctx, proposalID)
-	if err != nil {
-		return nil, err
+	if strings.TrimSpace(supersedingProposalID) == "" {
+		return nil, errors.New("superseding_proposal_id is required to supersede a proposal")
 	}
-	if p == nil {
-		return nil, fmt.Errorf("proposal %s not found", proposalID)
-	}
-	if p.Status == ProposalStatusSuperseded {
-		return p, nil
+	if supersedingProposalID == proposalID {
+		return nil, fmt.Errorf("proposal %s cannot supersede itself", proposalID)
 	}
 
-	now := time.Now().UnixMilli()
-	_, err = s.st.DB().ExecContext(ctx, `
+	var superseded *PolicyChangeProposal
+	err := s.st.WithTx(ctx, func(tx *sql.Tx) error {
+		p, err := queryProposal(ctx, tx, proposalID)
+		if err != nil {
+			return err
+		}
+		if p == nil {
+			return fmt.Errorf("proposal %s not found", proposalID)
+		}
+		if p.Status == ProposalStatusSuperseded {
+			superseded = p
+			return nil
+		}
+		if p.Status != ProposalStatusDraft && p.Status != ProposalStatusProposed {
+			return fmt.Errorf("cannot supersede proposal with status %s; only draft or proposed proposals can be superseded", p.Status)
+		}
+
+		var exists int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM policy_change_proposal WHERE id = ?`, supersedingProposalID).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			return fmt.Errorf("superseding proposal %s does not exist", supersedingProposalID)
+		}
+
+		now := time.Now().UnixMilli()
+		res, err := tx.ExecContext(ctx, `
 UPDATE policy_change_proposal
 SET status = 'superseded', decided_at = ?
-WHERE id = ?`, now, proposalID)
+WHERE id = ? AND status IN ('draft','proposed')`, now, proposalID)
+		if err != nil {
+			return err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			return fmt.Errorf("proposal %s was not updated; it can no longer be superseded", proposalID)
+		}
+
+		p.Status = ProposalStatusSuperseded
+		p.DecidedAt = &now
+		superseded = p
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	p.Status = ProposalStatusSuperseded
-	p.DecidedAt = &now
-	return p, nil
+	return superseded, nil
 }
 
 func (s *Service) AssociateMetrics(ctx context.Context, proposalID string, metricIDs []string) error {
@@ -570,13 +664,17 @@ ORDER BY created_at ASC`, graphID)
 		versions = append(versions, v)
 		versionIDs = append(versionIDs, v.ID)
 	}
+	if err := vRows.Err(); err != nil {
+		return nil, err
+	}
 	vRows.Close()
 
 	for i := range versions {
 		outcomes, err := s.ListOutcomesForVersion(ctx, versions[i].ID)
-		if err == nil {
-			versions[i].Outcomes = outcomes
+		if err != nil {
+			return nil, err
 		}
+		versions[i].Outcomes = outcomes
 
 		mRows, err := s.st.DB().QueryContext(ctx, `
 SELECT m.id, m.anchor_id, m.name, m.value, m.unit, COALESCE(m.dimensions, ''), m.recorded_at
@@ -584,21 +682,28 @@ FROM metric m
 JOIN anchor a ON a.id = m.anchor_id
 WHERE a.graph_version_id = ?
 ORDER BY m.recorded_at ASC, m.name ASC`, versions[i].ID)
-		if err == nil {
-			var metrics []Metric
-			for mRows.Next() {
-				var m Metric
-				var dims string
-				if err := mRows.Scan(&m.ID, &m.AnchorID, &m.Name, &m.Value, &m.Unit, &dims, &m.RecordedAt); err == nil {
-					if dims != "" {
-						m.Dimensions = json.RawMessage(dims)
-					}
-					metrics = append(metrics, m)
-				}
-			}
-			mRows.Close()
-			versions[i].Metrics = metrics
+		if err != nil {
+			return nil, err
 		}
+		var metrics []Metric
+		for mRows.Next() {
+			var m Metric
+			var dims string
+			if err := mRows.Scan(&m.ID, &m.AnchorID, &m.Name, &m.Value, &m.Unit, &dims, &m.RecordedAt); err != nil {
+				mRows.Close()
+				return nil, err
+			}
+			if dims != "" {
+				m.Dimensions = json.RawMessage(dims)
+			}
+			metrics = append(metrics, m)
+		}
+		if err := mRows.Err(); err != nil {
+			mRows.Close()
+			return nil, err
+		}
+		mRows.Close()
+		versions[i].Metrics = metrics
 	}
 
 	var proposals []EvidenceChain
@@ -613,21 +718,31 @@ ORDER BY m.recorded_at ASC, m.name ASC`, versions[i].ID)
 SELECT id FROM policy_change_proposal
 WHERE target_graph_version_id IN (%s)
 ORDER BY created_at ASC`, strings.Join(placeholders, ",")), args...)
-		if err == nil {
-			var pIDs []string
-			for pRows.Next() {
-				var pid string
-				if err := pRows.Scan(&pid); err == nil {
-					pIDs = append(pIDs, pid)
-				}
+		if err != nil {
+			return nil, err
+		}
+		var pIDs []string
+		for pRows.Next() {
+			var pid string
+			if err := pRows.Scan(&pid); err != nil {
+				pRows.Close()
+				return nil, err
 			}
+			pIDs = append(pIDs, pid)
+		}
+		if err := pRows.Err(); err != nil {
 			pRows.Close()
+			return nil, err
+		}
+		pRows.Close()
 
-			for _, pid := range pIDs {
-				chain, err := s.GetEvidenceChain(ctx, pid)
-				if err == nil && chain != nil {
-					proposals = append(proposals, *chain)
-				}
+		for _, pid := range pIDs {
+			chain, err := s.GetEvidenceChain(ctx, pid)
+			if err != nil {
+				return nil, err
+			}
+			if chain != nil {
+				proposals = append(proposals, *chain)
 			}
 		}
 	}

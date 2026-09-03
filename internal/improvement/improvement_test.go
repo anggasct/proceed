@@ -2,6 +2,7 @@ package improvement_test
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -88,13 +89,19 @@ func appendTerminalEvent(t *testing.T, st *store.Store, runID, eventType, detail
 
 func createGrantApproval(t *testing.T, st *store.Store, runID, versionID string) string {
 	t.Helper()
+	return createApproval(t, st, runID, versionID, time.Now().UnixMilli()+60000)
+}
+
+func createApproval(t *testing.T, st *store.Store, runID, versionID string, expiresAt int64) string {
+	t.Helper()
 	approvalID := ulid.Make().String()
 	nodeID := ulid.Make().String()
+	nodeKey := "gate-" + approvalID[len(approvalID)-8:]
 	now := time.Now().UnixMilli()
 
 	_, err := st.DB().Exec(`
 INSERT INTO run_node (id, run_id, node_key, status, attempt_count, started_at)
-VALUES (?, ?, 'gate1', 'waiting', 1, ?)`, nodeID, runID, now)
+VALUES (?, ?, ?, 'waiting', 1, ?)`, nodeID, runID, nodeKey, now)
 	if err != nil {
 		t.Fatalf("failed to create run_node: %v", err)
 	}
@@ -103,7 +110,7 @@ VALUES (?, ?, 'gate1', 'waiting', 1, ?)`, nodeID, runID, now)
 INSERT INTO approval (id, run_id, run_node_id, graph_version_id, requested_action, evidence_references,
                       required_scope, expires_at, decision, decided_by, decided_at, created_at)
 VALUES (?, ?, ?, ?, 'deploy', '[]', 'approve', ?, 'grant', 'operator', ?, ?)`,
-		approvalID, runID, nodeID, versionID, now+60000, now, now)
+		approvalID, runID, nodeID, versionID, expiresAt, now, now)
 	if err != nil {
 		t.Fatalf("failed to create approval: %v", err)
 	}
@@ -398,9 +405,10 @@ UPDATE policy_change_proposal SET status = 'approved', approval_id = NULL WHERE 
 	}
 
 	// 7. Test Rejection with rationale
+	originalRationale := "increase retry limit to 10"
 	p2, err := svc.CreateProposal(ctx, improvement.CreateProposalRequest{
 		TargetGraphVersionID: versionID,
-		Rationale:            "increase retry limit to 10",
+		Rationale:            originalRationale,
 		ProposedChange:       `{"step1": {"max_attempts": 10}}`,
 	})
 	if err != nil {
@@ -417,7 +425,7 @@ UPDATE policy_change_proposal SET status = 'approved', approval_id = NULL WHERE 
 		t.Fatal("expected error when rejecting without rationale, got nil")
 	}
 
-	// Rejection with rationale -> succeeds
+	// Rejection with rationale -> succeeds and preserves the proposer's rationale
 	rejectRationale := "retry limit exceeds cluster policy threshold of 5"
 	rejectedP, err := svc.RejectProposal(ctx, p2.ID, rejectRationale)
 	if err != nil {
@@ -426,11 +434,29 @@ UPDATE policy_change_proposal SET status = 'approved', approval_id = NULL WHERE 
 	if rejectedP.Status != improvement.ProposalStatusRejected {
 		t.Errorf("status = %q, want rejected", rejectedP.Status)
 	}
-	if rejectedP.Rationale != rejectRationale {
-		t.Errorf("rationale = %q, want %q", rejectedP.Rationale, rejectRationale)
+	if rejectedP.Rationale != originalRationale {
+		t.Errorf("rationale = %q, want original %q preserved", rejectedP.Rationale, originalRationale)
+	}
+	if rejectedP.RejectionReason == nil || *rejectedP.RejectionReason != rejectRationale {
+		t.Errorf("rejection_reason = %v, want %q", rejectedP.RejectionReason, rejectRationale)
 	}
 	if rejectedP.DecidedAt == nil {
 		t.Error("expected decided_at to be set on rejected proposal")
+	}
+
+	// Rejection reason is retrievable from the stored row
+	reloaded, err := svc.GetProposal(ctx, p2.ID)
+	if err != nil {
+		t.Fatalf("failed to reload rejected proposal: %v", err)
+	}
+	if reloaded == nil {
+		t.Fatal("expected rejected proposal row, got nil")
+	}
+	if reloaded.Rationale != originalRationale {
+		t.Errorf("persisted rationale = %q, want original %q preserved", reloaded.Rationale, originalRationale)
+	}
+	if reloaded.RejectionReason == nil || *reloaded.RejectionReason != rejectRationale {
+		t.Errorf("persisted rejection_reason = %v, want %q", reloaded.RejectionReason, rejectRationale)
 	}
 }
 
@@ -566,5 +592,279 @@ func TestProposalTargetingSupersededVersion(t *testing.T) {
 	}
 	if p.SupersedesProposalID == nil || *p.SupersedesProposalID != priorP.ID {
 		t.Errorf("supersedes_proposal_id = %v, want %q", p.SupersedesProposalID, priorP.ID)
+	}
+}
+
+// Verifies that an approval reference is only valid when it is a grant bound to
+// the proposal's target graph version and has not expired.
+func TestApproveProposalRequiresMatchingUnexpiredApproval(t *testing.T) {
+	st := openTestStore(t)
+	svc := improvement.New(st)
+	ctx := context.Background()
+
+	_, versionID1, _ := seedGraphAndVersion(t, st, "approval-bind-graph-v1")
+	_, versionID2, _ := seedGraphAndVersion(t, st, "approval-bind-graph-v2")
+
+	p, err := svc.CreateProposal(ctx, improvement.CreateProposalRequest{
+		TargetGraphVersionID: versionID1,
+		Rationale:            "tune gate timeout",
+		ProposedChange:       `{"step1": {"timeout_ms": 3000}}`,
+	})
+	if err != nil {
+		t.Fatalf("failed to create proposal: %v", err)
+	}
+	if _, err := svc.SubmitProposal(ctx, p.ID); err != nil {
+		t.Fatalf("failed to submit proposal: %v", err)
+	}
+
+	// 1. Grant approval bound to a different graph version -> MUST fail
+	runID2 := mustCreateRun(t, st, versionID2)
+	foreignApprovalID := createGrantApproval(t, st, runID2, versionID2)
+	_, err = svc.ApproveProposal(ctx, p.ID, foreignApprovalID)
+	if err == nil {
+		t.Fatal("expected error when approving with approval bound to a different graph version, got nil")
+	}
+
+	// 2. Expired grant approval bound to the target version -> MUST fail
+	runID1 := mustCreateRun(t, st, versionID1)
+	expiredApprovalID := createApproval(t, st, runID1, versionID1, time.Now().UnixMilli()-1000)
+	_, err = svc.ApproveProposal(ctx, p.ID, expiredApprovalID)
+	if err == nil {
+		t.Fatal("expected error when approving with an expired approval, got nil")
+	}
+
+	// Proposal must remain proposed with no approval recorded
+	reloaded, err := svc.GetProposal(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("failed to reload proposal: %v", err)
+	}
+	if reloaded.Status != improvement.ProposalStatusProposed {
+		t.Errorf("status = %q, want proposed", reloaded.Status)
+	}
+	if reloaded.ApprovalID != nil {
+		t.Errorf("approval_id = %v, want nil after failed approvals", reloaded.ApprovalID)
+	}
+
+	// 3. Unexpired grant approval bound to the target version -> succeeds
+	validApprovalID := createGrantApproval(t, st, runID1, versionID1)
+	if _, err := svc.ApproveProposal(ctx, p.ID, validApprovalID); err != nil {
+		t.Fatalf("failed to approve proposal with matching unexpired approval: %v", err)
+	}
+}
+
+// Verifies that concurrent approval decisions produce exactly one winner: the
+// losing decision returns an error and the stored row records only the winning
+// approval reference.
+func TestApproveProposalConcurrentDecisionSingleWinner(t *testing.T) {
+	st := openTestStore(t)
+	svc := improvement.New(st)
+	ctx := context.Background()
+
+	_, versionID, _ := seedGraphAndVersion(t, st, "concurrent-approval-graph")
+	runID := mustCreateRun(t, st, versionID)
+
+	p, err := svc.CreateProposal(ctx, improvement.CreateProposalRequest{
+		TargetGraphVersionID: versionID,
+		Rationale:            "raise batch size",
+		ProposedChange:       `{"step1": {"batch_size": 64}}`,
+	})
+	if err != nil {
+		t.Fatalf("failed to create proposal: %v", err)
+	}
+	if _, err := svc.SubmitProposal(ctx, p.ID); err != nil {
+		t.Fatalf("failed to submit proposal: %v", err)
+	}
+
+	approvalA := createGrantApproval(t, st, runID, versionID)
+	approvalB := createGrantApproval(t, st, runID, versionID)
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	winner := make(chan string, 2)
+	for _, approvalID := range []string{approvalA, approvalB} {
+		go func(id string) {
+			<-start
+			_, err := svc.ApproveProposal(ctx, p.ID, id)
+			results <- err
+			if err == nil {
+				winner <- id
+			}
+		}(approvalID)
+	}
+	close(start)
+
+	var winnerID string
+	for i := 0; i < 2; i++ {
+		if err := <-results; err == nil {
+			if winnerID != "" {
+				t.Fatal("expected exactly one successful approval, got two")
+			}
+			winnerID = <-winner
+		}
+	}
+	if winnerID == "" {
+		t.Fatal("expected one successful approval, got none")
+	}
+
+	reloaded, err := svc.GetProposal(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("failed to reload proposal: %v", err)
+	}
+	if reloaded.Status != improvement.ProposalStatusApproved {
+		t.Errorf("status = %q, want approved", reloaded.Status)
+	}
+	if reloaded.ApprovalID == nil || *reloaded.ApprovalID != winnerID {
+		t.Errorf("approval_id = %v, want winning approval %s", reloaded.ApprovalID, winnerID)
+	}
+}
+
+// Verifies supersede guards: the superseding proposal must exist, and only
+// draft/proposed proposals can be superseded.
+func TestSupersedeProposalGuards(t *testing.T) {
+	st := openTestStore(t)
+	svc := improvement.New(st)
+	ctx := context.Background()
+
+	_, versionID, _ := seedGraphAndVersion(t, st, "supersede-guard-graph")
+	runID := mustCreateRun(t, st, versionID)
+
+	proposedP, err := svc.CreateProposal(ctx, improvement.CreateProposalRequest{
+		TargetGraphVersionID: versionID,
+		Rationale:            "baseline",
+		ProposedChange:       `{"a": 1}`,
+	})
+	if err != nil {
+		t.Fatalf("failed to create proposal: %v", err)
+	}
+	replacementP, err := svc.CreateProposal(ctx, improvement.CreateProposalRequest{
+		TargetGraphVersionID: versionID,
+		Rationale:            "replacement",
+		ProposedChange:       `{"a": 2}`,
+	})
+	if err != nil {
+		t.Fatalf("failed to create replacement proposal: %v", err)
+	}
+
+	// 1. Empty superseding proposal ID -> MUST fail
+	if _, err := svc.SupersedeProposal(ctx, proposedP.ID, ""); err == nil {
+		t.Fatal("expected error when superseding without a superseding proposal, got nil")
+	}
+
+	// 2. Non-existent superseding proposal ID -> MUST fail
+	if _, err := svc.SupersedeProposal(ctx, proposedP.ID, ulid.Make().String()); err == nil {
+		t.Fatal("expected error when superseding proposal does not exist, got nil")
+	}
+
+	// 3. Approved proposal -> MUST fail (a recorded human decision is never erased)
+	approvedP, err := svc.CreateProposal(ctx, improvement.CreateProposalRequest{
+		TargetGraphVersionID: versionID,
+		Rationale:            "approved change",
+		ProposedChange:       `{"a": 3}`,
+	})
+	if err != nil {
+		t.Fatalf("failed to create approved candidate: %v", err)
+	}
+	if _, err := svc.SubmitProposal(ctx, approvedP.ID); err != nil {
+		t.Fatalf("failed to submit approved candidate: %v", err)
+	}
+	approvalID := createGrantApproval(t, st, runID, versionID)
+	if _, err := svc.ApproveProposal(ctx, approvedP.ID, approvalID); err != nil {
+		t.Fatalf("failed to approve candidate: %v", err)
+	}
+	if _, err := svc.SupersedeProposal(ctx, approvedP.ID, replacementP.ID); err == nil {
+		t.Fatal("expected error when superseding an approved proposal, got nil")
+	}
+
+	// 4. Proposed proposal -> succeeds
+	supersededP, err := svc.SupersedeProposal(ctx, proposedP.ID, replacementP.ID)
+	if err != nil {
+		t.Fatalf("failed to supersede proposed proposal: %v", err)
+	}
+	if supersededP.Status != improvement.ProposalStatusSuperseded {
+		t.Errorf("status = %q, want superseded", supersededP.Status)
+	}
+	if supersededP.DecidedAt == nil {
+		t.Error("expected decided_at to be set on superseded proposal")
+	}
+
+	// 5. Already-superseded proposal -> idempotent, no error
+	again, err := svc.SupersedeProposal(ctx, proposedP.ID, replacementP.ID)
+	if err != nil {
+		t.Fatalf("expected idempotent supersede, got error: %v", err)
+	}
+	if again.Status != improvement.ProposalStatusSuperseded {
+		t.Errorf("status = %q, want superseded", again.Status)
+	}
+}
+
+// Verifies that metrics with malformed JSON dimensions are rejected at the
+// write boundary instead of breaking overview serialization later.
+func TestRecordMetricRejectsInvalidDimensionsJSON(t *testing.T) {
+	st := openTestStore(t)
+	svc := improvement.New(st)
+	ctx := context.Background()
+
+	_, versionID, _ := seedGraphAndVersion(t, st, "metric-dims-graph")
+	runID := mustCreateRun(t, st, versionID)
+	appendTerminalEvent(t, st, runID, "run_completed", "")
+
+	outcome, err := svc.GetOutcome(ctx, runID)
+	if err != nil || outcome == nil {
+		t.Fatalf("failed to get outcome: %v", err)
+	}
+
+	_, err = svc.RecordMetric(ctx, improvement.Metric{
+		AnchorID:   outcome.AnchorID,
+		Name:       "bad_dims",
+		Value:      1.0,
+		Unit:       "count",
+		Dimensions: json.RawMessage(`{not json`),
+	})
+	if err == nil {
+		t.Fatal("expected error for malformed JSON dimensions, got nil")
+	}
+
+	valid, err := svc.RecordMetric(ctx, improvement.Metric{
+		AnchorID:   outcome.AnchorID,
+		Name:       "good_dims",
+		Value:      2.0,
+		Unit:       "count",
+		Dimensions: json.RawMessage(`{"route":"fast"}`),
+	})
+	if err != nil {
+		t.Fatalf("failed to record metric with valid dimensions: %v", err)
+	}
+
+	metrics, err := svc.ListMetricsForAnchor(ctx, outcome.AnchorID)
+	if err != nil {
+		t.Fatalf("failed to list metrics: %v", err)
+	}
+	if len(metrics) != 1 {
+		t.Fatalf("metric count = %d, want 1 (only the valid metric persisted)", len(metrics))
+	}
+	if string(metrics[0].Dimensions) != `{"route":"fast"}` {
+		t.Errorf("dimensions = %s, want %s", metrics[0].Dimensions, `{"route":"fast"}`)
+	}
+	if _, err := json.Marshal(improvement.Overview{Versions: []improvement.VersionSummary{{Metrics: metrics}}}); err != nil {
+		t.Fatalf("overview serialization must succeed for valid dimensions: %v", err)
+	}
+	_ = valid
+}
+
+// Verifies that GetOverview propagates query failures instead of returning a
+// silently incomplete overview.
+func TestGetOverviewPropagatesQueryErrors(t *testing.T) {
+	st := openTestStore(t)
+	svc := improvement.New(st)
+
+	seedGraphAndVersion(t, st, "overview-error-graph")
+	st.Close()
+
+	overview, err := svc.GetOverview(context.Background(), "overview-error-graph")
+	if err == nil {
+		t.Fatal("expected error from GetOverview against a failed store, got nil")
+	}
+	if overview != nil {
+		t.Errorf("overview = %+v, want nil on error", overview)
 	}
 }

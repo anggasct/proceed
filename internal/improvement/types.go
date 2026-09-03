@@ -46,6 +46,7 @@ type PolicyChangeProposal struct {
 	TargetDigest         string         `json:"target_digest,omitempty"`
 	Status               ProposalStatus `json:"status"`
 	Rationale            string         `json:"rationale"`
+	RejectionReason      *string        `json:"rejection_reason,omitempty"`
 	ProposedChange       string         `json:"proposed_change"`
 	ApprovalID           *string        `json:"approval_id,omitempty"`
 	SupersedesProposalID *string        `json:"supersedes_proposal_id,omitempty"`
