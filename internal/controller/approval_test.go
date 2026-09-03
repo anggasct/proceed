@@ -196,6 +196,36 @@ func TestApprovalGrantResumesRun(t *testing.T) {
 	}
 }
 
+// The approval row must carry the caller's decision idempotency key, not the
+// decision event id, so the documented unique column enforces replay defense.
+func TestApprovalProjectionStoresDecisionIdempotencyKey(t *testing.T) {
+	for _, tc := range []struct {
+		decision string
+		key      string
+	}{
+		{"grant", "idem-grant-key-1"},
+		{"deny", "idem-deny-key-1"},
+	} {
+		st, ctrl, runID := openApprovalGateRun(t, approvalGateGraph)
+		approvalID := pendingApprovalID(t, st, runID)
+
+		res := decide(t, ctrl, runID, approvalID, tc.decision, "alice", tc.key)
+		if res.Code != ApprovalDecided {
+			t.Fatalf("%s: res = %+v, want APPROVAL_DECIDED", tc.decision, res)
+		}
+
+		var storedKey string
+		if err := st.DB().QueryRow(
+			"SELECT decision_idempotency_key FROM approval WHERE id = ?", approvalID).
+			Scan(&storedKey); err != nil {
+			t.Fatal(err)
+		}
+		if storedKey != tc.key {
+			t.Errorf("%s: decision_idempotency_key = %q, want %q", tc.decision, storedKey, tc.key)
+		}
+	}
+}
+
 // Deny terminates the gate node; no declared alternate route means failure.
 func TestApprovalDenyTerminatesPerPolicy(t *testing.T) {
 	st, ctrl, runID := openApprovalGateRun(t, approvalGateGraph)

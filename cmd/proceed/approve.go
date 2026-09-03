@@ -14,12 +14,12 @@ import (
 )
 
 const approveUsage = `usage:
-  proceed approve <run-id> <approval-id> --decision grant|deny [--actor <name>] [--idempotency-key <key>] [--reason <note>] [--data-dir <dir>] [--config <file>]
+  proceed approve <run-id> <approval-id> --decision grant|deny [--actor <name>] [--idempotency-key <key>] [--data-dir <dir>] [--config <file>]
 `
 
 func cmdApprove(args []string, stdout, stderr io.Writer) int {
 	flags := cliFlags{}
-	var decision, actor, idempotencyKey, reason string
+	var decision, actor, idempotencyKey string
 	var positional []string
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -63,13 +63,6 @@ func cmdApprove(args []string, stdout, stderr io.Writer) int {
 				return exitUsage
 			}
 			idempotencyKey = v
-		case "--reason":
-			v, ok := needsValue()
-			if !ok {
-				fmt.Fprintln(stderr, "proceed: --reason requires a value")
-				return exitUsage
-			}
-			reason = v
 		case "--config", "--data-dir", "--bind":
 			v, ok := needsValue()
 			if !ok {
@@ -134,7 +127,6 @@ func cmdApprove(args []string, stdout, stderr io.Writer) int {
 		Decision:       decision,
 		Actor:          actor,
 		IdempotencyKey: idempotencyKey,
-		Reason:         reason,
 	})
 	if err != nil {
 		return printClassified(err, stderr)

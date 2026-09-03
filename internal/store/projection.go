@@ -134,8 +134,9 @@ type approvalRequestedPayload struct {
 }
 
 type approvalDecidedPayload struct {
-	ApprovalID string `json:"approval_id"`
-	DecidedBy  string `json:"decided_by"`
+	ApprovalID             string `json:"approval_id"`
+	DecidedBy              string `json:"decided_by"`
+	DecisionIdempotencyKey string `json:"decision_idempotency_key"`
 }
 
 type causalLinkPayload struct {
@@ -630,7 +631,7 @@ func onApprovalDecided(ctx context.Context, tx *sql.Tx, ev *Event) error {
 	_, err := tx.ExecContext(ctx, `
 UPDATE approval SET decision = ?, decided_by = ?, decided_at = ?, decision_idempotency_key = ?
 WHERE id = ?`,
-		decision, p.DecidedBy, ev.OccurredAt, ev.EventID, p.ApprovalID)
+		decision, p.DecidedBy, ev.OccurredAt, p.DecisionIdempotencyKey, p.ApprovalID)
 	return err
 }
 
