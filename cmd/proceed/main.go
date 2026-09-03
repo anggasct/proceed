@@ -17,7 +17,7 @@ Commands:
   validate    Compile and validate a graph definition
   run         Execute a graph to terminal completion
   serve       Run the controller with the local HTTP API
-  graph       inspect | why | export — read-only run views
+  graph       inspect | why | export | improvement — read-only run and graph views
   approve     Record an approval gate decision
   reconcile   Resolve an uncertain effect
   store       export | import — backup and restore

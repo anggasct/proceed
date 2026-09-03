@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 
+	"proceed/internal/improvement"
 	"proceed/internal/query/export"
 	"proceed/internal/query/why"
 	"proceed/internal/store"
@@ -15,6 +16,7 @@ const graphUsage = `usage:
   proceed graph inspect <run-id> [--data-dir <dir>] [--config <file>]
   proceed graph why <run-id> <node-id> [--data-dir <dir>] [--config <file>]
   proceed graph export <run-id> --format mermaid|json [--data-dir <dir>] [--config <file>]
+  proceed graph improvement <graph> [--data-dir <dir>] [--config <file>]
 `
 
 func cmdGraph(args []string, stdout, stderr io.Writer) int {
@@ -23,7 +25,7 @@ func cmdGraph(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 	subcommand := args[0]
-	if subcommand != "inspect" && subcommand != "why" && subcommand != "export" {
+	if subcommand != "inspect" && subcommand != "why" && subcommand != "export" && subcommand != "improvement" {
 		fmt.Fprintf(stderr, "proceed graph: unknown subcommand %q\n%s", subcommand, graphUsage)
 		return exitUsage
 	}
@@ -57,6 +59,8 @@ func cmdGraph(args []string, stdout, stderr io.Writer) int {
 		payload, err = st.RuntimeGraph(context.Background(), positional[0])
 	case "why":
 		payload, err = why.New(st).Explain(context.Background(), positional[0], positional[1])
+	case "improvement":
+		payload, err = improvement.New(st).GetOverview(context.Background(), positional[0])
 	}
 	if err != nil {
 		return printClassified(err, stderr)
