@@ -308,7 +308,7 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 	var profile capability.Profile
 	var workspaceRoot string
 	var artifactSink executor.ArtifactPublisher
-	if kind == executor.Shell {
+	if kind == executor.Shell || kind == executor.AgentCLI {
 		if _, hasProfile := cfg["capability"]; hasProfile {
 			profile, err = capability.FromConfig(cfg)
 			if err != nil {
@@ -365,7 +365,7 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 			return c.rejectNode(ctx, runID, n.NodeKey, n.AttemptNo, kind, contract, opKey, err)
 		}
 	}
-	if kind == executor.Shell && profile.Process != "" {
+	if (kind == executor.Shell || kind == executor.AgentCLI) && profile.Process != "" {
 		if err := c.recordCapabilityApproval(ctx, runID, digest, n.NodeKey, opKey, profile); err != nil {
 			return c.rejectNode(ctx, runID, n.NodeKey, n.AttemptNo, kind, contract, opKey, err)
 		}

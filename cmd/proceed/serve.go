@@ -49,7 +49,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 
 	serveCfg := controller.DefaultConfig()
 	serveCfg.Mode = "serve"
-	c, err := controller.New(st, serveCfg, buildPool())
+	c, err := controller.New(st, serveCfg, buildPool(cfg.AgentCLIs))
 	if err != nil {
 		fmt.Fprintf(stderr, "proceed: %v\n", err)
 		return exitUnclassified
