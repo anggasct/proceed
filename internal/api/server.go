@@ -11,6 +11,7 @@ import (
 	"proceed/internal/compiler"
 	"proceed/internal/config"
 	"proceed/internal/controller"
+	"proceed/internal/query/export"
 	"proceed/internal/store"
 )
 
@@ -37,7 +38,7 @@ func NewServer(deps Deps) *Server {
 	s.mux.HandleFunc("POST /v1/approvals/{id}/deny", s.handleApprovalDecision("deny"))
 	s.mux.HandleFunc("POST /v1/runs/{id}/approve", s.handleReserved("approve"))
 	s.mux.HandleFunc("POST /v1/runs/{id}/reconcile", s.handleReserved("admin"))
-	s.mux.HandleFunc("GET /v1/runs/{id}/export", s.handleReserved("read"))
+	s.mux.HandleFunc("GET /v1/runs/{id}/export", s.handleExport)
 	return s
 }
 
@@ -289,6 +290,40 @@ func writeApprovalDecisionError(w http.ResponseWriter, err error) {
 	default:
 		writeError(w, http.StatusInternalServerError, "INTERNAL", err.Error(), nil)
 	}
+}
+
+func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
+	if !s.authorize(w, r, "read") {
+		return
+	}
+	runID := r.PathValue("id")
+	if runID == "" {
+		writeError(w, http.StatusBadRequest, store.CodeGraphInvalid, "run id is required", nil)
+		return
+	}
+	format := r.URL.Query().Get("format")
+	if format == "" {
+		format = "json"
+	}
+	format = strings.ToLower(format)
+	if err := export.ValidateFormat(format); err != nil {
+		writeError(w, http.StatusBadRequest, store.CodeGraphInvalid, err.Error(), nil)
+		return
+	}
+	out, err := export.Export(r.Context(), s.deps.Store, runID, format)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if format == "mermaid" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(out)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(out)
 }
 
 func freezeGraph(ctx context.Context, st *store.Store, path string) (string, error) {
