@@ -1,6 +1,6 @@
 package store
 
-const storeSchemaVersion = 2
+const storeSchemaVersion = 3
 
 var schemaDDL = `
 CREATE TABLE IF NOT EXISTS graph (
@@ -259,6 +259,7 @@ CREATE TABLE IF NOT EXISTS policy_change_proposal (
   proposed_change         TEXT NOT NULL,
   approval_id             TEXT REFERENCES approval(id),
   supersedes_proposal_id  TEXT REFERENCES policy_change_proposal(id),
+  rejection_reason        TEXT,
   created_at              INTEGER NOT NULL,
   decided_at              INTEGER,
   CHECK (status <> 'approved' OR approval_id IS NOT NULL)

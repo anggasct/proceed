@@ -190,6 +190,7 @@ var knownEventTypes = map[string]bool{
 	"run_completed":           true,
 	"run_failed":              true,
 	"run_cancelled":           true,
+	"run_abandoned":           true,
 }
 
 func TestProjectedEventTypesMatchVocabulary(t *testing.T) {
@@ -206,7 +207,7 @@ func TestProjectedEventTypesMatchVocabulary(t *testing.T) {
 		"node_uncertain", "node_cancel_requested", "node_skipped", "artifact_published",
 		"edge_traversed", "decision_recorded", "effect_intent", "effect_receipt",
 		"approval_requested", "approval_granted", "approval_denied", "evaluation_failed",
-		"run_completed", "run_failed", "run_cancelled"} {
+		"run_completed", "run_failed", "run_cancelled", "run_abandoned"} {
 		if !projected[typ] {
 			t.Errorf("vocabulary event type %q has no projection handler", typ)
 		}

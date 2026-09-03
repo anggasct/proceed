@@ -79,6 +79,18 @@ func migrationBackupPath(path string) string {
 	return path + fmt.Sprintf(".pre-schema-%d.bak", storeSchemaVersion)
 }
 
+func migrateSchemaAdditions(ctx context.Context, conn *sql.Conn) error {
+	var n int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('policy_change_proposal') WHERE name = 'rejection_reason'`).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	_, err := conn.ExecContext(ctx, `ALTER TABLE policy_change_proposal ADD COLUMN rejection_reason TEXT`)
+	return err
+}
+
 func ctxBackground() context.Context { return context.Background() }
 
 func migrateInPlace(ctx context.Context, db *sql.DB) error {
@@ -93,6 +105,10 @@ func migrateInPlace(ctx context.Context, db *sql.DB) error {
 	if _, err := conn.ExecContext(ctx, schemaDDL); err != nil {
 		_, _ = conn.ExecContext(ctx, "ROLLBACK")
 		return fmt.Errorf("apply schema: %w", err)
+	}
+	if err := migrateSchemaAdditions(ctx, conn); err != nil {
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return fmt.Errorf("apply schema migrations: %w", err)
 	}
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", storeSchemaVersion)); err != nil {
 		_, _ = conn.ExecContext(ctx, "ROLLBACK")

@@ -684,6 +684,7 @@ func onRunTerminal(ctx context.Context, tx *sql.Tx, ev *Event) error {
 		"run_completed": "completed",
 		"run_failed":    "failed",
 		"run_cancelled": "cancelled",
+		"run_abandoned": "abandoned",
 	}[ev.Type]
 	var versionID string
 	if err := tx.QueryRowContext(ctx,
@@ -982,6 +983,7 @@ var projectedHandlers = map[string]projectionHandler{
 	"run_completed":           onRunTerminal,
 	"run_failed":              onRunTerminal,
 	"run_cancelled":           onRunTerminal,
+	"run_abandoned":           onRunTerminal,
 	"external_wait_requested": onExternalWaitRequested,
 	"external_event_received": onExternalEventReceived,
 	"external_wait_completed": onExternalWaitCompleted,

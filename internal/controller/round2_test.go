@@ -190,6 +190,8 @@ func TestFanOutBranchesOverlap(t *testing.T) {
 
 	var running atomic.Int64
 	var maxOverlap atomic.Int64
+	overlapCh := make(chan struct{})
+	var closeOnce sync.Once
 	pool := map[executor.Kind]executor.Executor{
 		"shell": executor.NewFuncExecutor("shell", executor.Pure, func(ctx context.Context, req *executor.Request) (*executor.Result, error) {
 			cur := running.Add(1)
@@ -199,7 +201,16 @@ func TestFanOutBranchesOverlap(t *testing.T) {
 					break
 				}
 			}
-			time.Sleep(60 * time.Millisecond)
+			if req.NodeKey == "left" || req.NodeKey == "right" {
+				if cur >= 2 {
+					closeOnce.Do(func() { close(overlapCh) })
+				} else {
+					select {
+					case <-overlapCh:
+					case <-time.After(2 * time.Second):
+					}
+				}
+			}
 			running.Add(-1)
 			return &executor.Result{}, nil
 		}),

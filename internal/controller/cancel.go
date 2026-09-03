@@ -194,3 +194,47 @@ SELECT COUNT(*) FROM run_node WHERE run_id = ?
 	c.cancelInflightRun(runID)
 	return nil
 }
+
+func (c *Controller) AbandonRun(ctx context.Context, runID, detail string) error {
+	run, err := c.loadRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if run.status != "running" {
+		return nil
+	}
+
+	nowMs := time.Now().UnixMilli()
+	err = c.store.WithTx(ctx, func(tx *sql.Tx) error {
+		var status string
+		if err := tx.QueryRowContext(ctx,
+			"SELECT status FROM graph_run WHERE id = ?", runID).Scan(&status); err != nil {
+			return err
+		}
+		if status != "running" {
+			return nil
+		}
+
+		payload := map[string]any{}
+		if detail != "" {
+			payload["detail"] = detail
+		}
+
+		_, err := c.appendWithin(ctx, tx, &store.Event{
+			EventID:       ulid.Make().String(),
+			RunID:         runID,
+			SchemaVersion: "proceed/v1",
+			Type:          "run_abandoned",
+			OccurredAt:    nowMs,
+			ActorType:     "controller",
+			ActorID:       c.cfg.OwnerID,
+			Payload:       payloadJSON(payload),
+		})
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	c.cancelInflightRun(runID)
+	return nil
+}
