@@ -14,6 +14,7 @@ import (
 	"proceed/internal/config"
 	"proceed/internal/controller"
 	"proceed/internal/executor"
+	approvalexec "proceed/internal/executor/approval"
 	httpexec "proceed/internal/executor/http"
 	"proceed/internal/executor/shell"
 	"proceed/internal/store"
@@ -95,8 +96,9 @@ func resolveConfig(f cliFlags) (config.Config, error) {
 
 func buildPool() map[executor.Kind]executor.Executor {
 	return map[executor.Kind]executor.Executor{
-		executor.Shell: shell.New(),
-		executor.HTTP:  httpexec.New(),
+		executor.Shell:         shell.New(),
+		executor.HTTP:          httpexec.New(),
+		executor.HumanApproval: approvalexec.New(),
 	}
 }
 

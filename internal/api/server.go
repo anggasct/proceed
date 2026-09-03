@@ -33,6 +33,9 @@ func NewServer(deps Deps) *Server {
 	s.mux.HandleFunc("GET /v1/runs/{id}/graph", s.handleGetRun)
 	s.mux.HandleFunc("POST /v1/runs/{id}/cancel", s.handleCancelRun)
 	s.mux.HandleFunc("POST /v1/waits/{id}/complete", s.handleCompleteWait)
+	s.mux.HandleFunc("POST /v1/approvals/{id}/decision", s.handleApprovalDecision(""))
+	s.mux.HandleFunc("POST /v1/approvals/{id}/grant", s.handleApprovalDecision("grant"))
+	s.mux.HandleFunc("POST /v1/approvals/{id}/deny", s.handleApprovalDecision("deny"))
 	s.mux.HandleFunc("POST /v1/runs/{id}/approve", s.handleReserved("approve"))
 	s.mux.HandleFunc("POST /v1/runs/{id}/reconcile", s.handleReserved("admin"))
 	s.mux.HandleFunc("GET /v1/runs/{id}/export", s.handleExport)
@@ -207,6 +210,86 @@ func (s *Server) handleCompleteWait(w http.ResponseWriter, r *http.Request) {
 		resp["message"] = result.Message
 	}
 	writeJSON(w, result.HTTPStatus, resp)
+}
+
+func (s *Server) handleApprovalDecision(fixedDecision string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.authorize(w, r, "approve") {
+			return
+		}
+		approvalID := r.PathValue("id")
+		if approvalID == "" {
+			writeError(w, http.StatusBadRequest, "GRAPH_INVALID", "approval id is required", nil)
+			return
+		}
+
+		var body struct {
+			Decision       string `json:"decision"`
+			Actor          string `json:"actor"`
+			IdempotencyKey string `json:"decision_idempotency_key"`
+			Reason         string `json:"reason"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "GRAPH_INVALID", "request body must be valid JSON: "+err.Error(), nil)
+			return
+		}
+		decision := body.Decision
+		if fixedDecision != "" {
+			if decision != "" && decision != fixedDecision {
+				writeError(w, http.StatusBadRequest, "GRAPH_INVALID", "decision must be "+fixedDecision, nil)
+				return
+			}
+			decision = fixedDecision
+		}
+
+		result, err := s.deps.Controller.DecideApproval(r.Context(), controller.ApprovalDecisionRequest{
+			ApprovalID:     approvalID,
+			Decision:       decision,
+			Actor:          body.Actor,
+			IdempotencyKey: body.IdempotencyKey,
+			Reason:         body.Reason,
+		})
+		if err != nil {
+			writeApprovalDecisionError(w, err)
+			return
+		}
+
+		switch result.Code {
+		case controller.ApprovalDecided, controller.ApprovalAlreadyDecided:
+			_ = s.deps.Controller.ResumeRun(r.Context(), result.RunID)
+			writeJSON(w, result.HTTPStatus, map[string]any{
+				"approval_id": result.ApprovalID,
+				"run_id":      result.RunID,
+				"node_key":    result.NodeKey,
+				"status":      result.Code,
+				"decision":    result.Decision,
+				"actor":       result.Actor,
+			})
+		case controller.ApprovalExpired:
+			writeJSON(w, result.HTTPStatus, map[string]any{
+				"approval_id": result.ApprovalID,
+				"run_id":      result.RunID,
+				"node_key":    result.NodeKey,
+				"status":      result.Code,
+				"message":     result.Message,
+			})
+		default:
+			writeError(w, result.HTTPStatus, result.Code, result.Message, nil)
+		}
+	}
+}
+
+func writeApprovalDecisionError(w http.ResponseWriter, err error) {
+	if _, ok := compiler.AsGraphInvalid(err); ok {
+		writeError(w, http.StatusBadRequest, store.CodeGraphInvalid, err.Error(), nil)
+		return
+	}
+	switch store.ErrorCode(err) {
+	case store.CodeGraphInvalid:
+		writeError(w, http.StatusBadRequest, store.CodeGraphInvalid, err.Error(), nil)
+	default:
+		writeError(w, http.StatusInternalServerError, "INTERNAL", err.Error(), nil)
+	}
 }
 
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
