@@ -15,7 +15,6 @@ import (
 
 	"proceed/internal/capability"
 	"proceed/internal/executor"
-	approvalexec "proceed/internal/executor/approval"
 	"proceed/internal/store"
 )
 
@@ -423,7 +422,7 @@ watch:
 	// own cancel signal, not the user, so it is a timeout. An uncertainty
 	// the executor already classified always wins.
 	if execErr != nil && errors.Is(execErr, executor.ErrWaitRequested) {
-		gate, gateErr := approvalexec.ParseGate(cfg)
+		gate, gateErr := executor.ParseGate(cfg)
 		if gateErr != nil {
 			return c.failNode(ctx, runID, n.NodeKey, n.AttemptNo, gateErr)
 		}
