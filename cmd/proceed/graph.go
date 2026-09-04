@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 
 	"proceed/internal/improvement"
 	"proceed/internal/query/export"
@@ -17,6 +18,7 @@ const graphUsage = `usage:
   proceed graph why <run-id> <node-id> [--data-dir <dir>] [--config <file>]
   proceed graph export <run-id> --format mermaid|json [--data-dir <dir>] [--config <file>]
   proceed graph improvement <graph> [--data-dir <dir>] [--config <file>]
+  proceed graph list [--status <status>] [--limit <n>] [--data-dir <dir>] [--config <file>]
 `
 
 func cmdGraph(args []string, stdout, stderr io.Writer) int {
@@ -25,12 +27,15 @@ func cmdGraph(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 	subcommand := args[0]
-	if subcommand != "inspect" && subcommand != "why" && subcommand != "export" && subcommand != "improvement" {
+	if subcommand != "inspect" && subcommand != "why" && subcommand != "export" && subcommand != "improvement" && subcommand != "list" {
 		fmt.Fprintf(stderr, "proceed graph: unknown subcommand %q\n%s", subcommand, graphUsage)
 		return exitUsage
 	}
 	if subcommand == "export" {
 		return cmdGraphExport(args[1:], stdout, stderr)
+	}
+	if subcommand == "list" {
+		return cmdGraphList(args[1:], stdout, stderr)
 	}
 	wantPositional := 1
 	if subcommand == "why" {
@@ -138,4 +143,69 @@ func validateExportFormat(format string) error {
 
 func runExport(ctx context.Context, st *store.Store, runID, format string) ([]byte, error) {
 	return export.Export(ctx, st, runID, format)
+}
+
+func cmdGraphList(args []string, stdout, stderr io.Writer) int {
+	var status, limitRaw string
+	limit := 50
+	var filtered []string
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--status":
+			if i+1 >= len(args) {
+				fmt.Fprintln(stderr, "proceed graph list: --status requires a value")
+				return exitUsage
+			}
+			status = args[i+1]
+			i++
+		case len(args[i]) > 9 && args[i][:9] == "--status=":
+			status = args[i][9:]
+		case args[i] == "--limit":
+			if i+1 >= len(args) {
+				fmt.Fprintln(stderr, "proceed graph list: --limit requires a value")
+				return exitUsage
+			}
+			limitRaw = args[i+1]
+			i++
+		case len(args[i]) > 8 && args[i][:8] == "--limit=":
+			limitRaw = args[i][8:]
+		default:
+			filtered = append(filtered, args[i])
+		}
+	}
+	if limitRaw != "" {
+		parsed, err := strconv.Atoi(limitRaw)
+		if err != nil {
+			return printClassified(store.NewCodeError("GRAPH_INVALID", "limit must be an integer"), stderr)
+		}
+		limit = parsed
+	}
+	flags, positional, err := parseCommonFlags(filtered)
+	if err != nil || len(positional) != 0 {
+		fmt.Fprint(stderr, graphUsage)
+		return exitUsage
+	}
+	cfg, err := resolveConfig(flags)
+	if err != nil {
+		fmt.Fprintf(stderr, "proceed: %v\n", err)
+		return exitUnclassified
+	}
+	st, err := store.Open(cfg.DataDir + "/proceed.db")
+	if err != nil {
+		fmt.Fprintf(stderr, "proceed: %v\n", err)
+		return exitUnclassified
+	}
+	defer st.Close()
+
+	summaries, err := st.ListRuns(context.Background(), status, limit)
+	if err != nil {
+		return printClassified(err, stderr)
+	}
+	encoded, err := json.MarshalIndent(store.RunList{Runs: summaries}, "", "  ")
+	if err != nil {
+		fmt.Fprintf(stderr, "proceed: %v\n", err)
+		return exitUnclassified
+	}
+	fmt.Fprintln(stdout, string(encoded))
+	return exitOK
 }

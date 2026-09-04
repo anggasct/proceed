@@ -412,3 +412,84 @@ func assertStaticInternalError(t *testing.T, rec *httptest.ResponseRecorder, pay
 		t.Fatalf("message = %q, want static text", message)
 	}
 }
+
+func TestAPIListRuns(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Tokens = append(cfg.Tokens, config.Token{Name: "norun", Token: "norun-secret", Scopes: []string{"approve"}})
+	server, _, _ := testServer(t, cfg)
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	defer target.Close()
+	graphPath := filepath.Join(cfg.DataDir, "graph.yaml")
+	graphYAML := fmt.Sprintf(`schema: proceed/v1
+name: api-list
+nodes:
+  - id: call
+    type: task
+    executor:
+      kind: http
+      method: GET
+      url: %s
+    contract: reconcilable
+    terminal: true
+    capability:
+      network:
+        allowlisted_hosts: [127.0.0.1]
+edges: []
+`, target.URL)
+	if err := os.WriteFile(graphPath, []byte(graphYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := doJSON(t, server.Handler(), "POST", "/v1/runs", "operator-secret",
+		`{"graph":`+jsonString(graphPath)+`}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d", rec.Code)
+	}
+
+	rec, payload := doJSON(t, server.Handler(), "GET", "/v1/runs", "viewer-secret", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d body = %v", rec.Code, payload)
+	}
+	runs, ok := payload["runs"].([]any)
+	if !ok || len(runs) != 1 {
+		t.Fatalf("runs = %v, want 1", payload["runs"])
+	}
+	entry, ok := runs[0].(map[string]any)
+	if !ok {
+		t.Fatalf("entry = %v", runs[0])
+	}
+	for _, field := range []string{"run_id", "graph_name", "status", "created_at"} {
+		if _, ok := entry[field]; !ok {
+			t.Fatalf("entry missing %q: %v", field, entry)
+		}
+	}
+	if entry["graph_name"] != "api-list" {
+		t.Fatalf("graph_name = %v, want api-list", entry["graph_name"])
+	}
+
+	rec, payload = doJSON(t, server.Handler(), "GET", "/v1/runs?status=completed", "viewer-secret", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("filtered status = %d body = %v", rec.Code, payload)
+	}
+
+	for target, want := range map[string]string{
+		"/v1/runs?status=waiting": "GRAPH_INVALID",
+		"/v1/runs?limit=0":        "GRAPH_INVALID",
+		"/v1/runs?limit=abc":      "GRAPH_INVALID",
+	} {
+		rec, payload := doJSON(t, server.Handler(), "GET", target, "viewer-secret", "")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("GET %s status = %d, want 400", target, rec.Code)
+		}
+		if payload["error"].(map[string]any)["code"] != want {
+			t.Fatalf("GET %s envelope = %v", target, payload)
+		}
+	}
+
+	rec, _ = doJSON(t, server.Handler(), "GET", "/v1/runs", "norun-secret", "")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("no-read-scope status = %d, want 403", rec.Code)
+	}
+}
