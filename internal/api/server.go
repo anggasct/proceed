@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -288,8 +289,13 @@ func writeApprovalDecisionError(w http.ResponseWriter, err error) {
 	case store.CodeGraphInvalid:
 		writeError(w, http.StatusBadRequest, store.CodeGraphInvalid, err.Error(), nil)
 	default:
-		writeError(w, http.StatusInternalServerError, "INTERNAL", err.Error(), nil)
+		writeInternalError(w, err)
 	}
+}
+
+func writeInternalError(w http.ResponseWriter, err error) {
+	log.Printf("internal error: %v", err)
+	writeError(w, http.StatusInternalServerError, "INTERNAL", "internal error", nil)
 }
 
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
@@ -381,6 +387,6 @@ func writeStoreError(w http.ResponseWriter, err error) {
 	case store.CodeStoreConflict, "WAIT_CONFLICT":
 		writeError(w, http.StatusConflict, code, err.Error(), nil)
 	default:
-		writeError(w, http.StatusInternalServerError, "INTERNAL", err.Error(), nil)
+		writeInternalError(w, err)
 	}
 }
