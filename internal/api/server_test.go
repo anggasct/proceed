@@ -379,3 +379,36 @@ edges: []
 		t.Fatalf("cancel body run_id = %v, want %v", payload["run_id"], runID)
 	}
 }
+
+func TestAPIInternalErrorsHideDetails(t *testing.T) {
+	cfg := testConfig(t)
+	server, st, _ := testServer(t, cfg)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, payload := doJSON(t, server.Handler(), "POST", "/v1/approvals/unknown/decision", "operator-secret",
+		`{"decision":"grant","actor":"op","decision_idempotency_key":"e2e-key-1"}`)
+	assertStaticInternalError(t, rec, payload)
+
+	rec, payload = doJSON(t, server.Handler(), "GET", "/v1/runs/unknown/export", "viewer-secret", "")
+	assertStaticInternalError(t, rec, payload)
+}
+
+func assertStaticInternalError(t *testing.T, rec *httptest.ResponseRecorder, payload map[string]any) {
+	t.Helper()
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (body = %v)", rec.Code, payload)
+	}
+	body, ok := payload["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("envelope = %v, want error body", payload)
+	}
+	if body["code"] != "INTERNAL" {
+		t.Fatalf("code = %v, want INTERNAL", body["code"])
+	}
+	message, _ := body["message"].(string)
+	if message != "internal error" {
+		t.Fatalf("message = %q, want static text", message)
+	}
+}
