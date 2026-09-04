@@ -1,0 +1,41 @@
+schema: proceed/v1
+name: delivery-loop
+nodes:
+  - id: lint
+    type: task
+    contract: pure
+    executor:
+      kind: shell
+      command: [/bin/sh, -c, "printf lint-ok"]
+    capability:
+      process: declared-command
+  - id: test
+    type: task
+    contract: pure
+    executor:
+      kind: shell
+      command: [/bin/sh, -c, "printf tests-ok"]
+    capability:
+      process: declared-command
+  - id: approve-deploy
+    type: task
+    contract: idempotent
+    executor:
+      kind: human_approval
+      scope: deploy-prod
+      expires_in_ms: 60000
+  - id: deploy
+    type: task
+    contract: idempotent
+    terminal: true
+    executor:
+      kind: http
+      method: POST
+      url: http://127.0.0.1:1/deploy
+    capability:
+      network:
+        allowlisted_hosts: [127.0.0.1]
+edges:
+  - { from: lint, to: test, type: depends_on }
+  - { from: test, to: approve-deploy, type: depends_on }
+  - { from: approve-deploy, to: deploy, type: depends_on }

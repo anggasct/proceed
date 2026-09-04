@@ -1,0 +1,33 @@
+schema: proceed/v1
+name: content-publish
+nodes:
+  - id: draft
+    type: task
+    contract: non_replayable
+    executor:
+      kind: agent_cli
+      cli: drafter
+      args: [draft, --topic, launch]
+    capability:
+      process: declared-command
+  - id: editor-review
+    type: task
+    contract: idempotent
+    executor:
+      kind: human_approval
+      scope: editor
+      expires_in_ms: 60000
+  - id: publish
+    type: task
+    contract: idempotent
+    terminal: true
+    executor:
+      kind: http
+      method: POST
+      url: http://127.0.0.1:1/publish
+    capability:
+      network:
+        allowlisted_hosts: [127.0.0.1]
+edges:
+  - { from: draft, to: editor-review, type: depends_on }
+  - { from: editor-review, to: publish, type: depends_on }
