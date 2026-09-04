@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"proceed/internal/compiler"
@@ -30,6 +31,7 @@ type Server struct {
 func NewServer(deps Deps) *Server {
 	s := &Server{deps: deps, mux: http.NewServeMux()}
 	s.mux.HandleFunc("POST /v1/runs", s.handleCreateRun)
+	s.mux.HandleFunc("GET /v1/runs", s.handleListRuns)
 	s.mux.HandleFunc("GET /v1/runs/{id}", s.handleGetRun)
 	s.mux.HandleFunc("GET /v1/runs/{id}/graph", s.handleGetRun)
 	s.mux.HandleFunc("POST /v1/runs/{id}/cancel", s.handleCancelRun)
@@ -134,6 +136,27 @@ func (s *Server) versionExists(ctx context.Context, versionID string) bool {
 		return false
 	}
 	return count > 0
+}
+
+func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
+	if !s.authorize(w, r, "read") {
+		return
+	}
+	limit := 50
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "GRAPH_INVALID", "limit must be an integer", nil)
+			return
+		}
+		limit = parsed
+	}
+	summaries, err := s.deps.Store.ListRuns(r.Context(), r.URL.Query().Get("status"), limit)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, store.RunList{Runs: summaries})
 }
 
 func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
