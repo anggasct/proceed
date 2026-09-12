@@ -20,6 +20,7 @@ Commands:
   graph       inspect | why | export | improvement — read-only run and graph views
   approve     Record an approval gate decision
   reconcile   Resolve an uncertain effect
+  trigger     add | list | remove — inbound webhook trigger bindings
   store       export | import — backup and restore
 
 Run "proceed <command> -h" for command flags.
@@ -54,6 +55,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return cmdGraph(args[1:], stdout, stderr)
 		case "approve":
 			return cmdApprove(args[1:], stdout, stderr)
+		case "trigger":
+			return cmdTrigger(args[1:], stdout, stderr)
 		case "store":
 			return cmdStore(args[1:], stdout, stderr)
 		default:
@@ -73,5 +76,6 @@ var commands = map[string]struct{}{
 	"graph":     {},
 	"approve":   {},
 	"reconcile": {},
+	"trigger":   {},
 	"store":     {},
 }

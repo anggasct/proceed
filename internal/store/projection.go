@@ -19,7 +19,7 @@ type Run struct {
 	DefinitionDigest string
 }
 
-func (s *Store) CreateRun(ctx context.Context, graphVersionID string, params *RunParamsStart) (Run, error) {
+func (s *Store) CreateRun(ctx context.Context, graphVersionID string, params *RunParamsStart, triggerName string) (Run, error) {
 	now := time.Now().UnixMilli()
 	run := Run{ID: ulid.Make().String(), GraphVersionID: graphVersionID}
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
@@ -34,6 +34,7 @@ func (s *Store) CreateRun(ctx context.Context, graphVersionID string, params *Ru
 		started := runStartedPayload{
 			GraphVersionID:   graphVersionID,
 			DefinitionDigest: run.DefinitionDigest,
+			TriggerName:      triggerName,
 		}
 		if params != nil {
 			started.ParamsDigest = params.Digest
@@ -60,10 +61,14 @@ func (s *Store) CreateRun(ctx context.Context, graphVersionID string, params *Ru
 		if params != nil && params.Digest != "" {
 			paramsDigest = params.Digest
 		}
+		var triggerNameValue any
+		if triggerName != "" {
+			triggerNameValue = triggerName
+		}
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO graph_run (id, graph_version_id, definition_digest, params_digest, status, created_at)
-VALUES (?, ?, ?, ?, 'running', ?)`,
-			run.ID, run.GraphVersionID, run.DefinitionDigest, paramsDigest, now); err != nil {
+INSERT INTO graph_run (id, graph_version_id, definition_digest, params_digest, trigger_name, status, created_at)
+VALUES (?, ?, ?, ?, ?, 'running', ?)`,
+			run.ID, run.GraphVersionID, run.DefinitionDigest, paramsDigest, triggerNameValue, now); err != nil {
 			return err
 		}
 		return appendEventTx(ctx, tx, &ev)
@@ -79,6 +84,7 @@ type runStartedPayload struct {
 	DefinitionDigest string          `json:"definition_digest"`
 	ParamsDigest     string          `json:"params_digest,omitempty"`
 	Params           []RunParamValue `json:"params,omitempty"`
+	TriggerName      string          `json:"trigger_name,omitempty"`
 }
 
 type nodeStartedPayload struct {
@@ -295,9 +301,9 @@ func onRunStarted(ctx context.Context, tx *sql.Tx, ev *Event) error {
 		paramsDigest = "{}"
 	}
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO graph_run (id, graph_version_id, definition_digest, params_digest, status, created_at)
-VALUES (?, ?, ?, ?, 'running', ?) ON CONFLICT(id) DO NOTHING`,
-		ev.RunID, p.GraphVersionID, digest, paramsDigest, ev.OccurredAt); err != nil {
+INSERT INTO graph_run (id, graph_version_id, definition_digest, params_digest, trigger_name, status, created_at)
+VALUES (?, ?, ?, ?, ?, 'running', ?) ON CONFLICT(id) DO NOTHING`,
+		ev.RunID, p.GraphVersionID, digest, paramsDigest, nullableOr(p.TriggerName), ev.OccurredAt); err != nil {
 		return err
 	}
 	for i := range p.Params {

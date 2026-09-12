@@ -70,7 +70,7 @@ edges:
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := st.CreateRun(ctx, frozen.GraphVersionID, nil)
+	run, err := st.CreateRun(ctx, frozen.GraphVersionID, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +417,7 @@ func TestLargeRun(t *testing.T) {
 	doc, _ := compiler.Parse(src)
 	_ = compiler.Validate(doc)
 	frozen, _ := st.FreezeDefinition(ctx, "large.yaml", src, doc)
-	run, _ := st.CreateRun(ctx, frozen.GraphVersionID, nil)
+	run, _ := st.CreateRun(ctx, frozen.GraphVersionID, nil, "")
 	out, err := Export(ctx, st, run.ID, "json")
 	if err != nil {
 		t.Fatalf("large run export: %v", err)

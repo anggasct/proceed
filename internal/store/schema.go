@@ -1,6 +1,6 @@
 package store
 
-const storeSchemaVersion = 4
+const storeSchemaVersion = 5
 
 var schemaDDL = `
 CREATE TABLE IF NOT EXISTS graph (
@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS graph_run (
   graph_version_id  TEXT NOT NULL REFERENCES graph_version(id),
   definition_digest TEXT NOT NULL,
   params_digest     TEXT NOT NULL DEFAULT '{}',
+  trigger_name      TEXT,
   status            TEXT NOT NULL
                     CHECK (status IN ('running','completed','failed','cancelled','abandoned')),
   created_at        INTEGER NOT NULL,
@@ -314,6 +315,14 @@ CREATE INDEX IF NOT EXISTS idx_graph_edge_version ON graph_edge(graph_version_id
 CREATE INDEX IF NOT EXISTS idx_graph_param_version ON graph_param(graph_version_id);
 CREATE INDEX IF NOT EXISTS idx_policy_version ON policy(graph_version_id);
 CREATE INDEX IF NOT EXISTS idx_run_param_run ON run_param(run_id);
+
+CREATE TABLE IF NOT EXISTS webhook_trigger (
+  id                 TEXT PRIMARY KEY,
+  name               TEXT NOT NULL UNIQUE,
+  graph_version_id   TEXT NOT NULL REFERENCES graph_version(id),
+  definition_digest  TEXT NOT NULL,
+  created_at         INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_run_node_run        ON run_node(run_id);
 CREATE INDEX IF NOT EXISTS idx_run_edge_run        ON run_edge(run_id);
 CREATE INDEX IF NOT EXISTS idx_run_edge_traversals ON run_edge(run_id, edge_id);

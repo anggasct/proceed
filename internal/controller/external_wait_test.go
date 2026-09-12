@@ -36,7 +36,7 @@ func openTestStoreWithGraph(t *testing.T, graphYAML string) (*store.Store, strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := s.CreateRun(context.Background(), frozen.GraphVersionID, nil)
+	run, err := s.CreateRun(context.Background(), frozen.GraphVersionID, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
