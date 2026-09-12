@@ -18,7 +18,7 @@ func TestExternalWaitProjectionAndRebuild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := s.CreateRun(ctx, frozen.GraphVersionID)
+	run, err := s.CreateRun(ctx, frozen.GraphVersionID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

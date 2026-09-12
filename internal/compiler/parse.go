@@ -15,13 +15,25 @@ const (
 )
 
 type Document struct {
-	Schema   string
-	Name     string
-	Nodes    []Node
-	Edges    []Edge
-	HasEdges bool
-	Policies []Policy
-	Extras   map[string]yaml.Node
+	Schema    string
+	Name      string
+	Nodes     []Node
+	Edges     []Edge
+	HasEdges  bool
+	Policies  []Policy
+	Params    []Param
+	HasParams bool
+	Extras    map[string]yaml.Node
+}
+
+type Param struct {
+	Name        string
+	Type        string
+	Required    bool
+	HasRequired bool
+	HasDefault  bool
+	Default     string
+	DefaultTag  string
 }
 
 type Node struct {
@@ -102,7 +114,11 @@ type Policy struct {
 }
 
 var documentFields = map[string]struct{}{
-	"schema": {}, "name": {}, "nodes": {}, "edges": {}, "policies": {},
+	"schema": {}, "name": {}, "nodes": {}, "edges": {}, "policies": {}, "params": {},
+}
+
+var paramFields = map[string]struct{}{
+	"name": {}, "type": {}, "required": {}, "default": {},
 }
 
 var nodeFields = map[string]struct{}{
@@ -204,6 +220,9 @@ func (p *parser) document(n *yaml.Node) *Document {
 			doc.HasEdges = true
 		case "policies":
 			doc.Policies = p.policies(f.value)
+		case "params":
+			doc.Params = p.params(f.value)
+			doc.HasParams = true
 		}
 	}
 	switch {
@@ -493,6 +512,75 @@ func (p *parser) retry(n *yaml.Node, path string) *Retry {
 		}
 	}
 	return r
+}
+
+func (p *parser) params(n *yaml.Node) []Param {
+	items := p.sequence(n, "params")
+	out := make([]Param, 0, len(items))
+	for i, item := range items {
+		out = append(out, p.param(item, fmt.Sprintf("params[%d]", i)))
+	}
+	return out
+}
+
+func (p *parser) param(n *yaml.Node, path string) Param {
+	var pa Param
+	if !p.isMapping(n, path) {
+		return pa
+	}
+	for _, f := range p.fields(n, path, paramFields) {
+		if f.extra {
+			p.errf(RuleUnknownField, joinPath(path, f.name), "unknown field %q", f.name)
+			continue
+		}
+		loc := joinPath(path, f.name)
+		switch f.name {
+		case "name":
+			pa.Name = p.str(f.value, loc)
+		case "type":
+			pa.Type = p.str(f.value, loc)
+		case "required":
+			pa.Required, pa.HasRequired = p.boolean(f.value, loc)
+		case "default":
+			pa.Default, pa.DefaultTag, pa.HasDefault = p.paramDefault(f.value, loc)
+		}
+	}
+	return pa
+}
+
+func (p *parser) paramDefault(n *yaml.Node, path string) (string, string, bool) {
+	if n.Kind != yaml.ScalarNode {
+		p.errf(RuleParse, path, "default must be a scalar")
+		return "", "", false
+	}
+	switch n.Tag {
+	case "!!null":
+		return "", "", false
+	case "!!str":
+		return n.Value, n.Tag, true
+	case "!!int":
+		v, err := strconv.ParseInt(n.Value, 0, 64)
+		if err != nil {
+			p.errf(RuleParse, path, "default integer %q out of range", n.Value)
+			return "", "", false
+		}
+		return strconv.FormatInt(v, 10), n.Tag, true
+	case "!!float":
+		v, err := strconv.ParseFloat(n.Value, 64)
+		if err != nil {
+			p.errf(RuleParse, path, "invalid default float %q", n.Value)
+			return "", "", false
+		}
+		return strconv.FormatFloat(v, 'g', -1, 64), n.Tag, true
+	case "!!bool":
+		if strings.EqualFold(n.Value, "true") {
+			return "true", n.Tag, true
+		}
+		return "false", n.Tag, true
+	default:
+		p.errf(RuleParse, path, "default must be a scalar")
+		return "", "", false
+	}
 }
 
 func (p *parser) fields(n *yaml.Node, path string, allowed map[string]struct{}) []field {

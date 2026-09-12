@@ -44,6 +44,37 @@ type Controller struct {
 
 	inflightMu sync.Mutex
 	inflight   map[string]inflightExecution
+
+	// Bound secret refs live only for the controller process lifetime:
+	// the durable run_param row is a presence marker, so re-resolution
+	// after a restart falls back to the declared default ref or the
+	// param name against operator config (fail closed when unresolvable).
+	paramRefsMu sync.Mutex
+	paramRefs   map[string]map[string]string
+}
+
+func (c *Controller) rememberParamRefs(runID string, refs map[string]string) {
+	if len(refs) == 0 {
+		return
+	}
+	c.paramRefsMu.Lock()
+	defer c.paramRefsMu.Unlock()
+	if c.paramRefs == nil {
+		c.paramRefs = map[string]map[string]string{}
+	}
+	c.paramRefs[runID] = refs
+}
+
+func (c *Controller) paramRefsFor(runID string) map[string]string {
+	c.paramRefsMu.Lock()
+	defer c.paramRefsMu.Unlock()
+	return c.paramRefs[runID]
+}
+
+func (c *Controller) forgetParamRefs(runID string) {
+	c.paramRefsMu.Lock()
+	defer c.paramRefsMu.Unlock()
+	delete(c.paramRefs, runID)
 }
 
 type inflightExecution struct {

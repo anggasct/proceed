@@ -54,7 +54,7 @@ edges: []
 
 func mustCreateRun(t *testing.T, st *store.Store, versionID string) string {
 	t.Helper()
-	run, err := st.CreateRun(context.Background(), versionID)
+	run, err := st.CreateRun(context.Background(), versionID, nil)
 	if err != nil {
 		t.Fatalf("failed to create run: %v", err)
 	}

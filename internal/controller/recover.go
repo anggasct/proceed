@@ -131,6 +131,11 @@ func (c *Controller) reconcileNode(ctx context.Context, runID, nodeKey string) e
 	if err != nil {
 		return err
 	}
+	if kind == executor.Shell || kind == executor.HTTP {
+		if err := c.interpolateNodeParams(ctx, runID, run.graphVersionID, kind, cfg); err != nil {
+			return c.failNode(ctx, runID, nodeKey, attemptNo, err)
+		}
+	}
 	ex, ok := c.pool[kind]
 	if !ok {
 		return c.waitingNode(ctx, runID, nodeKey)
@@ -198,6 +203,11 @@ func (c *Controller) reconcileCancelledNode(ctx context.Context, runID, nodeKey 
 	cfg, kind, contract, err := c.parseNodeConfig(nodeConfigForKey(c, ctx, runID, run.graphVersionID, nodeKey))
 	if err != nil {
 		return err
+	}
+	if kind == executor.Shell || kind == executor.HTTP {
+		if err := c.interpolateNodeParams(ctx, runID, run.graphVersionID, kind, cfg); err != nil {
+			return c.failNode(ctx, runID, nodeKey, attemptNo, err)
+		}
 	}
 	ex, ok := c.pool[kind]
 	if !ok {

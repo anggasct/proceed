@@ -1,12 +1,14 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -82,7 +84,45 @@ func (s *Server) handleReserved(scope string) http.HandlerFunc {
 }
 
 type createRunRequest struct {
-	Graph string `json:"graph"`
+	Graph  string                     `json:"graph"`
+	Params map[string]json.RawMessage `json:"params"`
+}
+
+func paramBindings(params map[string]json.RawMessage) ([]controller.ParamBinding, error) {
+	names := make([]string, 0, len(params))
+	for name := range params {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]controller.ParamBinding, 0, len(params))
+	for _, name := range names {
+		dec := json.NewDecoder(bytes.NewReader(params[name]))
+		dec.UseNumber()
+		var value any
+		if err := dec.Decode(&value); err != nil {
+			return nil, store.NewCodeError(store.CodeGraphInvalid,
+				"param %q must be a JSON scalar or a secret_ref object", name)
+		}
+		switch v := value.(type) {
+		case string:
+			out = append(out, controller.ParamBinding{Name: name, Value: v})
+		case json.Number:
+			out = append(out, controller.ParamBinding{Name: name, Value: v.String()})
+		case bool:
+			out = append(out, controller.ParamBinding{Name: name, Value: strconv.FormatBool(v)})
+		case map[string]any:
+			ref, ok := v["secret_ref"].(string)
+			if len(v) != 1 || !ok || !compiler.IsValidName(ref) {
+				return nil, store.NewCodeError(store.CodeGraphInvalid,
+					"param %q must carry exactly one secret_ref name", name)
+			}
+			out = append(out, controller.ParamBinding{Name: name, Value: ref, SecretRef: true})
+		default:
+			return nil, store.NewCodeError(store.CodeGraphInvalid,
+				"param %q must be a JSON scalar or a secret_ref object", name)
+		}
+	}
+	return out, nil
 }
 
 func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
@@ -107,7 +147,26 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		}
 		versionID = freeze
 	}
-	runID, err := s.deps.Controller.Run(r.Context(), controller.RunInput{GraphVersionID: versionID})
+	var bindings []controller.ParamBinding
+	if body.Params != nil {
+		var err error
+		bindings, err = paramBindings(body.Params)
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+	}
+	decls, err := s.deps.Store.GraphParams(r.Context(), versionID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	bound, err := controller.BindRunParams(decls, bindings)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	runID, err := s.deps.Controller.Run(r.Context(), controller.RunInput{GraphVersionID: versionID, Params: bound})
 	if err != nil {
 		writeStoreError(w, err)
 		return

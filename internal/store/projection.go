@@ -19,7 +19,7 @@ type Run struct {
 	DefinitionDigest string
 }
 
-func (s *Store) CreateRun(ctx context.Context, graphVersionID string) (Run, error) {
+func (s *Store) CreateRun(ctx context.Context, graphVersionID string, params *RunParamsStart) (Run, error) {
 	now := time.Now().UnixMilli()
 	run := Run{ID: ulid.Make().String(), GraphVersionID: graphVersionID}
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
@@ -31,10 +31,15 @@ func (s *Store) CreateRun(ctx context.Context, graphVersionID string) (Run, erro
 			}
 			return err
 		}
-		payload, err := json.Marshal(runStartedPayload{
+		started := runStartedPayload{
 			GraphVersionID:   graphVersionID,
 			DefinitionDigest: run.DefinitionDigest,
-		})
+		}
+		if params != nil {
+			started.ParamsDigest = params.Digest
+			started.Params = params.Values
+		}
+		payload, err := json.Marshal(started)
 		if err != nil {
 			return err
 		}
@@ -51,10 +56,14 @@ func (s *Store) CreateRun(ctx context.Context, graphVersionID string) (Run, erro
 			PayloadDigest: payloadDigest(string(payload)),
 			Payload:       string(payload),
 		}
+		paramsDigest := "{}"
+		if params != nil && params.Digest != "" {
+			paramsDigest = params.Digest
+		}
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO graph_run (id, graph_version_id, definition_digest, status, created_at)
-VALUES (?, ?, ?, 'running', ?)`,
-			run.ID, run.GraphVersionID, run.DefinitionDigest, now); err != nil {
+INSERT INTO graph_run (id, graph_version_id, definition_digest, params_digest, status, created_at)
+VALUES (?, ?, ?, ?, 'running', ?)`,
+			run.ID, run.GraphVersionID, run.DefinitionDigest, paramsDigest, now); err != nil {
 			return err
 		}
 		return appendEventTx(ctx, tx, &ev)
@@ -66,8 +75,10 @@ VALUES (?, ?, ?, 'running', ?)`,
 }
 
 type runStartedPayload struct {
-	GraphVersionID   string `json:"graph_version_id"`
-	DefinitionDigest string `json:"definition_digest"`
+	GraphVersionID   string          `json:"graph_version_id"`
+	DefinitionDigest string          `json:"definition_digest"`
+	ParamsDigest     string          `json:"params_digest,omitempty"`
+	Params           []RunParamValue `json:"params,omitempty"`
 }
 
 type nodeStartedPayload struct {
@@ -279,11 +290,29 @@ func onRunStarted(ctx context.Context, tx *sql.Tx, ev *Event) error {
 			return err
 		}
 	}
-	_, err := tx.ExecContext(ctx, `
-INSERT INTO graph_run (id, graph_version_id, definition_digest, status, created_at)
-VALUES (?, ?, ?, 'running', ?) ON CONFLICT(id) DO NOTHING`,
-		ev.RunID, p.GraphVersionID, digest, ev.OccurredAt)
-	return err
+	paramsDigest := p.ParamsDigest
+	if paramsDigest == "" {
+		paramsDigest = "{}"
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO graph_run (id, graph_version_id, definition_digest, params_digest, status, created_at)
+VALUES (?, ?, ?, ?, 'running', ?) ON CONFLICT(id) DO NOTHING`,
+		ev.RunID, p.GraphVersionID, digest, paramsDigest, ev.OccurredAt); err != nil {
+		return err
+	}
+	for i := range p.Params {
+		v := p.Params[i]
+		var value any
+		if v.Value != nil {
+			value = *v.Value
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO run_param (run_id, name, type, value) VALUES (?, ?, ?, ?)
+ON CONFLICT(run_id, name) DO NOTHING`, ev.RunID, v.Name, v.Type, value); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func onNodeStarted(ctx context.Context, tx *sql.Tx, ev *Event) error {
@@ -811,12 +840,19 @@ func onExternalEventRejected(ctx context.Context, tx *sql.Tx, ev *Event) error {
 
 var wipeOrder = []string{
 	"external_wait", "causal_link", "decision", "evaluation", "effect", "artifact", "outcome", "anchor",
-	"approval", "node_attempt", "run_edge", "run_node", "graph_run",
+	"approval", "node_attempt", "run_edge", "run_node", "run_param", "graph_run",
 }
 
-var digestTables = []string{
-	"graph_run", "run_node", "run_edge", "node_attempt", "artifact", "evaluation",
-	"effect", "decision", "causal_link", "approval", "outcome", "anchor", "external_wait",
+type digestTable struct {
+	table string
+	order string
+}
+
+var digestTables = []digestTable{
+	{"graph_run", "id"}, {"run_node", "id"}, {"run_edge", "id"}, {"node_attempt", "id"},
+	{"artifact", "id"}, {"evaluation", "id"}, {"effect", "id"}, {"decision", "id"},
+	{"causal_link", "id"}, {"approval", "id"}, {"outcome", "id"}, {"anchor", "id"},
+	{"external_wait", "id"}, {"run_param", "run_id, name"},
 }
 
 type RebuildReport struct {
@@ -831,8 +867,8 @@ type queryer interface {
 
 func projectionDigestTx(ctx context.Context, q queryer) (string, error) {
 	h := sha256.New()
-	for _, table := range digestTables {
-		rows, err := q.QueryContext(ctx, "SELECT * FROM "+table+" ORDER BY id")
+	for _, t := range digestTables {
+		rows, err := q.QueryContext(ctx, "SELECT * FROM "+t.table+" ORDER BY "+t.order)
 		if err != nil {
 			return "", err
 		}
@@ -841,7 +877,7 @@ func projectionDigestTx(ctx context.Context, q queryer) (string, error) {
 			rows.Close()
 			return "", err
 		}
-		h.Write([]byte(table))
+		h.Write([]byte(t.table))
 		for rows.Next() {
 			vals := make([]any, len(cols))
 			ptrs := make([]any, len(cols))

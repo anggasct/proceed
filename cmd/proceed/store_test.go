@@ -41,7 +41,7 @@ func buildCLIStore(t *testing.T, dataDir string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.CreateRun(context.Background(), frozen.GraphVersionID); err != nil {
+	if _, err := s.CreateRun(context.Background(), frozen.GraphVersionID, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dataDir, "artifacts", "note"), []byte("cli artifact"), 0o644); err != nil {

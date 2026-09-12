@@ -102,7 +102,7 @@ func appendFixtureStream(t *testing.T, s *Store, run Run, edgeID, nodeA, nodeB s
 func TestCreateRunEmitsRunStarted(t *testing.T) {
 	s := openTestStore(t)
 	versionID, _, _, _ := fixtureVersion(t, s)
-	run, err := s.CreateRun(context.Background(), versionID)
+	run, err := s.CreateRun(context.Background(), versionID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestCreateRunEmitsRunStarted(t *testing.T) {
 
 func TestCreateRunRejectsUnknownVersion(t *testing.T) {
 	s := openTestStore(t)
-	_, err := s.CreateRun(context.Background(), "01NOPE")
+	_, err := s.CreateRun(context.Background(), "01NOPE", nil)
 	if !IsCode(err, CodeGraphInvalid) {
 		t.Fatalf("error = %v, want GRAPH_INVALID", err)
 	}
@@ -134,7 +134,7 @@ func TestCreateRunRejectsUnknownVersion(t *testing.T) {
 func TestRebuildFromEmptyProjectionReproducesDigest(t *testing.T) {
 	s := openTestStore(t)
 	versionID, edgeID, nodeA, nodeB := fixtureVersion(t, s)
-	run, err := s.CreateRun(context.Background(), versionID)
+	run, err := s.CreateRun(context.Background(), versionID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestRebuildFromEmptyProjectionReproducesDigest(t *testing.T) {
 func TestRebuildDetectsInjectedDivergence(t *testing.T) {
 	s := openTestStore(t)
 	versionID, edgeID, nodeA, nodeB := fixtureVersion(t, s)
-	run, err := s.CreateRun(context.Background(), versionID)
+	run, err := s.CreateRun(context.Background(), versionID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 func TestRebuildConvergesAfterCrashBeforeProjection(t *testing.T) {
 	s := openTestStore(t)
 	versionID, _, nodeA, _ := fixtureVersion(t, s)
-	run, err := s.CreateRun(context.Background(), versionID)
+	run, err := s.CreateRun(context.Background(), versionID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +274,7 @@ func TestRebuildConvergesAfterCrashBeforeProjection(t *testing.T) {
 func TestUnknownEventTypeStoredAndIgnored(t *testing.T) {
 	s := openTestStore(t)
 	versionID, _, nodeA, _ := fixtureVersion(t, s)
-	run, err := s.CreateRun(context.Background(), versionID)
+	run, err := s.CreateRun(context.Background(), versionID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +288,7 @@ func TestUnknownEventTypeStoredAndIgnored(t *testing.T) {
 func TestRunTerminalProjections(t *testing.T) {
 	s := openTestStore(t)
 	versionID, edgeID, nodeA, nodeB := fixtureVersion(t, s)
-	run, err := s.CreateRun(context.Background(), versionID)
+	run, err := s.CreateRun(context.Background(), versionID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

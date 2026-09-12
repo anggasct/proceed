@@ -20,15 +20,23 @@ import (
 
 type RunInput struct {
 	GraphVersionID string
+	Params         *BoundRunParams
 }
 
 func (c *Controller) Run(ctx context.Context, input RunInput) (string, error) {
 	if err := c.acquireLease(ctx, time.Now()); err != nil {
 		return "", err
 	}
-	run, err := c.store.CreateRun(ctx, input.GraphVersionID)
+	params := input.Params
+	if params != nil && len(params.Values) == 0 {
+		params = nil
+	}
+	run, err := c.store.CreateRun(ctx, input.GraphVersionID, params.Start())
 	if err != nil {
 		return "", err
+	}
+	if input.Params != nil {
+		c.rememberParamRefs(run.ID, input.Params.Refs)
 	}
 	return run.ID, nil
 }
@@ -301,6 +309,11 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 	ex, kind, contract, err := c.resolveExecutor(cfg)
 	if err != nil {
 		return c.failNode(ctx, runID, n.NodeKey, n.AttemptNo, err)
+	}
+	if kind == executor.Shell || kind == executor.HTTP {
+		if err := c.interpolateNodeParams(ctx, runID, graphVersionID, kind, cfg); err != nil {
+			return c.failNode(ctx, runID, n.NodeKey, n.AttemptNo, err)
+		}
 	}
 	maxAttempts, backoffMs := retryPolicy(cfg)
 	n.MaxAttempts, n.BackoffMs = maxAttempts, backoffMs
