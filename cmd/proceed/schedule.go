@@ -95,11 +95,11 @@ func parseScheduleFlags(args []string) (scheduleFlags, error) {
 }
 
 func openScheduleStore(f scheduleFlags) (*store.Store, error) {
-	dataDir := f.dataDir
-	if dataDir == "" {
-		dataDir = ".proceed"
+	cfg, err := resolveConfig(cliFlags{configPath: f.configPath, dataDir: f.dataDir})
+	if err != nil {
+		return nil, err
 	}
-	return store.Open(filepath.Join(dataDir, "proceed.db"))
+	return store.Open(filepath.Join(cfg.DataDir, "proceed.db"))
 }
 
 func cmdScheduleAdd(args []string, stdout, stderr io.Writer) int {

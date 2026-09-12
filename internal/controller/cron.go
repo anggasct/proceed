@@ -156,7 +156,10 @@ func (c *Controller) FireDueSchedules(ctx context.Context, now time.Time) error 
 		return err
 	}
 	for _, o := range outcomes {
-		if o.RunID != "" {
+		switch {
+		case o.Error != "":
+			log.Printf("schedule %s failed to fire tick %d: %s", o.Name, o.Tick, o.Error)
+		case o.RunID != "":
 			runID := o.RunID
 			log.Printf("schedule %s fired run %s", o.Name, runID)
 			go func() {
@@ -164,7 +167,7 @@ func (c *Controller) FireDueSchedules(ctx context.Context, now time.Time) error 
 				defer cancel()
 				_ = c.Drain(drainCtx, runID)
 			}()
-		} else if o.Skipped > 0 {
+		case o.Skipped > 0:
 			log.Printf("schedule %s skipped %d ticks (window %d..%d)", o.Name, o.Skipped, o.SkipFrom, o.SkipTo)
 		}
 	}

@@ -367,6 +367,46 @@ func TestScheduledRunProjectionRebuild(t *testing.T) {
 	}
 }
 
+func TestFireDueSchedulesIsolatesPerScheduleErrors(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	versionID := freezeScheduleGraph(t, s)
+
+	tick := minuteMs(t, "2026-09-12T10:00:00Z")
+	if err := s.AddSchedule(context.Background(), "a-bad", versionID, "0 0 31 2 *", tick); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddSchedule(context.Background(), "healthy", versionID, "* * * * *", tick); err != nil {
+		t.Fatal(err)
+	}
+
+	outcomes, err := s.FireDueSchedules(context.Background(), tick+2000, testNextFunc(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outcomes) != 2 {
+		t.Fatalf("outcomes = %+v", outcomes)
+	}
+	bad, healthy := outcomes[0], outcomes[1]
+	if bad.Name != "a-bad" || bad.Error == "" || bad.RunID != "" {
+		t.Fatalf("bad outcome = %+v", bad)
+	}
+	if healthy.Name != "healthy" || healthy.Error != "" || healthy.RunID == "" || healthy.Tick != tick {
+		t.Fatalf("healthy outcome = %+v", healthy)
+	}
+	healthySched := scheduleRows(t, s, "healthy")
+	if len(runIDsForSchedule(t, s, healthySched.ID)) != 1 {
+		t.Fatal("healthy schedule must still fire after a failing schedule")
+	}
+	badSched := scheduleRows(t, s, "a-bad")
+	if len(runIDsForSchedule(t, s, badSched.ID)) != 0 || badSched.NextFireAt != tick {
+		t.Fatalf("bad row = %+v", badSched)
+	}
+}
+
 func TestMigrationAddsScheduleColumns(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "proceed.db")

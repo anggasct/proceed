@@ -135,6 +135,7 @@ type ScheduleFireOutcome struct {
 	SkipFrom   int64
 	SkipTo     int64
 	NextFireAt int64
+	Error      string
 }
 
 type CronNextFunc func(expr string, after time.Time) (time.Time, bool, error)
@@ -163,7 +164,13 @@ func (s *Store) FireDueSchedules(ctx context.Context, nowMs int64, next CronNext
 		sched := &due[i]
 		outcome, err := s.fireOneSchedule(ctx, sched, nowMs, next)
 		if err != nil {
-			return outcomes, err
+			outcomes = append(outcomes, ScheduleFireOutcome{
+				ScheduleID: sched.ID,
+				Name:       sched.Name,
+				Tick:       sched.NextFireAt,
+				Error:      err.Error(),
+			})
+			continue
 		}
 		if outcome != nil {
 			outcomes = append(outcomes, *outcome)

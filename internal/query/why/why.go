@@ -19,6 +19,8 @@ type Explanation struct {
 type Recorded struct {
 	RunID          string             `json:"run_id"`
 	GraphVersionID string             `json:"graph_version_id"`
+	ScheduleID     string             `json:"schedule_id,omitempty"`
+	ScheduleTick   int64              `json:"schedule_tick,omitempty"`
 	NodeKey        string             `json:"node_key"`
 	NodeStatus     string             `json:"node_status"`
 	AttemptCount   int64              `json:"attempt_count"`
@@ -285,8 +287,11 @@ WHERE d.run_id = ?`, runID).Scan(&actualLinks); err != nil {
 
 func (q *Query) load(ctx context.Context, runID, nodeKey string) (*Recorded, error) {
 	var graphVersionID string
-	err := q.st.DB().QueryRowContext(ctx,
-		"SELECT graph_version_id FROM graph_run WHERE id = ?", runID).Scan(&graphVersionID)
+	var scheduleID string
+	var scheduleTick int64
+	err := q.st.DB().QueryRowContext(ctx, `
+SELECT graph_version_id, COALESCE(schedule_id, ''), COALESCE(schedule_tick, 0)
+FROM graph_run WHERE id = ?`, runID).Scan(&graphVersionID, &scheduleID, &scheduleTick)
 	if err == sql.ErrNoRows {
 		return nil, store.NewCodeError("RUN_NOT_FOUND", "run %s does not exist", runID)
 	}
@@ -321,6 +326,8 @@ WHERE gn.graph_version_id = ? AND gn.node_key = ?`, runID, graphVersionID, nodeK
 	rec := &Recorded{
 		RunID:          runID,
 		GraphVersionID: graphVersionID,
+		ScheduleID:     scheduleID,
+		ScheduleTick:   scheduleTick,
 		NodeKey:        nodeKey,
 		NodeStatus:     nodeStatus,
 		AttemptCount:   attemptCount,
@@ -375,6 +382,8 @@ ORDER BY sequence LIMIT 1`, runID)
 		return nil, err
 	}
 	var graphVersionID, payload string
+	var scheduleID string
+	var scheduleTick int64
 	for rows.Next() {
 		if err := rows.Scan(&graphVersionID, &payload, &payload); err != nil {
 			rows.Close()
@@ -382,12 +391,16 @@ ORDER BY sequence LIMIT 1`, runID)
 		}
 		var started struct {
 			GraphVersionID string `json:"graph_version_id"`
+			ScheduleID     string `json:"schedule_id"`
+			ScheduleTick   int64  `json:"schedule_tick"`
 		}
 		if err := json.Unmarshal([]byte(payload), &started); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		graphVersionID = started.GraphVersionID
+		scheduleID = started.ScheduleID
+		scheduleTick = started.ScheduleTick
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -410,6 +423,8 @@ ORDER BY sequence LIMIT 1`, runID)
 	rec := &Recorded{
 		RunID:          runID,
 		GraphVersionID: graphVersionID,
+		ScheduleID:     scheduleID,
+		ScheduleTick:   scheduleTick,
 		NodeKey:        nodeKey,
 		NodeStatus:     "pending",
 		Source:         "events",
