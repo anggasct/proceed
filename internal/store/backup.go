@@ -598,6 +598,16 @@ func verifyStagedProjections(ctx context.Context, staging string) error {
 	defer db.Close()
 	var verifyErr error
 	err = func() error {
+		// Projection replay executes current-schema SQL, so older snapshots
+		// need additive columns pre-applied before verification.
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		if err := migrateSchemaAdditions(ctx, conn); err != nil {
+			return err
+		}
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err

@@ -85,15 +85,15 @@ func parseTriggerFlags(args []string) (triggerFlags, error) {
 }
 
 func openTriggerStore(f triggerFlags) (*store.Store, string, error) {
-	dataDir := f.dataDir
-	if dataDir == "" {
-		dataDir = ".proceed"
-	}
-	st, err := store.Open(filepath.Join(dataDir, "proceed.db"))
+	cfg, err := resolveConfig(cliFlags{configPath: f.configPath, dataDir: f.dataDir})
 	if err != nil {
-		return nil, dataDir, err
+		return nil, "", err
 	}
-	return st, dataDir, nil
+	st, err := store.Open(filepath.Join(cfg.DataDir, "proceed.db"))
+	if err != nil {
+		return nil, cfg.DataDir, err
+	}
+	return st, cfg.DataDir, nil
 }
 
 func cmdTriggerAdd(args []string, stdout, stderr io.Writer) int {

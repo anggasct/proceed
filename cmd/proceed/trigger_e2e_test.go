@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -95,5 +96,66 @@ func TestCLITriggerAddUsage(t *testing.T) {
 	code, _, _ = runCLI(t, "trigger", "bogus")
 	if code != 2 {
 		t.Fatalf("bogus subcommand exit = %d", code)
+	}
+}
+
+func TestCLITriggerHonorsConfigDataDir(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "alt-data")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	defer server.Close()
+	graph := triggerGraphFile(t, dir, server.URL)
+	cfg := filepath.Join(dir, "proceed.yaml")
+	if err := os.WriteFile(cfg, []byte("data_dir: "+dataDir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, stderr := runCLI(t, "trigger", "add", "--name", "deploy", "--graph", graph, "--config", cfg)
+	if code != 0 {
+		t.Fatalf("add exit = %d stderr = %q", code, stderr)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "proceed.db")); err != nil {
+		t.Fatalf("binding not written to the configured data dir: %v", err)
+	}
+
+	code, stdout, stderr := runCLI(t, "trigger", "list", "--config", cfg)
+	if code != 0 || !strings.Contains(stdout, "deploy") {
+		t.Fatalf("list exit = %d stdout = %q stderr = %q", code, stdout, stderr)
+	}
+
+	code, stdout, stderr = runCLI(t, "trigger", "remove", "deploy", "--config", cfg)
+	if code != 0 || !strings.Contains(stdout, "trigger deploy removed") {
+		t.Fatalf("remove exit = %d stdout = %q stderr = %q", code, stdout, stderr)
+	}
+}
+
+func TestCLITriggerHonorsDataDirEnv(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "env-data")
+	t.Setenv("PROCEED_DATA_DIR", dataDir)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	defer server.Close()
+	graph := triggerGraphFile(t, dir, server.URL)
+
+	code, _, stderr := runCLI(t, "trigger", "add", "--name", "deploy", "--graph", graph)
+	if code != 0 {
+		t.Fatalf("add exit = %d stderr = %q", code, stderr)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "proceed.db")); err != nil {
+		t.Fatalf("binding not written to the env-configured data dir: %v", err)
+	}
+
+	code, stdout, stderr := runCLI(t, "trigger", "list")
+	if code != 0 || !strings.Contains(stdout, "deploy") {
+		t.Fatalf("list exit = %d stdout = %q stderr = %q", code, stdout, stderr)
+	}
+
+	code, stdout, stderr = runCLI(t, "trigger", "remove", "deploy")
+	if code != 0 || !strings.Contains(stdout, "trigger deploy removed") {
+		t.Fatalf("remove exit = %d stdout = %q stderr = %q", code, stdout, stderr)
 	}
 }
