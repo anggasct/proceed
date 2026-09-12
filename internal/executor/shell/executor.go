@@ -78,6 +78,7 @@ func (e *Executor) Execute(ctx context.Context, req *executor.Request) (*executo
 	if err != nil {
 		return nil, err
 	}
+	redactions = append(redactions, req.SecretRedactions...)
 	cmd, err := e.Launcher.Command(req.Capability, req.WorkspaceRoot, config.workdir, config.command, env)
 	if errors.Is(err, ErrSandboxUnavailable) {
 		return nil, &capability.Error{Message: "sandbox is unavailable"}
@@ -207,29 +208,44 @@ func parseEnvironment(raw any) (map[string]string, error) {
 	}
 	env := make(map[string]string, len(values))
 	for name, value := range values {
-		ref, ok := value.(string)
-		if !ok || !strings.HasPrefix(ref, "${") || !strings.HasSuffix(ref, "}") {
-			return nil, &capability.Error{Message: "shell environment values must be secret references"}
+		s, ok := value.(string)
+		if !ok {
+			return nil, &capability.Error{Message: "shell environment values must be strings"}
 		}
-		env[name] = ref
+		env[name] = s
 	}
 	return env, nil
 }
 
-func resolveEnvironment(ctx context.Context, req *executor.Request, refs map[string]string) (map[string]string, [][]byte, error) {
-	if len(refs) == 0 {
+func isSecretReferenceForm(value string) bool {
+	return strings.HasPrefix(value, "${") && strings.HasSuffix(value, "}")
+}
+
+func resolveEnvironment(ctx context.Context, req *executor.Request, env map[string]string) (map[string]string, [][]byte, error) {
+	if len(env) == 0 {
 		return nil, nil, nil
 	}
-	if err := validateEnvironmentReferences(req.Capability, refs); err != nil {
+	if err := validateEnvironmentReferences(req.Capability, env); err != nil {
 		return nil, nil, err
 	}
-	if req.Secrets == nil {
+	hasRefs := false
+	for _, value := range env {
+		if isSecretReferenceForm(value) {
+			hasRefs = true
+			break
+		}
+	}
+	if hasRefs && req.Secrets == nil {
 		return nil, nil, &capability.Error{Message: "secret resolver is required"}
 	}
-	env := make(map[string]string, len(refs))
-	redactions := make([][]byte, 0, len(refs))
-	for envName, ref := range refs {
-		name, ok := capability.NormalizeSecretReference(ref)
+	resolved := make(map[string]string, len(env))
+	redactions := make([][]byte, 0, len(env))
+	for envName, value := range env {
+		if !isSecretReferenceForm(value) {
+			resolved[envName] = value
+			continue
+		}
+		name, ok := capability.NormalizeSecretReference(value)
 		if !ok {
 			return nil, nil, &capability.Error{Message: "secret reference is invalid"}
 		}
@@ -237,17 +253,20 @@ func resolveEnvironment(ctx context.Context, req *executor.Request, refs map[str
 		if err != nil {
 			return nil, nil, &capability.Error{Message: "secret resolution failed"}
 		}
-		env[envName] = string(secret)
+		resolved[envName] = string(secret)
 		if len(secret) > 0 {
 			redactions = append(redactions, append([]byte(nil), secret...))
 		}
 	}
-	return env, redactions, nil
+	return resolved, redactions, nil
 }
 
-func validateEnvironmentReferences(profile capability.Profile, refs map[string]string) error {
-	for _, ref := range refs {
-		if !profile.AllowsSecret(ref) {
+func validateEnvironmentReferences(profile capability.Profile, env map[string]string) error {
+	for _, value := range env {
+		if !isSecretReferenceForm(value) {
+			continue
+		}
+		if !profile.AllowsSecret(value) {
 			return &capability.Error{Message: "secret reference is not declared"}
 		}
 	}

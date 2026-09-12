@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 
 	"proceed/internal/compiler"
 	"proceed/internal/executor"
+	"proceed/internal/executor/shell"
 	"proceed/internal/store"
 )
 
@@ -346,6 +348,189 @@ func TestHTTPSecretParamInterpolationNeverPersists(t *testing.T) {
 	}
 
 	assertNoLeak(t, st, runID, "http-secret-value")
+}
+
+const shellSecretParamGraph = `schema: proceed/v1
+name: shell-secret-param
+params:
+  - { name: token, type: secret, required: true }
+nodes:
+  - id: call
+    type: task
+    executor:
+      kind: shell
+      command: ["/bin/sh", "-c", "echo token={{ params.token }}"]
+    contract: pure
+    terminal: true
+    capability:
+      filesystem: none
+      process: declared-command
+      network: none
+edges: []
+`
+
+func TestShellSecretParamInterpolationNeverPersists(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	src := []byte(shellSecretParamGraph)
+	doc, err := compiler.Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := compiler.Validate(doc); err != nil {
+		t.Fatal(err)
+	}
+	frozen, err := st.FreezeDefinition(context.Background(), "test.yaml", src, doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	cfg.Secrets = mapResolver{"API_TOKEN": "shell-secret-value"}
+	c, err := New(st, cfg, map[executor.Kind]executor.Executor{
+		executor.Shell: &shell.Executor{Launcher: shell.Launcher{Path: fakeBubblewrap(t)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := BindRunParams(doc.Params, []ParamBinding{
+		{Name: "token", Value: "${API_TOKEN}"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, err := c.Run(context.Background(), RunInput{GraphVersionID: frozen.GraphVersionID, Params: bound})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Drain(context.Background(), runID); err != nil {
+		t.Fatal(err)
+	}
+
+	if s := nodeStatus(t, st, runID, "call"); s != "succeeded" {
+		t.Fatalf("node status = %q, want succeeded", s)
+	}
+	var path string
+	if err := st.DB().QueryRow("SELECT path FROM artifact WHERE run_id = ? AND name = 'stdout'", runID).Scan(&path); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(st.DataDir(), filepath.FromSlash(path)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(content), "shell-secret-value") || !strings.Contains(string(content), "[REDACTED]") {
+		t.Fatalf("stdout artifact = %q, want redacted", content)
+	}
+	assertNoLeak(t, st, runID, "shell-secret-value")
+}
+
+const shellEnvParamGraph = `schema: proceed/v1
+name: shell-env-param
+params:
+  - { name: mode, type: string, required: true }
+nodes:
+  - id: call
+    type: task
+    executor:
+      kind: shell
+      command: ["/bin/sh", "-c", "printf '%s' \"$MODE\""]
+      x-proceed-env:
+        MODE: "{{ params.mode }}"
+    contract: pure
+    terminal: true
+    capability:
+      filesystem: none
+      process: declared-command
+      network: none
+edges: []
+`
+
+func TestShellEnvParamInterpolationRuns(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	src := []byte(shellEnvParamGraph)
+	doc, err := compiler.Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := compiler.Validate(doc); err != nil {
+		t.Fatal(err)
+	}
+	frozen, err := st.FreezeDefinition(context.Background(), "test.yaml", src, doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(st, DefaultConfig(), map[executor.Kind]executor.Executor{
+		executor.Shell: &shell.Executor{Launcher: shell.Launcher{Path: fakeBubblewrap(t)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := BindRunParams(doc.Params, []ParamBinding{
+		{Name: "mode", Value: "prod"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, err := c.Run(context.Background(), RunInput{GraphVersionID: frozen.GraphVersionID, Params: bound})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Drain(context.Background(), runID); err != nil {
+		t.Fatal(err)
+	}
+
+	if s := nodeStatus(t, st, runID, "call"); s != "succeeded" {
+		t.Fatalf("node status = %q, want succeeded", s)
+	}
+	var path string
+	if err := st.DB().QueryRow("SELECT path FROM artifact WHERE run_id = ? AND name = 'stdout'", runID).Scan(&path); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(st.DataDir(), filepath.FromSlash(path)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "prod" {
+		t.Fatalf("stdout artifact = %q, want prod", content)
+	}
+}
+
+func TestParamDefaultPlaceholderNeverReachesExecutor(t *testing.T) {
+	graph := `schema: proceed/v1
+name: default-placeholder
+params:
+  - { name: env, type: string, required: true }
+  - { name: greeting, type: string, default: "hello {{ params.env }}" }
+nodes:
+  - id: call
+    type: task
+    executor:
+      kind: shell
+      command: [bin/call, "{{ params.greeting }}"]
+    contract: pure
+    terminal: true
+edges: []
+`
+	doc, err := compiler.Parse([]byte(graph))
+	if err != nil {
+		t.Fatal(err)
+	}
+	verr := compiler.Validate(doc)
+	if verr == nil {
+		t.Fatal("graph with placeholder default must be rejected at compile")
+	}
+	if !strings.Contains(verr.Error(), "must not contain param placeholders") {
+		t.Fatalf("error = %v", verr)
+	}
+	if e, ok := compiler.AsGraphInvalid(verr); !ok || e.Code != compiler.CodeGraphInvalid {
+		t.Fatalf("error = %v, want GRAPH_INVALID", verr)
+	}
 }
 
 func toStrings(items []any) []string {

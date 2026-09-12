@@ -137,9 +137,7 @@ func (c *Controller) reconcileNode(ctx context.Context, runID, nodeKey string) e
 		if err != nil {
 			return c.failNode(ctx, runID, nodeKey, attemptNo, err)
 		}
-		if kind == executor.HTTP {
-			secretRedactions = redactions
-		}
+		secretRedactions = redactions
 	}
 	ex, ok := c.pool[kind]
 	if !ok {
@@ -216,9 +214,7 @@ func (c *Controller) reconcileCancelledNode(ctx context.Context, runID, nodeKey 
 		if err != nil {
 			return c.failNode(ctx, runID, nodeKey, attemptNo, err)
 		}
-		if kind == executor.HTTP {
-			secretRedactions = redactions
-		}
+		secretRedactions = redactions
 	}
 	ex, ok := c.pool[kind]
 	if !ok {

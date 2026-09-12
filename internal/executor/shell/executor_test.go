@@ -112,6 +112,86 @@ func TestExecuteRedactsSecretsBeforeOutputLimit(t *testing.T) {
 	}
 }
 
+func TestExecuteRedactsRequestSecrets(t *testing.T) {
+	publisher := &recordingPublisher{}
+	adapter := &Executor{Launcher: Launcher{Path: fakeBubblewrap(t)}}
+	result, err := adapter.Execute(context.Background(), &executor.Request{
+		Config: map[string]any{
+			"executor": map[string]any{
+				"kind":    "shell",
+				"command": []any{"/bin/sh", "-c", "printf '%s' param-secret-value"},
+			},
+		},
+		Capability:        testProfile(),
+		WorkspaceRoot:     t.TempDir(),
+		SecretRedactions:  [][]byte{[]byte("param-secret-value")},
+		ArtifactPublisher: publisher,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := result.Output["stdout"]; got != "[REDACTED]" {
+		t.Fatalf("stdout = %v, want redacted output", got)
+	}
+	if got := string(publisher.inputs[0].Content); got != "[REDACTED]" {
+		t.Fatalf("published stdout = %q, want redacted output", got)
+	}
+}
+
+func TestExecutePassesLiteralEnvValues(t *testing.T) {
+	publisher := &recordingPublisher{}
+	adapter := &Executor{Launcher: Launcher{Path: fakeBubblewrap(t)}}
+	result, err := adapter.Execute(context.Background(), &executor.Request{
+		Config: map[string]any{
+			"executor": map[string]any{
+				"kind":    "shell",
+				"command": []any{"/bin/sh", "-c", `printf '%s' "$MODE"`},
+				"x-proceed-env": map[string]any{
+					"MODE": "prod",
+				},
+			},
+		},
+		Capability:        testProfile(),
+		WorkspaceRoot:     t.TempDir(),
+		ArtifactPublisher: publisher,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := result.Output["stdout"]; got != "prod" {
+		t.Fatalf("stdout = %v, want prod", got)
+	}
+}
+
+func TestExecuteRedactsSecretParamsInEnv(t *testing.T) {
+	publisher := &recordingPublisher{}
+	adapter := &Executor{Launcher: Launcher{Path: fakeBubblewrap(t)}}
+	result, err := adapter.Execute(context.Background(), &executor.Request{
+		Config: map[string]any{
+			"executor": map[string]any{
+				"kind":    "shell",
+				"command": []any{"/bin/sh", "-c", `printf '%s' "$TOKEN"`},
+				"x-proceed-env": map[string]any{
+					"TOKEN": "param-secret-value",
+				},
+			},
+		},
+		Capability:        testProfile(),
+		WorkspaceRoot:     t.TempDir(),
+		SecretRedactions:  [][]byte{[]byte("param-secret-value")},
+		ArtifactPublisher: publisher,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := result.Output["stdout"]; got != "[REDACTED]" {
+		t.Fatalf("stdout = %v, want redacted output", got)
+	}
+	if got := string(publisher.inputs[0].Content); got != "[REDACTED]" {
+		t.Fatalf("published stdout = %q, want redacted output", got)
+	}
+}
+
 func TestExecuteRejectsUndeclaredSecretBeforeStart(t *testing.T) {
 	adapter := &Executor{Launcher: Launcher{Path: fakeBubblewrap(t)}}
 	_, err := adapter.Execute(context.Background(), &executor.Request{

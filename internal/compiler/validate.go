@@ -132,6 +132,10 @@ func (v *validator) paramsPass() {
 			v.errf(RuleParamDeclaration, joinPath(path, "default"),
 				"default for %s param %q must be a %s value", pa.Type, pa.Name, pa.Type)
 		}
+		if pa.HasDefault && HasParamRef(pa.Default) {
+			v.errf(RuleParamDeclaration, joinPath(path, "default"),
+				"default for param %q must not contain param placeholders", pa.Name)
+		}
 		if pa.HasDefault && pa.Type == "secret" {
 			if _, ok := ParseSecretRef(pa.Default); !ok {
 				v.errf(RuleParamDeclaration, joinPath(path, "default"),
@@ -231,6 +235,10 @@ func (v *validator) paramRefPass() {
 					key, value := env.Content[k], env.Content[k+1]
 					forbid(joinPath(path, "executor.x-proceed-env"), key.Value)
 					requireDeclared(joinPath(path, "executor.x-proceed-env"), value.Value)
+					if !isSecretReference(value.Value) && !HasParamRef(value.Value) {
+						v.errf(RuleParamReference, joinPath(path, "executor.x-proceed-env"),
+							"shell env values must be ${NAME} secret references or param placeholders")
+					}
 				}
 			}
 		case "http":

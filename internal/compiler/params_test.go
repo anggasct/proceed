@@ -78,6 +78,7 @@ func TestParamsDeclarationRejections(t *testing.T) {
 		{"bool default string", "params:\n  - { name: flag, type: bool, default: yes-please }", "must be a bool value"},
 		{"string default int", "params:\n  - { name: env, type: string, default: 3 }", "must be a string value"},
 		{"secret default literal", "params:\n  - { name: token, type: secret, default: hunter2 }", "must be a ${NAME} reference"},
+		{"string default placeholder", "params:\n  - { name: greeting, type: string, default: \"{{ params.env }}\" }", "must not contain param placeholders"},
 		{"unknown field", "params:\n  - { name: env, type: string, label: x }", "unknown field"},
 	}
 	for _, tc := range cases {
@@ -283,6 +284,70 @@ func TestParamRefUndeclaredInCommand(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), `references undeclared param "bogus"`) {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestShellEnvValuesMustBeReferencesOrPlaceholders(t *testing.T) {
+	src := `schema: proceed/v1
+name: env-literal
+params:
+  - { name: mode, type: string }
+nodes:
+  - id: call
+    type: task
+    executor:
+      kind: shell
+      command: [bin/call]
+      x-proceed-env:
+        MODE: prod
+    contract: pure
+    terminal: true
+edges: []
+`
+	err := parseAndValidate(t, src)
+	if err == nil {
+		t.Fatal("expected rejection")
+	}
+	if !strings.Contains(err.Error(), "shell env values must be ${NAME} secret references or param placeholders") {
+		t.Fatalf("error = %v", err)
+	}
+
+	reference := strings.Replace(src, "MODE: prod", `MODE: "${deploy_mode}"`, 1)
+	if err := parseAndValidate(t, reference); err != nil {
+		t.Fatalf("secret reference env value must pass: %v", err)
+	}
+	placeholder := strings.Replace(src, "MODE: prod", "MODE: \"{{ params.mode }}\"", 1)
+	if err := parseAndValidate(t, placeholder); err != nil {
+		t.Fatalf("param placeholder env value must pass: %v", err)
+	}
+}
+
+func TestParamDefaultPlaceholdersNeverReachInterpolation(t *testing.T) {
+	src := `schema: proceed/v1
+name: default-placeholder
+params:
+  - { name: env, type: string, required: true }
+  - { name: greeting, type: string, default: "hello {{ params.env }}" }
+nodes:
+  - id: call
+    type: task
+    executor:
+      kind: shell
+      command: [bin/call, "{{ params.greeting }}"]
+    contract: pure
+    terminal: true
+edges: []
+`
+	doc, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	verr := Validate(doc)
+	if verr == nil {
+		t.Fatal("placeholder in declaration default must be rejected")
+	}
+	if !strings.Contains(verr.Error(), "must not contain param placeholders") {
+		t.Fatalf("error = %v", verr)
 	}
 }
 

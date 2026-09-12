@@ -316,9 +316,7 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 		if err != nil {
 			return c.failNode(ctx, runID, n.NodeKey, n.AttemptNo, err)
 		}
-		if kind == executor.HTTP {
-			secretRedactions = redactions
-		}
+		secretRedactions = redactions
 	}
 	maxAttempts, backoffMs := retryPolicy(cfg)
 	n.MaxAttempts, n.BackoffMs = maxAttempts, backoffMs
