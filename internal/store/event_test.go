@@ -373,7 +373,7 @@ func TestOpenMigrationRollbackOnFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.CreateRun(context.Background(), frozen.GraphVersionID); err != nil {
+	if _, err := s.CreateRun(context.Background(), frozen.GraphVersionID, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.db.Exec("PRAGMA user_version = 1"); err != nil {
@@ -441,7 +441,7 @@ func TestConcurrentOpenMigratesOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.CreateRun(context.Background(), frozen.GraphVersionID); err != nil {
+	if _, err := s.CreateRun(context.Background(), frozen.GraphVersionID, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.db.Exec("PRAGMA user_version = 1"); err != nil {

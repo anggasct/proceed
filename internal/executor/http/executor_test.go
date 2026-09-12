@@ -143,6 +143,49 @@ func withExtras(req *executor.Request, effects executor.EffectPublisher, artifac
 	return req
 }
 
+func TestExecuteRedactsInterpolatedSecretsFromPersistedEvidence(t *testing.T) {
+	var echoed string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		echoed = r.URL.RawQuery
+		fmt.Fprint(w, "token="+r.URL.Query().Get("token"))
+	}))
+	defer server.Close()
+
+	run := func(secret string) (executor.EffectIntent, string) {
+		t.Helper()
+		effects := newRecordingEffects()
+		cfg := nodeConfig(server.URL+"/api?token="+secret, []string{"127.0.0.1"})
+		req := withExtras(request(cfg), effects, nil, nil)
+		req.SecretRedactions = [][]byte{[]byte(secret)}
+		result, err := New().Execute(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+		effects.mu.Lock()
+		defer effects.mu.Unlock()
+		if len(effects.intents) != 1 {
+			t.Fatalf("effect intents = %d, want 1", len(effects.intents))
+		}
+		return effects.intents[0], result.Output["body"].(string)
+	}
+
+	intent, body := run("alpha-secret-value")
+	if echoed != "token=alpha-secret-value" {
+		t.Fatalf("server query = %q, want the secret delivered", echoed)
+	}
+	if strings.Contains(intent.Target, "alpha-secret-value") || !strings.Contains(intent.Target, "[REDACTED]") {
+		t.Fatalf("intent target = %q, want redacted", intent.Target)
+	}
+	if strings.Contains(body, "alpha-secret-value") || !strings.Contains(body, "[REDACTED]") {
+		t.Fatalf("echoed body = %q, want redacted", body)
+	}
+
+	other, _ := run("beta-secret-value")
+	if intent.RequestDigest != other.RequestDigest {
+		t.Fatal("request digest must not depend on the secret value")
+	}
+}
+
 func TestExecuteRejectsNonAllowlistedHostBeforeDial(t *testing.T) {
 	var connections int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

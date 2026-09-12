@@ -189,7 +189,7 @@ func (c *Controller) loadRun(ctx context.Context, runID string) (runInfo, error)
 
 func (c *Controller) tryCompleteRun(ctx context.Context, runID, graphVersionID string) error {
 	nowMs := time.Now().UnixMilli()
-	return c.store.WithTx(ctx, func(tx *sql.Tx) error {
+	err := c.store.WithTx(ctx, func(tx *sql.Tx) error {
 		var status string
 		if err := tx.QueryRowContext(ctx,
 			"SELECT status FROM graph_run WHERE id = ?", runID).Scan(&status); err != nil {
@@ -249,4 +249,8 @@ FROM run_node WHERE run_id = ?`, graphVersionID, runID)
 		_, err := c.appendWithin(ctx, tx, &ev)
 		return err
 	})
+	if err == nil {
+		c.forgetParamRefs(runID)
+	}
+	return err
 }

@@ -144,7 +144,7 @@ edges: []
 	doc, _ := compiler.Parse(src)
 	_ = compiler.Validate(doc)
 	frozen, _ := st.FreezeDefinition(ctx, "test.yaml", src, doc)
-	run, _ := st.CreateRun(ctx, frozen.GraphVersionID)
+	run, _ := st.CreateRun(ctx, frozen.GraphVersionID, nil)
 
 	waitID := ulid.Make().String()
 	corrKey := "repo=proceed/core;pr=5;head=sha256:wh_sha1"
@@ -732,7 +732,7 @@ edges:
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := st.CreateRun(ctx, frozen.GraphVersionID)
+	run, err := st.CreateRun(ctx, frozen.GraphVersionID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -908,7 +908,7 @@ edges:
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := st.CreateRun(ctx, frozen.GraphVersionID)
+	run, err := st.CreateRun(ctx, frozen.GraphVersionID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

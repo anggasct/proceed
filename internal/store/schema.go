@@ -1,6 +1,6 @@
 package store
 
-const storeSchemaVersion = 3
+const storeSchemaVersion = 4
 
 var schemaDDL = `
 CREATE TABLE IF NOT EXISTS graph (
@@ -61,11 +61,31 @@ CREATE TABLE IF NOT EXISTS graph_run (
   id                TEXT PRIMARY KEY,
   graph_version_id  TEXT NOT NULL REFERENCES graph_version(id),
   definition_digest TEXT NOT NULL,
+  params_digest     TEXT NOT NULL DEFAULT '{}',
   status            TEXT NOT NULL
                     CHECK (status IN ('running','completed','failed','cancelled','abandoned')),
   created_at        INTEGER NOT NULL,
   started_at        INTEGER,
-  finished_at       INTEGER
+  finished_at        INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS graph_param (
+  graph_version_id TEXT NOT NULL REFERENCES graph_version(id),
+  name             TEXT NOT NULL,
+  type             TEXT NOT NULL
+                   CHECK (type IN ('string','int','float','bool','secret')),
+  required         INTEGER NOT NULL DEFAULT 0 CHECK (required IN (0,1)),
+  default_value    TEXT,
+  PRIMARY KEY (graph_version_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS run_param (
+  run_id   TEXT NOT NULL REFERENCES graph_run(id),
+  name     TEXT NOT NULL,
+  type     TEXT NOT NULL CHECK (type IN ('string','int','float','bool','secret')),
+  value    TEXT,
+  PRIMARY KEY (run_id, name),
+  CHECK (type <> 'secret' OR value IS NULL)
 );
 
 CREATE TABLE IF NOT EXISTS run_node (
@@ -291,7 +311,9 @@ CREATE TABLE IF NOT EXISTS external_wait (
 
 CREATE INDEX IF NOT EXISTS idx_graph_node_version ON graph_node(graph_version_id);
 CREATE INDEX IF NOT EXISTS idx_graph_edge_version ON graph_edge(graph_version_id);
+CREATE INDEX IF NOT EXISTS idx_graph_param_version ON graph_param(graph_version_id);
 CREATE INDEX IF NOT EXISTS idx_policy_version ON policy(graph_version_id);
+CREATE INDEX IF NOT EXISTS idx_run_param_run ON run_param(run_id);
 CREATE INDEX IF NOT EXISTS idx_run_node_run        ON run_node(run_id);
 CREATE INDEX IF NOT EXISTS idx_run_edge_run        ON run_edge(run_id);
 CREATE INDEX IF NOT EXISTS idx_run_edge_traversals ON run_edge(run_id, edge_id);

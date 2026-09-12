@@ -28,7 +28,7 @@ const requestCancelTimeout = 5 * time.Second
 const defaultConfigPath = "proceed.yaml"
 
 const runUsage = `usage:
-  proceed run <file> [--data-dir <dir>] [--config <file>]
+  proceed run <file> [--param k=v] [--data-dir <dir>] [--config <file>]
 `
 
 type cliFlags struct {
@@ -104,7 +104,43 @@ func buildPool(agentCLIs map[string]string) map[executor.Kind]executor.Executor 
 	}
 }
 
+func extractParamFlags(args []string) (params, rest []string, err error) {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--param":
+			if i+1 >= len(args) {
+				return nil, nil, fmt.Errorf("--param requires a k=v value")
+			}
+			i++
+			params = append(params, args[i])
+		case strings.HasPrefix(arg, "--param="):
+			params = append(params, strings.TrimPrefix(arg, "--param="))
+		default:
+			rest = append(rest, arg)
+		}
+	}
+	return params, rest, nil
+}
+
+func parseParamFlags(flags []string) ([]controller.ParamBinding, error) {
+	out := make([]controller.ParamBinding, 0, len(flags))
+	for _, flag := range flags {
+		name, value, ok := strings.Cut(flag, "=")
+		if !ok || name == "" {
+			return nil, fmt.Errorf("--param requires k=v form, got %q", flag)
+		}
+		out = append(out, controller.ParamBinding{Name: name, Value: value})
+	}
+	return out, nil
+}
+
 func cmdRun(args []string, stdout, stderr io.Writer) int {
+	paramFlags, args, err := extractParamFlags(args)
+	if err != nil || len(args) == 0 {
+		fmt.Fprint(stderr, runUsage)
+		return exitUsage
+	}
 	flags, positional, err := parseCommonFlags(args)
 	if err != nil || len(positional) != 1 {
 		fmt.Fprint(stderr, runUsage)
@@ -126,6 +162,15 @@ func cmdRun(args []string, stdout, stderr io.Writer) int {
 		return printClassified(err, stderr)
 	}
 	if err := compiler.Validate(doc); err != nil {
+		return printClassified(err, stderr)
+	}
+	bindings, err := parseParamFlags(paramFlags)
+	if err != nil {
+		fmt.Fprintf(stderr, "proceed: %v\n", err)
+		return exitUsage
+	}
+	bound, err := controller.BindRunParams(doc.Params, bindings)
+	if err != nil {
 		return printClassified(err, stderr)
 	}
 	st, err := store.Open(cfg.DataDir + "/proceed.db")
@@ -158,7 +203,7 @@ func cmdRun(args []string, stdout, stderr io.Writer) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	runID, err := c.Run(ctx, controller.RunInput{GraphVersionID: frozen.GraphVersionID})
+	runID, err := c.Run(ctx, controller.RunInput{GraphVersionID: frozen.GraphVersionID, Params: bound})
 	if err != nil {
 		c.ReleaseLease()
 		return printClassified(err, stderr)

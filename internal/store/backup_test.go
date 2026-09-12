@@ -37,7 +37,7 @@ func buildPopulatedDir(t *testing.T, dataDir string) *Store {
 		t.Fatal(err)
 	}
 	versionID, edgeID, nodeA, nodeB := fixtureVersion(t, s)
-	run, err := s.CreateRun(context.Background(), versionID)
+	run, err := s.CreateRun(context.Background(), versionID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

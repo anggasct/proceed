@@ -131,6 +131,14 @@ func (c *Controller) reconcileNode(ctx context.Context, runID, nodeKey string) e
 	if err != nil {
 		return err
 	}
+	var secretRedactions [][]byte
+	if kind == executor.Shell || kind == executor.HTTP {
+		redactions, err := c.interpolateNodeParams(ctx, runID, run.graphVersionID, kind, cfg)
+		if err != nil {
+			return c.failNode(ctx, runID, nodeKey, attemptNo, err)
+		}
+		secretRedactions = redactions
+	}
 	ex, ok := c.pool[kind]
 	if !ok {
 		return c.waitingNode(ctx, runID, nodeKey)
@@ -145,6 +153,7 @@ func (c *Controller) reconcileNode(ctx context.Context, runID, nodeKey string) e
 		Contract:         contract,
 		Config:           cfg,
 		Secrets:          c.cfg.Secrets,
+		SecretRedactions: secretRedactions,
 	}
 	result, state, rerr := reconcileEffect(ctx, ex, req)
 	if errors.Is(rerr, executor.ErrNotReconcilable) {
@@ -199,6 +208,14 @@ func (c *Controller) reconcileCancelledNode(ctx context.Context, runID, nodeKey 
 	if err != nil {
 		return err
 	}
+	var secretRedactions [][]byte
+	if kind == executor.Shell || kind == executor.HTTP {
+		redactions, err := c.interpolateNodeParams(ctx, runID, run.graphVersionID, kind, cfg)
+		if err != nil {
+			return c.failNode(ctx, runID, nodeKey, attemptNo, err)
+		}
+		secretRedactions = redactions
+	}
 	ex, ok := c.pool[kind]
 	if !ok {
 		return c.waitingNode(ctx, runID, nodeKey)
@@ -213,6 +230,7 @@ func (c *Controller) reconcileCancelledNode(ctx context.Context, runID, nodeKey 
 		Contract:         contract,
 		Config:           cfg,
 		Secrets:          c.cfg.Secrets,
+		SecretRedactions: secretRedactions,
 	})
 	if errors.Is(rerr, executor.ErrNotReconcilable) {
 		return c.waitingNode(ctx, runID, nodeKey)

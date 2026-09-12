@@ -1034,7 +1034,7 @@ func TestSkippedDependencyCitesSkipEvent(t *testing.T) {
 	st := newStore(t)
 	frozen := compileAndFreeze(t, st, linearGraph)
 	c := newController(t, st, map[executor.Kind]executor.Executor{})
-	runID, err := st.CreateRun(context.Background(), frozen.GraphVersionID)
+	runID, err := st.CreateRun(context.Background(), frozen.GraphVersionID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

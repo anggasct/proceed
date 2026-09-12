@@ -20,7 +20,7 @@ func CanonicalJSON(src []byte) ([]byte, error) {
 		return nil, graphInvalid(Diagnostic{Rule: RuleParse, Message: "empty document"})
 	}
 	var out []byte
-	if err := encodeNode(root.Content[0], false, &out); err != nil {
+	if err := encodeNode(root.Content[0], false, false, true, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -31,20 +31,20 @@ func DefinitionDigest(canonical []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func encodeNode(n *yaml.Node, inExtension bool, out *[]byte) error {
+func encodeNode(n *yaml.Node, inExtension bool, inParams bool, rootMapping bool, out *[]byte) error {
 	if n.Kind == yaml.AliasNode {
-		return encodeNode(n.Alias, inExtension, out)
+		return encodeNode(n.Alias, inExtension, inParams, false, out)
 	}
 	switch n.Kind {
 	case yaml.ScalarNode:
-		return encodeScalar(n, inExtension, out)
+		return encodeScalar(n, inExtension, inParams, out)
 	case yaml.SequenceNode:
 		*out = append(*out, '[')
 		for i, item := range n.Content {
 			if i > 0 {
 				*out = append(*out, ',')
 			}
-			if err := encodeNode(item, inExtension, out); err != nil {
+			if err := encodeNode(item, inExtension, inParams, false, out); err != nil {
 				return err
 			}
 		}
@@ -71,7 +71,8 @@ func encodeNode(n *yaml.Node, inExtension bool, out *[]byte) error {
 			}
 			encodeString(p.key, out)
 			*out = append(*out, ':')
-			if err := encodeNode(p.value, inExtension || strings.HasPrefix(p.key, "x-"), out); err != nil {
+			childParams := inParams || (rootMapping && p.key == "params")
+			if err := encodeNode(p.value, inExtension || strings.HasPrefix(p.key, "x-"), childParams, false, out); err != nil {
 				return err
 			}
 		}
@@ -82,13 +83,13 @@ func encodeNode(n *yaml.Node, inExtension bool, out *[]byte) error {
 			*out = append(*out, 'n', 'u', 'l', 'l')
 			return nil
 		}
-		return encodeNode(n.Content[0], inExtension, out)
+		return encodeNode(n.Content[0], inExtension, inParams, rootMapping, out)
 	default:
 		return graphInvalid(Diagnostic{Rule: RuleParse, Message: fmt.Sprintf("unsupported node kind %d", n.Kind)})
 	}
 }
 
-func encodeScalar(n *yaml.Node, inExtension bool, out *[]byte) error {
+func encodeScalar(n *yaml.Node, inExtension bool, inParams bool, out *[]byte) error {
 	switch n.Tag {
 	case "!!null":
 		*out = append(*out, 'n', 'u', 'l', 'l')
@@ -108,8 +109,8 @@ func encodeScalar(n *yaml.Node, inExtension bool, out *[]byte) error {
 		*out = strconv.AppendInt(*out, v, 10)
 		return nil
 	case "!!float":
-		if !inExtension {
-			return graphInvalid(Diagnostic{Rule: RuleParse, Message: "floats are prohibited outside x-* fields"})
+		if !inExtension && !inParams {
+			return graphInvalid(Diagnostic{Rule: RuleParse, Message: "floats are prohibited outside x-* fields and the params declaration"})
 		}
 		v, err := strconv.ParseFloat(n.Value, 64)
 		if err != nil {

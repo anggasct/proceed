@@ -84,11 +84,21 @@ func migrateSchemaAdditions(ctx context.Context, conn *sql.Conn) error {
 	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('policy_change_proposal') WHERE name = 'rejection_reason'`).Scan(&n); err != nil {
 		return err
 	}
-	if n > 0 {
-		return nil
+	if n == 0 {
+		if _, err := conn.ExecContext(ctx, `ALTER TABLE policy_change_proposal ADD COLUMN rejection_reason TEXT`); err != nil {
+			return err
+		}
 	}
-	_, err := conn.ExecContext(ctx, `ALTER TABLE policy_change_proposal ADD COLUMN rejection_reason TEXT`)
-	return err
+	var digestCol int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('graph_run') WHERE name = 'params_digest'`).Scan(&digestCol); err != nil {
+		return err
+	}
+	if digestCol == 0 {
+		if _, err := conn.ExecContext(ctx, `ALTER TABLE graph_run ADD COLUMN params_digest TEXT NOT NULL DEFAULT '{}'`); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func ctxBackground() context.Context { return context.Background() }
@@ -204,6 +214,9 @@ func (s *Store) FreezeDefinition(ctx context.Context, sourcePath string, src []b
 			return err
 		}
 		if err := insertPolicies(ctx, tx, versionID, row.Doc); err != nil {
+			return err
+		}
+		if err := insertGraphParams(ctx, tx, versionID, row.Doc); err != nil {
 			return err
 		}
 		result.GraphVersionID = versionID

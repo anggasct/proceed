@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+
+	yaml "gopkg.in/yaml.v3"
 )
 
 const (
@@ -53,10 +55,12 @@ var policyKindSet = map[string]bool{
 func Validate(doc *Document) error {
 	v := &validator{doc: doc}
 	v.documentPass()
+	v.paramsPass()
 	v.nodePass()
 	v.edgePass()
 	v.sinkPass()
 	v.cyclePass()
+	v.paramRefPass()
 	if len(v.diags) > 0 {
 		return graphInvalid(v.diags...)
 	}
@@ -97,6 +101,197 @@ func (v *validator) documentPass() {
 		}
 		if po.Rule == nil {
 			v.errf(RuleParse, joinPath(path, "rule"), "policy rule is required")
+		}
+	}
+}
+
+func (v *validator) paramsPass() {
+	seen := map[string]bool{}
+	for i := range v.doc.Params {
+		pa := &v.doc.Params[i]
+		path := fmt.Sprintf("params[%d]", i)
+		switch {
+		case pa.Name == "":
+			v.errf(RuleParamDeclaration, joinPath(path, "name"), "param name is required")
+		case !isName(pa.Name):
+			v.errf(RuleParamDeclaration, joinPath(path, "name"),
+				"param name %q must contain only letters, digits, -, _, .", pa.Name)
+		case seen[pa.Name]:
+			v.errf(RuleParamDeclaration, joinPath(path, "name"), "duplicate param name %q", pa.Name)
+		}
+		seen[pa.Name] = true
+		if !paramTypeSet[pa.Type] {
+			v.errf(RuleParamDeclaration, joinPath(path, "type"),
+				"param %q type must be one of string, int, float, bool, secret", pa.Name)
+		}
+		if pa.Required && pa.HasDefault {
+			v.errf(RuleParamDeclaration, joinPath(path, "default"),
+				"required param %q must not declare a default", pa.Name)
+		}
+		if pa.HasDefault && paramTypeSet[pa.Type] && !defaultTagMatches(pa.Type, pa.DefaultTag) {
+			v.errf(RuleParamDeclaration, joinPath(path, "default"),
+				"default for %s param %q must be a %s value", pa.Type, pa.Name, pa.Type)
+		}
+		if pa.HasDefault && HasParamRef(pa.Default) {
+			v.errf(RuleParamDeclaration, joinPath(path, "default"),
+				"default for param %q must not contain param placeholders", pa.Name)
+		}
+		if pa.HasDefault && pa.Type == "secret" {
+			if _, ok := ParseSecretRef(pa.Default); !ok {
+				v.errf(RuleParamDeclaration, joinPath(path, "default"),
+					"default for secret param %q must be a ${NAME} reference", pa.Name)
+			}
+		}
+	}
+}
+
+func defaultTagMatches(typ, tag string) bool {
+	switch typ {
+	case "string", "secret":
+		return tag == "!!str"
+	case "int":
+		return tag == "!!int"
+	case "float":
+		return tag == "!!int" || tag == "!!float"
+	case "bool":
+		return tag == "!!bool"
+	}
+	return false
+}
+
+const paramAllowlistHint = "param placeholders are only allowed in shell command, shell env, and http url/body"
+
+func (v *validator) paramRefPass() {
+	declared := map[string]bool{}
+	for i := range v.doc.Params {
+		declared[v.doc.Params[i].Name] = true
+	}
+	requireDeclared := func(loc, text string) {
+		EachParamRef(text, func(name string) {
+			if !declared[name] {
+				v.errf(RuleParamReference, loc, "references undeclared param %q", name)
+			}
+		})
+	}
+	forbid := func(loc, text string) {
+		EachParamRef(text, func(name string) {
+			v.errf(RuleParamReference, loc, paramAllowlistHint)
+		})
+	}
+	forbidExtras := func(loc, skip string, extras map[string]yaml.Node) {
+		names := make([]string, 0, len(extras))
+		for name := range extras {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if name == skip {
+				continue
+			}
+			var scalars []string
+			node := extras[name]
+			collectScalarStrings(&node, &scalars)
+			for _, s := range scalars {
+				forbid(joinPath(loc, name), s)
+			}
+		}
+	}
+	forbidExtras("", "", v.doc.Extras)
+	for i := range v.doc.Nodes {
+		n := &v.doc.Nodes[i]
+		path := fmt.Sprintf("nodes[%d]", i)
+		forbid(joinPath(path, "id"), n.ID)
+		forbidExtras(path, "", n.Extras)
+		if n.Retry != nil {
+			for j, entry := range n.Retry.RetryableErrors {
+				forbid(joinPath(path, fmt.Sprintf("retry.retryable_errors[%d]", j)), entry)
+			}
+			forbidExtras(joinPath(path, "retry"), "", n.Retry.Extras)
+		}
+		if n.Capability != nil {
+			capPath := joinPath(path, "capability")
+			forbidExtras(capPath, "", n.Capability.Extras)
+			if n.Capability.Network != nil {
+				forbidExtras(joinPath(capPath, "network"), "", n.Capability.Network.Extras)
+			}
+		}
+		if n.Executor == nil {
+			continue
+		}
+		e := n.Executor
+		skip := ""
+		if e.Kind == "shell" {
+			skip = "x-proceed-env"
+		}
+		forbidExtras(joinPath(path, "executor"), skip, e.Extras)
+		switch e.Kind {
+		case "shell":
+			for j, part := range e.Command {
+				requireDeclared(joinPath(path, fmt.Sprintf("executor.command[%d]", j)), part)
+			}
+			forbid(joinPath(path, "executor.workdir"), e.Workdir)
+			if env, ok := e.Extras["x-proceed-env"]; ok && env.Kind == yaml.MappingNode {
+				for k := 0; k+1 < len(env.Content); k += 2 {
+					key, value := env.Content[k], env.Content[k+1]
+					forbid(joinPath(path, "executor.x-proceed-env"), key.Value)
+					requireDeclared(joinPath(path, "executor.x-proceed-env"), value.Value)
+					if !isSecretReference(value.Value) && !HasParamRef(value.Value) {
+						v.errf(RuleParamReference, joinPath(path, "executor.x-proceed-env"),
+							"shell env values must be ${NAME} secret references or param placeholders")
+					}
+				}
+			}
+		case "http":
+			requireDeclared(joinPath(path, "executor.url"), e.URL)
+			var scalars []string
+			collectScalarStrings(e.Body, &scalars)
+			for _, s := range scalars {
+				requireDeclared(joinPath(path, "executor.body"), s)
+			}
+			forbid(joinPath(path, "executor.method"), e.Method)
+			for name, value := range e.Headers {
+				forbid(joinPath(path, "executor.headers."+name), name)
+				forbid(joinPath(path, "executor.headers."+name), value)
+			}
+		case "human_approval":
+			forbid(joinPath(path, "executor.scope"), e.Scope)
+		case "agent_cli":
+			forbid(joinPath(path, "executor.cli"), e.CLI)
+			for j, arg := range e.Args {
+				forbid(joinPath(path, fmt.Sprintf("executor.args[%d]", j)), arg)
+			}
+		}
+	}
+	for i := range v.doc.Edges {
+		e := &v.doc.Edges[i]
+		forbidExtras(fmt.Sprintf("edges[%d]", i), "", e.Extras)
+		if e.HasWhen {
+			forbid(fmt.Sprintf("edges[%d].when", i), e.When)
+		}
+	}
+	for i := range v.doc.Policies {
+		po := &v.doc.Policies[i]
+		var scalars []string
+		collectScalarStrings(po.Rule, &scalars)
+		for _, s := range scalars {
+			forbid(fmt.Sprintf("policies[%d].rule", i), s)
+		}
+		forbidExtras(fmt.Sprintf("policies[%d]", i), "", po.Extras)
+	}
+}
+
+func collectScalarStrings(n *yaml.Node, out *[]string) {
+	if n == nil {
+		return
+	}
+	switch n.Kind {
+	case yaml.ScalarNode:
+		if n.Tag == "!!str" {
+			*out = append(*out, n.Value)
+		}
+	case yaml.SequenceNode, yaml.MappingNode:
+		for _, c := range n.Content {
+			collectScalarStrings(c, out)
 		}
 	}
 }

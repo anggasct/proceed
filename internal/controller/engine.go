@@ -20,15 +20,23 @@ import (
 
 type RunInput struct {
 	GraphVersionID string
+	Params         *BoundRunParams
 }
 
 func (c *Controller) Run(ctx context.Context, input RunInput) (string, error) {
 	if err := c.acquireLease(ctx, time.Now()); err != nil {
 		return "", err
 	}
-	run, err := c.store.CreateRun(ctx, input.GraphVersionID)
+	params := input.Params
+	if params != nil && len(params.Values) == 0 {
+		params = nil
+	}
+	run, err := c.store.CreateRun(ctx, input.GraphVersionID, params.Start())
 	if err != nil {
 		return "", err
+	}
+	if input.Params != nil {
+		c.rememberParamRefs(run.ID, input.Params.Refs)
 	}
 	return run.ID, nil
 }
@@ -302,6 +310,14 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 	if err != nil {
 		return c.failNode(ctx, runID, n.NodeKey, n.AttemptNo, err)
 	}
+	var secretRedactions [][]byte
+	if kind == executor.Shell || kind == executor.HTTP {
+		redactions, err := c.interpolateNodeParams(ctx, runID, graphVersionID, kind, cfg)
+		if err != nil {
+			return c.failNode(ctx, runID, n.NodeKey, n.AttemptNo, err)
+		}
+		secretRedactions = redactions
+	}
 	maxAttempts, backoffMs := retryPolicy(cfg)
 	n.MaxAttempts, n.BackoffMs = maxAttempts, backoffMs
 	var profile capability.Profile
@@ -345,6 +361,7 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 		Capability:        profile,
 		WorkspaceRoot:     workspaceRoot,
 		Secrets:           c.cfg.Secrets,
+		SecretRedactions:  secretRedactions,
 		ArtifactPublisher: artifactSink,
 	}
 	if kind == executor.HTTP {

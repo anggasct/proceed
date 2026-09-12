@@ -230,11 +230,12 @@ func (e *Executor) Execute(ctx context.Context, req *executor.Request) (*executo
 	if err != nil {
 		return nil, err
 	}
+	redactions = append(redactions, req.SecretRedactions...)
 
 	var effectID string
 	if req.EffectPublisher != nil {
 		effectID, err = req.EffectPublisher.RecordIntent(ctx, executor.EffectIntent{
-			Target:        cfg.url,
+			Target:        redactString(cfg.url, redactions),
 			RequestDigest: requestDigest(resolved, redactions),
 		})
 		if err != nil {
@@ -471,10 +472,11 @@ func (e *Executor) ReconcileResult(ctx context.Context, req *executor.Request) (
 	if err != nil {
 		return nil, executor.EffectUnknown, err
 	}
-	resolved, _, err := resolveRequest(ctx, req, cfg)
+	resolved, redactions, err := resolveRequest(ctx, req, cfg)
 	if err != nil {
 		return nil, executor.EffectUnknown, err
 	}
+	redactions = append(redactions, req.SecretRedactions...)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, resolved.url, nil)
 	if err != nil {
 		return nil, executor.EffectUnknown, errDeliveryFailed
@@ -496,7 +498,7 @@ func (e *Executor) ReconcileResult(ctx context.Context, req *executor.Request) (
 	case response.StatusCode >= 200 && response.StatusCode < 300:
 		return &executor.Result{Output: map[string]any{
 			"status_code": response.StatusCode,
-			"body":        string(raw),
+			"body":        string(redact(raw, redactions)),
 			"reconciled":  true,
 		}}, executor.EffectConfirmed, nil
 	case response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusGone:
@@ -553,7 +555,7 @@ func requestDigest(resolved resolvedRequest, redactions [][]byte) string {
 	}
 	sort.Strings(names)
 	h := sha256.New()
-	fmt.Fprintf(h, "%s\n%s\n", resolved.method, resolved.url)
+	fmt.Fprintf(h, "%s\n%s\n", resolved.method, redactString(resolved.url, redactions))
 	for _, name := range names {
 		value := resolved.headers[name]
 		for _, secret := range redactions {
@@ -563,7 +565,7 @@ func requestDigest(resolved resolvedRequest, redactions [][]byte) string {
 		}
 		fmt.Fprintf(h, "%s: %s\n", name, value)
 	}
-	bodyHash := sha256.Sum256(resolved.body)
+	bodyHash := sha256.Sum256(redact(resolved.body, redactions))
 	fmt.Fprintf(h, "%s", hex.EncodeToString(bodyHash[:]))
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -594,6 +596,10 @@ func redact(value []byte, secrets [][]byte) []byte {
 		}
 	}
 	return value
+}
+
+func redactString(value string, secrets [][]byte) string {
+	return string(redact([]byte(value), secrets))
 }
 
 func bound(value []byte, limit int) ([]byte, bool) {
