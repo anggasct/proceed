@@ -20,7 +20,6 @@ type Run struct {
 }
 
 func (s *Store) CreateRun(ctx context.Context, graphVersionID string, params *RunParamsStart, triggerName string) (Run, error) {
-	now := time.Now().UnixMilli()
 	run := Run{ID: ulid.Make().String(), GraphVersionID: graphVersionID}
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
 		if err := tx.QueryRowContext(ctx,
@@ -31,52 +30,93 @@ func (s *Store) CreateRun(ctx context.Context, graphVersionID string, params *Ru
 			}
 			return err
 		}
-		started := runStartedPayload{
-			GraphVersionID:   graphVersionID,
+		_, err := startRunTx(ctx, tx, runStart{
+			RunID:            run.ID,
+			GraphVersionID:   run.GraphVersionID,
 			DefinitionDigest: run.DefinitionDigest,
+			Params:           params,
 			TriggerName:      triggerName,
-		}
-		if params != nil {
-			started.ParamsDigest = params.Digest
-			started.Params = params.Values
-		}
-		payload, err := json.Marshal(started)
-		if err != nil {
-			return err
-		}
-		ev := Event{
-			EventID:       ulid.Make().String(),
-			RunID:         run.ID,
-			Sequence:      1,
-			SchemaVersion: eventSchemaVersion,
-			Type:          "run_started",
-			OccurredAt:    now,
-			RecordedAt:    now,
-			ActorType:     "controller",
-			ActorID:       "controller",
-			PayloadDigest: payloadDigest(string(payload)),
-			Payload:       string(payload),
-		}
-		paramsDigest := "{}"
-		if params != nil && params.Digest != "" {
-			paramsDigest = params.Digest
-		}
-		var triggerNameValue any
-		if triggerName != "" {
-			triggerNameValue = triggerName
-		}
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO graph_run (id, graph_version_id, definition_digest, params_digest, trigger_name, status, created_at)
-VALUES (?, ?, ?, ?, ?, 'running', ?)`,
-			run.ID, run.GraphVersionID, run.DefinitionDigest, paramsDigest, triggerNameValue, now); err != nil {
-			return err
-		}
-		return appendEventTx(ctx, tx, &ev)
+		})
+		return err
 	})
 	if err != nil {
 		return Run{}, err
 	}
 	return run, nil
+}
+
+type runStart struct {
+	RunID            string
+	GraphVersionID   string
+	DefinitionDigest string
+	Params           *RunParamsStart
+	TriggerName      string
+	ScheduleID       string
+	ScheduleTick     int64
+	IdempotencyKey   string
+}
+
+func startRunTx(ctx context.Context, tx *sql.Tx, rs runStart) (string, error) {
+	now := time.Now().UnixMilli()
+	started := runStartedPayload{
+		GraphVersionID:   rs.GraphVersionID,
+		DefinitionDigest: rs.DefinitionDigest,
+		TriggerName:      rs.TriggerName,
+	}
+	if rs.ScheduleID != "" {
+		started.ScheduleID = rs.ScheduleID
+		started.ScheduleTick = rs.ScheduleTick
+	}
+	if rs.Params != nil {
+		started.ParamsDigest = rs.Params.Digest
+		started.Params = rs.Params.Values
+	}
+	payload, err := json.Marshal(started)
+	if err != nil {
+		return "", err
+	}
+	ev := Event{
+		EventID:        ulid.Make().String(),
+		RunID:          rs.RunID,
+		Sequence:       1,
+		SchemaVersion:  eventSchemaVersion,
+		Type:           "run_started",
+		OccurredAt:     now,
+		RecordedAt:     now,
+		ActorType:      "controller",
+		ActorID:        "controller",
+		IdempotencyKey: rs.IdempotencyKey,
+		PayloadDigest:  payloadDigest(string(payload)),
+		Payload:        string(payload),
+	}
+	paramsDigest := "{}"
+	if rs.Params != nil && rs.Params.Digest != "" {
+		paramsDigest = rs.Params.Digest
+	}
+	var triggerNameValue any
+	if rs.TriggerName != "" {
+		triggerNameValue = rs.TriggerName
+	}
+	var scheduleIDValue any
+	if rs.ScheduleID != "" {
+		scheduleIDValue = rs.ScheduleID
+	}
+	var scheduleTickValue any
+	if rs.ScheduleTick != 0 {
+		scheduleTickValue = rs.ScheduleTick
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO graph_run (id, graph_version_id, definition_digest, params_digest,
+                       schedule_id, schedule_tick, trigger_name, status, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)`,
+		rs.RunID, rs.GraphVersionID, rs.DefinitionDigest, paramsDigest,
+		scheduleIDValue, scheduleTickValue, triggerNameValue, now); err != nil {
+		return "", err
+	}
+	if err := appendEventTx(ctx, tx, &ev); err != nil {
+		return "", err
+	}
+	return rs.RunID, nil
 }
 
 type runStartedPayload struct {
@@ -85,6 +125,8 @@ type runStartedPayload struct {
 	ParamsDigest     string          `json:"params_digest,omitempty"`
 	Params           []RunParamValue `json:"params,omitempty"`
 	TriggerName      string          `json:"trigger_name,omitempty"`
+	ScheduleID       string          `json:"schedule_id,omitempty"`
+	ScheduleTick     int64           `json:"schedule_tick,omitempty"`
 }
 
 type nodeStartedPayload struct {
@@ -301,9 +343,12 @@ func onRunStarted(ctx context.Context, tx *sql.Tx, ev *Event) error {
 		paramsDigest = "{}"
 	}
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO graph_run (id, graph_version_id, definition_digest, params_digest, trigger_name, status, created_at)
-VALUES (?, ?, ?, ?, ?, 'running', ?) ON CONFLICT(id) DO NOTHING`,
-		ev.RunID, p.GraphVersionID, digest, paramsDigest, nullableOr(p.TriggerName), ev.OccurredAt); err != nil {
+INSERT INTO graph_run (id, graph_version_id, definition_digest, params_digest,
+                       schedule_id, schedule_tick, trigger_name, status, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?) ON CONFLICT(id) DO NOTHING`,
+		ev.RunID, p.GraphVersionID, digest, paramsDigest,
+		nullableOr(p.ScheduleID), nullableInt(p.ScheduleTick),
+		nullableOr(p.TriggerName), ev.OccurredAt); err != nil {
 		return err
 	}
 	for i := range p.Params {

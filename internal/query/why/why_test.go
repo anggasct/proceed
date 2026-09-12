@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"proceed/internal/compiler"
 	"proceed/internal/store"
@@ -259,6 +261,88 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestExplainScheduledRunShowsScheduleCausation(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	doc, err := compiler.Parse([]byte(fixtureGraph))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := compiler.Validate(doc); err != nil {
+		t.Fatal(err)
+	}
+	frozen, err := st.FreezeDefinition(ctx, "fixture.yaml", []byte(fixtureGraph), doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tick := time.Date(2026, 9, 12, 10, 1, 0, 0, time.UTC).UnixMilli()
+	if err := st.AddSchedule(ctx, "every", frozen.GraphVersionID, "* * * * *", tick); err != nil {
+		t.Fatal(err)
+	}
+	next := func(expr string, after time.Time) (time.Time, bool, error) {
+		return after.UTC().Truncate(time.Minute).Add(time.Minute), true, nil
+	}
+	outcomes, err := st.FireDueSchedules(ctx, tick+2000, next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outcomes) != 1 || outcomes[0].RunID == "" {
+		t.Fatalf("outcomes = %+v", outcomes)
+	}
+	runID := outcomes[0].RunID
+	var scheduleID string
+	if err := st.DB().QueryRow(
+		"SELECT id FROM schedule WHERE name = 'every'").Scan(&scheduleID); err != nil {
+		t.Fatal(err)
+	}
+
+	explanation, err := New(st).Explain(ctx, runID, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(explanation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"schedule_id":"`+scheduleID+`"`) ||
+		!strings.Contains(string(encoded), `"schedule_tick":`+strconv.FormatInt(tick, 10)) {
+		t.Fatalf("causation missing from why output: %s", encoded)
+	}
+	if explanation.Recorded.ScheduleID != scheduleID || explanation.Recorded.ScheduleTick != tick {
+		t.Fatalf("recorded = %+v", explanation.Recorded)
+	}
+
+	if _, err := st.Append(ctx, store.Event{
+		RunID:         runID,
+		Sequence:      2,
+		SchemaVersion: "proceed/v1",
+		Type:          "decision_recorded",
+		OccurredAt:    tick + 3000,
+		ActorType:     "controller",
+		ActorID:       "fixture",
+		Payload:       `{"node_key":"a","kind":"routing","candidate_edges":[],"causal_links":[]}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().Exec("DELETE FROM decision WHERE run_id = ?", runID); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := New(st).Explain(ctx, runID, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Recorded.Source != "events" {
+		t.Fatalf("source = %q, want events", replayed.Recorded.Source)
+	}
+	if replayed.Recorded.ScheduleID != scheduleID || replayed.Recorded.ScheduleTick != tick {
+		t.Fatalf("replayed recorded = %+v", replayed.Recorded)
+	}
 }
 
 func TestCompletedRootIsNotPending(t *testing.T) {

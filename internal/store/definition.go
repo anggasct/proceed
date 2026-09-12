@@ -107,6 +107,21 @@ func migrateSchemaAdditions(ctx context.Context, conn *sql.Conn) error {
 			return err
 		}
 	}
+	for _, col := range []struct{ name, ddl string }{
+		{"schedule_id", "ALTER TABLE graph_run ADD COLUMN schedule_id TEXT"},
+		{"schedule_tick", "ALTER TABLE graph_run ADD COLUMN schedule_tick INTEGER"},
+	} {
+		var n int
+		if err := conn.QueryRowContext(ctx,
+			fmt.Sprintf(`SELECT COUNT(*) FROM pragma_table_info('graph_run') WHERE name = '%s'`, col.name)).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			if _, err := conn.ExecContext(ctx, col.ddl); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 

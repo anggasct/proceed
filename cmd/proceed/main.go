@@ -21,6 +21,7 @@ Commands:
   approve     Record an approval gate decision
   reconcile   Resolve an uncertain effect
   trigger     add | list | remove — inbound webhook trigger bindings
+  schedule    add | list | pause | resume | remove — cron schedule bindings
   store       export | import — backup and restore
 
 Run "proceed <command> -h" for command flags.
@@ -57,6 +58,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return cmdApprove(args[1:], stdout, stderr)
 		case "trigger":
 			return cmdTrigger(args[1:], stdout, stderr)
+		case "schedule":
+			return cmdSchedule(args[1:], stdout, stderr)
 		case "store":
 			return cmdStore(args[1:], stdout, stderr)
 		default:
@@ -77,5 +80,6 @@ var commands = map[string]struct{}{
 	"approve":   {},
 	"reconcile": {},
 	"trigger":   {},
+	"schedule":  {},
 	"store":     {},
 }

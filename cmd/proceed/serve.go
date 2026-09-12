@@ -100,6 +100,9 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 				c.ReleaseLease()
 				return printClassified(err, stderr)
 			}
+			if err := c.FireDueSchedules(context.Background(), time.Now()); err != nil {
+				fmt.Fprintf(stderr, "proceed: schedule tick: %v\n", err)
+			}
 			if err := c.RecoverAll(context.Background()); err != nil {
 				fmt.Fprintf(stderr, "proceed: recovery scan: %v\n", err)
 			}

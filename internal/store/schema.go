@@ -1,6 +1,6 @@
 package store
 
-const storeSchemaVersion = 5
+const storeSchemaVersion = 6
 
 var schemaDDL = `
 CREATE TABLE IF NOT EXISTS graph (
@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS graph_run (
   graph_version_id  TEXT NOT NULL REFERENCES graph_version(id),
   definition_digest TEXT NOT NULL,
   params_digest     TEXT NOT NULL DEFAULT '{}',
+  schedule_id       TEXT,
+  schedule_tick     INTEGER,
   trigger_name      TEXT,
   status            TEXT NOT NULL
                     CHECK (status IN ('running','completed','failed','cancelled','abandoned')),
@@ -315,6 +317,23 @@ CREATE INDEX IF NOT EXISTS idx_graph_edge_version ON graph_edge(graph_version_id
 CREATE INDEX IF NOT EXISTS idx_graph_param_version ON graph_param(graph_version_id);
 CREATE INDEX IF NOT EXISTS idx_policy_version ON policy(graph_version_id);
 CREATE INDEX IF NOT EXISTS idx_run_param_run ON run_param(run_id);
+
+CREATE TABLE IF NOT EXISTS schedule (
+  id                 TEXT PRIMARY KEY,
+  name               TEXT NOT NULL UNIQUE,
+  graph_version_id   TEXT NOT NULL REFERENCES graph_version(id),
+  definition_digest  TEXT NOT NULL,
+  cron               TEXT NOT NULL,
+  enabled            INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  next_fire_at       INTEGER NOT NULL,
+  last_run_id        TEXT REFERENCES graph_run(id),
+  skipped_count      INTEGER NOT NULL DEFAULT 0,
+  last_skipped_at    INTEGER,
+  last_skip_window   TEXT,
+  created_at         INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_schedule_due ON schedule(enabled, next_fire_at);
 
 CREATE TABLE IF NOT EXISTS webhook_trigger (
   id                 TEXT PRIMARY KEY,
