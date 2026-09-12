@@ -19,6 +19,7 @@ Commands:
   serve       Run the controller with the local HTTP API
   graph       inspect | why | export | improvement — read-only run and graph views
   approve     Record an approval gate decision
+  dashboard   Watch runs, pending gates, and failures on one screen
   reconcile   Resolve an uncertain effect
   trigger     add | list | remove — inbound webhook trigger bindings
   schedule    add | list | pause | resume | remove — cron schedule bindings
@@ -56,6 +57,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return cmdGraph(args[1:], stdout, stderr)
 		case "approve":
 			return cmdApprove(args[1:], stdout, stderr)
+		case "dashboard":
+			return cmdDashboard(args[1:], stdout, stderr)
 		case "trigger":
 			return cmdTrigger(args[1:], stdout, stderr)
 		case "schedule":
@@ -78,6 +81,7 @@ var commands = map[string]struct{}{
 	"serve":     {},
 	"graph":     {},
 	"approve":   {},
+	"dashboard": {},
 	"reconcile": {},
 	"trigger":   {},
 	"schedule":  {},
