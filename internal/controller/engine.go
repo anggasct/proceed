@@ -21,6 +21,7 @@ import (
 type RunInput struct {
 	GraphVersionID string
 	Params         *BoundRunParams
+	TriggerName    string
 }
 
 func (c *Controller) Run(ctx context.Context, input RunInput) (string, error) {
@@ -31,7 +32,7 @@ func (c *Controller) Run(ctx context.Context, input RunInput) (string, error) {
 	if params != nil && len(params.Values) == 0 {
 		params = nil
 	}
-	run, err := c.store.CreateRun(ctx, input.GraphVersionID, params.Start())
+	run, err := c.store.CreateRun(ctx, input.GraphVersionID, params.Start(), input.TriggerName)
 	if err != nil {
 		return "", err
 	}

@@ -92,7 +92,7 @@ edges:
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := st.CreateRun(context.Background(), frozen.GraphVersionID, nil)
+	run, err := st.CreateRun(context.Background(), frozen.GraphVersionID, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}

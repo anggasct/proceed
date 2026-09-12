@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -37,7 +38,7 @@ func buildPopulatedDir(t *testing.T, dataDir string) *Store {
 		t.Fatal(err)
 	}
 	versionID, edgeID, nodeA, nodeB := fixtureVersion(t, s)
-	run, err := s.CreateRun(context.Background(), versionID, nil)
+	run, err := s.CreateRun(context.Background(), versionID, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -562,6 +563,108 @@ func TestImportRejectsSchemaVersionDisagreement(t *testing.T) {
 		if strings.HasPrefix(e.Name(), ".import-") {
 			t.Errorf("staging directory %s left behind", e.Name())
 		}
+	}
+}
+
+func recraftArchiveAsOlderSchema(t *testing.T, archive, outPath string) {
+	t.Helper()
+	members, err := readArchiveMembers(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest exportManifest
+	if err := json.Unmarshal(members[manifestMember], &manifest); err != nil {
+		t.Fatal(err)
+	}
+	work := filepath.Join(t.TempDir(), "work.db")
+	if err := os.WriteFile(work, members[manifest.DB.Path], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+work+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Ping(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`ALTER TABLE graph_run DROP COLUMN trigger_name`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", storeSchemaVersion-1)); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	content, err := os.ReadFile(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members[manifest.DB.Path] = content
+	manifest.DB.SHA256 = sha256Hex(content)
+	manifest.DB.SizeBytes = int64(len(content))
+	manifest.SchemaVersion = storeSchemaVersion - 1
+	encoded, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members[manifestMember] = encoded
+	writeTestArchive(t, outPath, members)
+}
+
+func TestImportAcceptsOlderSchemaArchive(t *testing.T) {
+	ctx := context.Background()
+	sourceDir := t.TempDir()
+	s := buildPopulatedDir(t, sourceDir)
+	s.Close()
+	archive := filepath.Join(t.TempDir(), "backup.tgz")
+	if err := Export(ctx, sourceDir, archive); err != nil {
+		t.Fatal(err)
+	}
+
+	older := filepath.Join(t.TempDir(), "older.tgz")
+	recraftArchiveAsOlderSchema(t, archive, older)
+
+	targetDir := t.TempDir()
+	if err := Import(ctx, older, targetDir); err != nil {
+		t.Fatalf("import of a pre-v%d archive failed: %v", storeSchemaVersion, err)
+	}
+
+	restored, err := Open(filepath.Join(targetDir, "proceed.db"))
+	if err != nil {
+		t.Fatalf("restored store failed to open: %v", err)
+	}
+	defer restored.Close()
+
+	var version int
+	if err := restored.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != storeSchemaVersion {
+		t.Errorf("restored user_version = %d, want %d", version, storeSchemaVersion)
+	}
+	var triggerCol int
+	if err := restored.db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info('graph_run') WHERE name = 'trigger_name'`).Scan(&triggerCol); err != nil {
+		t.Fatal(err)
+	}
+	if triggerCol != 1 {
+		t.Error("trigger_name column missing after restoring an older archive")
+	}
+	var runs int
+	if err := restored.db.QueryRow("SELECT COUNT(*) FROM graph_run").Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 1 {
+		t.Errorf("restored graph_run rows = %d, want 1", runs)
+	}
+	if _, err := restored.ListWebhookTriggers(ctx); err != nil {
+		t.Fatalf("webhook triggers unreadable on restored store: %v", err)
+	}
+	report, err := restored.RebuildProjections(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Diverged {
+		t.Error("restored store projections diverge from the event stream")
 	}
 }
 

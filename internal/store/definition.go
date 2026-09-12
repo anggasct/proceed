@@ -98,6 +98,15 @@ func migrateSchemaAdditions(ctx context.Context, conn *sql.Conn) error {
 			return err
 		}
 	}
+	var triggerCol int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('graph_run') WHERE name = 'trigger_name'`).Scan(&triggerCol); err != nil {
+		return err
+	}
+	if triggerCol == 0 {
+		if _, err := conn.ExecContext(ctx, `ALTER TABLE graph_run ADD COLUMN trigger_name TEXT`); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

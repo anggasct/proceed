@@ -327,7 +327,7 @@ func TestApprovalRestartPreservesWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := newTestController(t, st, approvalTestPool(), "ctrl-1")
-	run, err := st.CreateRun(context.Background(), frozen.GraphVersionID, nil)
+	run, err := st.CreateRun(context.Background(), frozen.GraphVersionID, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -26,11 +26,17 @@ type Token struct {
 	Scopes []string `yaml:"scopes" json:"scopes"`
 }
 
+type Trigger struct {
+	Name   string `yaml:"name" json:"name"`
+	Secret string `yaml:"secret" json:"-"`
+}
+
 type Config struct {
 	DataDir   string            `yaml:"data_dir"`
 	Bind      string            `yaml:"bind"`
 	Tokens    []Token           `yaml:"tokens"`
 	AgentCLIs map[string]string `yaml:"agent_clis"`
+	Triggers  []Trigger         `yaml:"triggers"`
 }
 
 type fileConfig struct {
@@ -38,6 +44,7 @@ type fileConfig struct {
 	Bind      string            `yaml:"bind"`
 	Tokens    []Token           `yaml:"tokens"`
 	AgentCLIs map[string]string `yaml:"agent_clis"`
+	Triggers  []Trigger         `yaml:"triggers"`
 }
 
 func Resolve(path string, getenv func(string) string) (Config, error) {
@@ -58,6 +65,7 @@ func Resolve(path string, getenv func(string) string) (Config, error) {
 			}
 			cfg.Tokens = fc.Tokens
 			cfg.AgentCLIs = fc.AgentCLIs
+			cfg.Triggers = fc.Triggers
 		case os.IsNotExist(err):
 		default:
 			return Config{}, err
@@ -113,6 +121,16 @@ func (c *Config) validate() error {
 			return fmt.Errorf("agent CLI %q requires an absolute binary path", name)
 		}
 	}
+	seenTrigger := map[string]bool{}
+	for _, trigger := range c.Triggers {
+		if trigger.Name == "" || trigger.Secret == "" {
+			return fmt.Errorf("trigger entries require a name and a secret")
+		}
+		if seenTrigger[trigger.Name] {
+			return fmt.Errorf("duplicate trigger name %q", trigger.Name)
+		}
+		seenTrigger[trigger.Name] = true
+	}
 	return nil
 }
 
@@ -152,4 +170,13 @@ func (c *Config) TokenScopes(token string) ([]string, bool) {
 		}
 	}
 	return nil, false
+}
+
+func (c *Config) TriggerSecret(name string) (string, bool) {
+	for _, entry := range c.Triggers {
+		if entry.Name == name {
+			return entry.Secret, true
+		}
+	}
+	return "", false
 }

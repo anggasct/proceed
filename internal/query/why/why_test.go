@@ -55,7 +55,7 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := st.CreateRun(ctx, frozen.GraphVersionID, nil)
+	run, err := st.CreateRun(ctx, frozen.GraphVersionID, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}

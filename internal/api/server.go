@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"proceed/internal/compiler"
 	"proceed/internal/config"
@@ -26,12 +27,15 @@ type Deps struct {
 }
 
 type Server struct {
-	deps Deps
-	mux  *http.ServeMux
+	deps    Deps
+	mux     *http.ServeMux
+	now     func() time.Time
+	limiter *triggerLimiter
 }
 
 func NewServer(deps Deps) *Server {
-	s := &Server{deps: deps, mux: http.NewServeMux()}
+	s := &Server{deps: deps, mux: http.NewServeMux(), now: time.Now}
+	s.limiter = newTriggerLimiter(s.now)
 	s.mux.HandleFunc("POST /v1/runs", s.handleCreateRun)
 	s.mux.HandleFunc("GET /v1/runs", s.handleListRuns)
 	s.mux.HandleFunc("GET /v1/runs/{id}", s.handleGetRun)
@@ -41,6 +45,7 @@ func NewServer(deps Deps) *Server {
 	s.mux.HandleFunc("POST /v1/approvals/{id}/decision", s.handleApprovalDecision(""))
 	s.mux.HandleFunc("POST /v1/approvals/{id}/grant", s.handleApprovalDecision("grant"))
 	s.mux.HandleFunc("POST /v1/approvals/{id}/deny", s.handleApprovalDecision("deny"))
+	s.mux.HandleFunc("POST /v1/triggers/{name}/fire", s.handleFireTrigger)
 	s.mux.HandleFunc("POST /v1/runs/{id}/approve", s.handleReserved("approve"))
 	s.mux.HandleFunc("POST /v1/runs/{id}/reconcile", s.handleReserved("admin"))
 	s.mux.HandleFunc("GET /v1/runs/{id}/export", s.handleExport)

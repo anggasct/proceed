@@ -108,7 +108,7 @@ func TestCreateRunRecordsParams(t *testing.T) {
 			{Name: "retries", Type: "int", Value: strPtr("3")},
 			{Name: "token", Type: "secret"},
 		},
-	})
+	}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestCreateRunWithoutParamsKeepsLegacyShape(t *testing.T) {
 	defer s.Close()
 	versionID := freezeParamsGraph(t, s)
 
-	run, err := s.CreateRun(context.Background(), versionID, nil)
+	run, err := s.CreateRun(context.Background(), versionID, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +188,7 @@ func TestRebuildProjectionsReplaysRunParams(t *testing.T) {
 			{Name: "env", Type: "string", Value: strPtr("staging")},
 			{Name: "token", Type: "secret"},
 		},
-	})
+	}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
