@@ -142,22 +142,30 @@ func coerceParam(d *compiler.Param, b ParamBinding) (text, ref string, err error
 	return "", "", paramInvalid("param %q has unknown type %q", d.Name, d.Type)
 }
 
-func (c *Controller) interpolateNodeParams(ctx context.Context, runID, graphVersionID string, kind executor.Kind, cfg map[string]any) error {
+func (c *Controller) interpolateNodeParams(ctx context.Context, runID, graphVersionID string, kind executor.Kind, cfg map[string]any) ([][]byte, error) {
 	rawExec, ok := cfg["executor"].(map[string]any)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	rows, err := c.store.RunParams(ctx, runID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	refs := c.paramRefsFor(runID)
+	var secretValues [][]byte
 	replaceIn := func(s string) (string, error) {
 		if !compiler.HasParamRef(s) {
 			return s, nil
 		}
 		return compiler.ReplaceParamRefs(s, func(name string) (string, error) {
-			return c.resolveParamValue(ctx, runID, graphVersionID, name, rows, refs)
+			v, err := c.resolveParamValue(ctx, runID, graphVersionID, name, rows, refs)
+			if err != nil {
+				return "", err
+			}
+			if row, ok := rows[name]; ok && row.Type == "secret" && len(v) > 0 {
+				secretValues = append(secretValues, []byte(v))
+			}
+			return v, nil
 		})
 	}
 	switch kind {
@@ -170,7 +178,7 @@ func (c *Controller) interpolateNodeParams(ctx context.Context, runID, graphVers
 				}
 				replaced, err := replaceIn(s)
 				if err != nil {
-					return err
+					return nil, err
 				}
 				command[i] = replaced
 			}
@@ -183,7 +191,7 @@ func (c *Controller) interpolateNodeParams(ctx context.Context, runID, graphVers
 				}
 				replaced, err := replaceIn(s)
 				if err != nil {
-					return err
+					return nil, err
 				}
 				env[k] = replaced
 			}
@@ -192,19 +200,19 @@ func (c *Controller) interpolateNodeParams(ctx context.Context, runID, graphVers
 		if u, ok := rawExec["url"].(string); ok {
 			replaced, err := replaceIn(u)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			rawExec["url"] = replaced
 		}
 		if raw, ok := rawExec["body"]; ok {
 			replaced, err := replaceParamValue(raw, replaceIn)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			rawExec["body"] = replaced
 		}
 	}
-	return nil
+	return secretValues, nil
 }
 
 func (c *Controller) resolveParamValue(ctx context.Context, runID, graphVersionID, name string, rows map[string]store.RunParamRow, refs map[string]string) (string, error) {

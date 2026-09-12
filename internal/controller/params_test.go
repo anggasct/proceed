@@ -2,6 +2,9 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -263,6 +266,88 @@ func TestInterpolationAtAdmission(t *testing.T) {
 	assertNoLeak(t, st, runID, "secret-value")
 }
 
+const httpSecretParamGraph = `schema: proceed/v1
+name: http-secret-param
+params:
+  - { name: token, type: secret, required: true }
+nodes:
+  - id: call
+    type: task
+    executor:
+      kind: http
+      method: GET
+      url: %s/api?token={{ params.token }}
+    contract: reconcilable
+    terminal: true
+    capability:
+      network:
+        allowlisted_hosts: [127.0.0.1]
+edges: []
+`
+
+func TestHTTPSecretParamInterpolationNeverPersists(t *testing.T) {
+	var gotQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		fmt.Fprint(w, `{"ok":true}`)
+	}))
+	defer server.Close()
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	src := []byte(fmt.Sprintf(httpSecretParamGraph, server.URL))
+	doc, err := compiler.Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := compiler.Validate(doc); err != nil {
+		t.Fatal(err)
+	}
+	frozen, err := st.FreezeDefinition(context.Background(), "test.yaml", src, doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	cfg.Secrets = mapResolver{"API_TOKEN": "http-secret-value"}
+	c, err := New(st, cfg, httpPool())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := BindRunParams(doc.Params, []ParamBinding{
+		{Name: "token", Value: "${API_TOKEN}"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, err := c.Run(context.Background(), RunInput{GraphVersionID: frozen.GraphVersionID, Params: bound})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Drain(context.Background(), runID); err != nil {
+		t.Fatal(err)
+	}
+
+	if s := nodeStatus(t, st, runID, "call"); s != "succeeded" {
+		t.Fatalf("node status = %q, want succeeded", s)
+	}
+	if gotQuery != "token=http-secret-value" {
+		t.Fatalf("target query = %q, want the resolved secret delivered to the server", gotQuery)
+	}
+
+	var target string
+	if err := st.DB().QueryRow("SELECT target FROM effect LIMIT 1").Scan(&target); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(target, "http-secret-value") || !strings.Contains(target, "[REDACTED]") {
+		t.Fatalf("effect target = %q, want redacted", target)
+	}
+
+	assertNoLeak(t, st, runID, "http-secret-value")
+}
+
 func toStrings(items []any) []string {
 	out := make([]string, len(items))
 	for i, v := range items {
@@ -274,7 +359,7 @@ func toStrings(items []any) []string {
 func assertNoLeak(t *testing.T, st *store.Store, runID, secret string) {
 	t.Helper()
 	var leaks []string
-	tables := []string{"event", "run_param", "node_attempt", "artifact"}
+	tables := []string{"event", "run_param", "node_attempt", "artifact", "effect"}
 	for _, table := range tables {
 		rows, err := st.DB().Query("SELECT * FROM " + table)
 		if err != nil {

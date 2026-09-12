@@ -174,14 +174,52 @@ func (v *validator) paramRefPass() {
 			v.errf(RuleParamReference, loc, paramAllowlistHint)
 		})
 	}
+	forbidExtras := func(loc, skip string, extras map[string]yaml.Node) {
+		names := make([]string, 0, len(extras))
+		for name := range extras {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if name == skip {
+				continue
+			}
+			var scalars []string
+			node := extras[name]
+			collectScalarStrings(&node, &scalars)
+			for _, s := range scalars {
+				forbid(joinPath(loc, name), s)
+			}
+		}
+	}
+	forbidExtras("", "", v.doc.Extras)
 	for i := range v.doc.Nodes {
 		n := &v.doc.Nodes[i]
 		path := fmt.Sprintf("nodes[%d]", i)
 		forbid(joinPath(path, "id"), n.ID)
+		forbidExtras(path, "", n.Extras)
+		if n.Retry != nil {
+			for j, entry := range n.Retry.RetryableErrors {
+				forbid(joinPath(path, fmt.Sprintf("retry.retryable_errors[%d]", j)), entry)
+			}
+			forbidExtras(joinPath(path, "retry"), "", n.Retry.Extras)
+		}
+		if n.Capability != nil {
+			capPath := joinPath(path, "capability")
+			forbidExtras(capPath, "", n.Capability.Extras)
+			if n.Capability.Network != nil {
+				forbidExtras(joinPath(capPath, "network"), "", n.Capability.Network.Extras)
+			}
+		}
 		if n.Executor == nil {
 			continue
 		}
 		e := n.Executor
+		skip := ""
+		if e.Kind == "shell" {
+			skip = "x-proceed-env"
+		}
+		forbidExtras(joinPath(path, "executor"), skip, e.Extras)
 		switch e.Kind {
 		case "shell":
 			for j, part := range e.Command {
@@ -218,6 +256,7 @@ func (v *validator) paramRefPass() {
 	}
 	for i := range v.doc.Edges {
 		e := &v.doc.Edges[i]
+		forbidExtras(fmt.Sprintf("edges[%d]", i), "", e.Extras)
 		if e.HasWhen {
 			forbid(fmt.Sprintf("edges[%d].when", i), e.When)
 		}
@@ -229,6 +268,7 @@ func (v *validator) paramRefPass() {
 		for _, s := range scalars {
 			forbid(fmt.Sprintf("policies[%d].rule", i), s)
 		}
+		forbidExtras(fmt.Sprintf("policies[%d]", i), "", po.Extras)
 	}
 }
 

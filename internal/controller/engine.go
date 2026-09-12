@@ -310,9 +310,14 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 	if err != nil {
 		return c.failNode(ctx, runID, n.NodeKey, n.AttemptNo, err)
 	}
+	var secretRedactions [][]byte
 	if kind == executor.Shell || kind == executor.HTTP {
-		if err := c.interpolateNodeParams(ctx, runID, graphVersionID, kind, cfg); err != nil {
+		redactions, err := c.interpolateNodeParams(ctx, runID, graphVersionID, kind, cfg)
+		if err != nil {
 			return c.failNode(ctx, runID, n.NodeKey, n.AttemptNo, err)
+		}
+		if kind == executor.HTTP {
+			secretRedactions = redactions
 		}
 	}
 	maxAttempts, backoffMs := retryPolicy(cfg)
@@ -358,6 +363,7 @@ func (c *Controller) executeNode(ctx context.Context, runID, graphVersionID, dig
 		Capability:        profile,
 		WorkspaceRoot:     workspaceRoot,
 		Secrets:           c.cfg.Secrets,
+		SecretRedactions:  secretRedactions,
 		ArtifactPublisher: artifactSink,
 	}
 	if kind == executor.HTTP {

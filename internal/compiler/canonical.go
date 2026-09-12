@@ -20,7 +20,7 @@ func CanonicalJSON(src []byte) ([]byte, error) {
 		return nil, graphInvalid(Diagnostic{Rule: RuleParse, Message: "empty document"})
 	}
 	var out []byte
-	if err := encodeNode(root.Content[0], false, false, &out); err != nil {
+	if err := encodeNode(root.Content[0], false, false, true, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -31,9 +31,9 @@ func DefinitionDigest(canonical []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func encodeNode(n *yaml.Node, inExtension bool, inParams bool, out *[]byte) error {
+func encodeNode(n *yaml.Node, inExtension bool, inParams bool, rootMapping bool, out *[]byte) error {
 	if n.Kind == yaml.AliasNode {
-		return encodeNode(n.Alias, inExtension, inParams, out)
+		return encodeNode(n.Alias, inExtension, inParams, false, out)
 	}
 	switch n.Kind {
 	case yaml.ScalarNode:
@@ -44,7 +44,7 @@ func encodeNode(n *yaml.Node, inExtension bool, inParams bool, out *[]byte) erro
 			if i > 0 {
 				*out = append(*out, ',')
 			}
-			if err := encodeNode(item, inExtension, inParams, out); err != nil {
+			if err := encodeNode(item, inExtension, inParams, false, out); err != nil {
 				return err
 			}
 		}
@@ -71,8 +71,8 @@ func encodeNode(n *yaml.Node, inExtension bool, inParams bool, out *[]byte) erro
 			}
 			encodeString(p.key, out)
 			*out = append(*out, ':')
-			childParams := inParams || p.key == "params"
-			if err := encodeNode(p.value, inExtension || strings.HasPrefix(p.key, "x-"), childParams, out); err != nil {
+			childParams := inParams || (rootMapping && p.key == "params")
+			if err := encodeNode(p.value, inExtension || strings.HasPrefix(p.key, "x-"), childParams, false, out); err != nil {
 				return err
 			}
 		}
@@ -83,7 +83,7 @@ func encodeNode(n *yaml.Node, inExtension bool, inParams bool, out *[]byte) erro
 			*out = append(*out, 'n', 'u', 'l', 'l')
 			return nil
 		}
-		return encodeNode(n.Content[0], inExtension, inParams, out)
+		return encodeNode(n.Content[0], inExtension, inParams, rootMapping, out)
 	default:
 		return graphInvalid(Diagnostic{Rule: RuleParse, Message: fmt.Sprintf("unsupported node kind %d", n.Kind)})
 	}

@@ -41,6 +41,7 @@ type Request struct {
 	WorkspaceRoot     string
 	Inputs            []ArtifactRef
 	Secrets           SecretResolver
+	SecretRedactions  [][]byte
 	ArtifactPublisher ArtifactPublisher
 	EffectPublisher   EffectPublisher
 }

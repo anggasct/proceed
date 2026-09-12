@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -168,6 +169,112 @@ func TestParamRefsForbiddenSurfaces(t *testing.T) {
 	}
 }
 
+func TestParamRefsForbiddenInRetryAndExtensions(t *testing.T) {
+	const base = `schema: proceed/v1
+name: refs-extras
+params:
+  - { name: env, type: string }
+nodes:
+  - id: call
+    type: task
+    executor: { kind: http, method: GET, url: "http://example.test/api" }
+    contract: pure
+    terminal: true
+    %s
+    capability:
+      network:
+        allowlisted_hosts: [example.test]
+edges: []
+`
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"retryable_errors", `retry: { max_attempts: 2, retryable_errors: ["{{ params.env }}"] }`},
+		{"retry extension", `retry: { max_attempts: 2, x-note: "{{ params.env }}" }`},
+		{"node extension", `x-note: "{{ params.env }}"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := parseAndValidate(t, fmt.Sprintf(base, tc.body))
+			if err == nil {
+				t.Fatal("expected rejection")
+			}
+			if !strings.Contains(err.Error(), paramAllowlistHint) {
+				t.Fatalf("error %q does not contain allowlist hint", err.Error())
+			}
+		})
+	}
+}
+
+func TestParamRefsForbiddenInExecutorAndDocumentExtensions(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{"executor extension", `schema: proceed/v1
+name: refs-exec-extra
+params:
+  - { name: env, type: string }
+nodes:
+  - id: call
+    type: task
+    executor:
+      kind: http
+      method: GET
+      url: "http://example.test/api"
+      x-note: "{{ params.env }}"
+    contract: pure
+    terminal: true
+    capability:
+      network:
+        allowlisted_hosts: [example.test]
+edges: []
+`},
+		{"document extension", `schema: proceed/v1
+name: refs-doc-extra
+x-note: "{{ params.env }}"
+params:
+  - { name: env, type: string }
+nodes:
+  - id: call
+    type: task
+    executor: { kind: shell, command: [bin/call] }
+    contract: pure
+    terminal: true
+edges: []
+`},
+		{"edge extension", `schema: proceed/v1
+name: refs-edge-extra
+params:
+  - { name: env, type: string }
+nodes:
+  - id: a
+    type: task
+    executor: { kind: shell, command: [bin/a] }
+    contract: pure
+  - id: b
+    type: task
+    executor: { kind: shell, command: [bin/b] }
+    contract: pure
+    terminal: true
+edges:
+  - { from: a, to: b, type: depends_on, x-note: "{{ params.env }}" }
+`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := parseAndValidate(t, tc.src)
+			if err == nil {
+				t.Fatal("expected rejection")
+			}
+			if !strings.Contains(err.Error(), paramAllowlistHint) {
+				t.Fatalf("error %q does not contain allowlist hint", err.Error())
+			}
+		})
+	}
+}
+
 func TestParamRefUndeclaredInCommand(t *testing.T) {
 	src := strings.Replace(paramGraphPrefix, "{{ params.env }}", "{{ params.bogus }}", 1)
 	err := parseAndValidate(t, src)
@@ -225,6 +332,43 @@ edges: []
 	noParams := strings.Replace(src, "params:\n  - { name: ratio, type: float, default: 0.5 }\n", "", 1)
 	if _, err := CanonicalJSON([]byte(noParams)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCanonicalJSONFloatUnderNestedParamsKeyRejected(t *testing.T) {
+	src := `schema: proceed/v1
+name: nested-params-float
+policies:
+  - name: p1
+    kind: retry
+    rule:
+      params:
+        threshold: 0.5
+nodes:
+  - id: call
+    type: task
+    executor: { kind: shell, command: [bin/call] }
+    contract: pure
+    terminal: true
+edges: []
+`
+	if _, err := CanonicalJSON([]byte(src)); err == nil {
+		t.Fatal("expected float rejection under a nested params key")
+	}
+	declaration := `schema: proceed/v1
+name: nested-params-float
+params:
+  - { name: ratio, type: float, default: 0.5 }
+nodes:
+  - id: call
+    type: task
+    executor: { kind: shell, command: [bin/call] }
+    contract: pure
+    terminal: true
+edges: []
+`
+	if _, err := CanonicalJSON([]byte(declaration)); err != nil {
+		t.Fatalf("float declaration default must stay accepted: %v", err)
 	}
 }
 
