@@ -1,6 +1,6 @@
 package store
 
-const storeSchemaVersion = 6
+const storeSchemaVersion = 7
 
 var schemaDDL = `
 CREATE TABLE IF NOT EXISTS graph (
@@ -375,6 +375,15 @@ CREATE TABLE IF NOT EXISTS webhook_delivery (
   completed_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_webhook_delivery_age ON webhook_delivery(completed_at);
+CREATE TABLE IF NOT EXISTS gc_record (
+  id                TEXT PRIMARY KEY,
+  policy_keep_runs  INTEGER NOT NULL,
+  policy_older_than TEXT NOT NULL,
+  dry_run           INTEGER NOT NULL CHECK (dry_run IN (0,1)),
+  deleted_runs      INTEGER NOT NULL,
+  per_table_counts  TEXT NOT NULL,
+  executed_at       INTEGER NOT NULL
+);
 `
 
 func (s *Store) SchemaVersion() int {
