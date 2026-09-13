@@ -35,7 +35,12 @@ type GCResult struct {
 }
 
 func (s *Store) GCRuns(ctx context.Context, policy GCPolicy, now time.Time) (GCResult, error) {
-	cutoff := now.Add(-policy.OlderThan).UnixMilli()
+	var cutoff int64
+	if policy.OlderThan < 0 {
+		cutoff = 0
+	} else {
+		cutoff = now.Add(-policy.OlderThan).UnixMilli()
+	}
 	keepIDs, err := gcKeepNewestIDs(ctx, s.db, policy.KeepRuns)
 	if err != nil {
 		return GCResult{}, err

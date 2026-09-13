@@ -90,6 +90,9 @@ func parseGCDuration(raw string) (time.Duration, error) {
 		if days < 0 {
 			return 0, fmt.Errorf("invalid --older-than %q: duration must not be negative", raw)
 		}
+		if days > int64(1<<63-1)/int64(24*time.Hour) {
+			return 0, fmt.Errorf("invalid --older-than %q: duration out of range", raw)
+		}
 		return time.Duration(days) * 24 * time.Hour, nil
 	}
 	dur, err := time.ParseDuration(trimmed)

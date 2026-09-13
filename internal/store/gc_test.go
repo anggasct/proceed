@@ -90,6 +90,26 @@ func assertNoFKViolations(t *testing.T, s *Store) {
 	}
 }
 
+func TestGCNegativeAgeDeletesNothing(t *testing.T) {
+	s, versionID := seedGCStore(t)
+	ctx := context.Background()
+	victim := seedGCRun(t, s, versionID, 10, "completed", 90*24*time.Hour)
+	res, err := s.GCRuns(ctx, GCPolicy{KeepRuns: 0, OlderThan: time.Duration(-1), OlderThanS: "overflow"}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.DeletedRuns != 0 {
+		t.Fatalf("deleted runs = %d, want 0 (negative effective age never derives a future cutoff)", res.DeletedRuns)
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM graph_run WHERE id = ?`, victim).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatal("old terminal run deleted under a negative effective age")
+	}
+}
+
 func TestGCDryRunChangesNothingButRecord(t *testing.T) {
 	s, versionID := seedGCStore(t)
 	ctx := context.Background()

@@ -167,6 +167,32 @@ func TestCLIGCInvalidDuration(t *testing.T) {
 	}
 }
 
+func TestCLIGCOverflowDayMagnitudeRejected(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+	gcSeedRun(t, dataDir, 90*24*time.Hour)
+	code, _, stderr := runCLI(t, "gc", "--keep-runs", "2", "--older-than", "200000d",
+		"--data-dir", dataDir)
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2 (unrepresentable day magnitude is a usage error)", code)
+	}
+	if !strings.Contains(stderr, "invalid --older-than") {
+		t.Fatalf("stderr = %q, want usage error", stderr)
+	}
+	st, err := store.Open(filepath.Join(dataDir, "proceed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	var n int
+	if err := st.DB().QueryRow(`SELECT COUNT(*) FROM graph_run`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("graph_run rows = %d, want 1 (no deletion on usage error)", n)
+	}
+}
+
 func TestCLIGCZeroKeepRequiresYes(t *testing.T) {
 	dir := t.TempDir()
 	gcSeedRun(t, filepath.Join(dir, "data"), 90*24*time.Hour)
