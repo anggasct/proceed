@@ -41,118 +41,23 @@ func Open(path string) (*Store, error) {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&current); err != nil {
 		return nil, closeOnErr(db, err)
 	}
-	if current > storeSchemaVersion {
-		return nil, closeOnErr(db, storeErr(CodeGraphInvalid,
-			"store schema version %d is newer than supported %d", current, storeSchemaVersion))
-	}
-	if current < storeSchemaVersion {
-		if err := withDataDirLock(filepath.Dir(path), func() error {
-			var locked int
-			if err := db.QueryRow("PRAGMA user_version").Scan(&locked); err != nil {
-				return err
-			}
-			if locked >= storeSchemaVersion {
-				return nil
-			}
-			return migrateUnderLock(ctxBackground(), db, path)
-		}); err != nil {
+	if current == 0 {
+		if _, err := db.Exec(schemaDDL); err != nil {
+			return nil, closeOnErr(db, fmt.Errorf("apply schema: %w", err))
+		}
+		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", storeSchemaVersion)); err != nil {
 			return nil, closeOnErr(db, err)
 		}
-	} else if _, err := db.Exec(schemaDDL); err != nil {
+		return &Store{db: db, dataDir: filepath.Dir(path), lockPath: lockPath}, nil
+	}
+	if current != storeSchemaVersion {
+		return nil, closeOnErr(db, storeErr(CodeGraphInvalid,
+			"store schema version %d is not supported by this build (supported: %d); start from an empty store", current, storeSchemaVersion))
+	}
+	if _, err := db.Exec(schemaDDL); err != nil {
 		return nil, closeOnErr(db, fmt.Errorf("apply schema: %w", err))
 	}
 	return &Store{db: db, dataDir: filepath.Dir(path), lockPath: lockPath}, nil
-}
-
-func migrateUnderLock(ctx context.Context, db *sql.DB, path string) error {
-	backupPath := migrationBackupPath(path)
-	if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	if _, err := db.Exec(fmt.Sprintf("VACUUM INTO '%s'", backupPath)); err != nil {
-		return fmt.Errorf("pre-migration backup: %w", err)
-	}
-	return migrateInPlace(ctx, db)
-}
-
-func migrationBackupPath(path string) string {
-	return path + fmt.Sprintf(".pre-schema-%d.bak", storeSchemaVersion)
-}
-
-func migrateSchemaAdditions(ctx context.Context, conn *sql.Conn) error {
-	var n int
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('policy_change_proposal') WHERE name = 'rejection_reason'`).Scan(&n); err != nil {
-		return err
-	}
-	if n == 0 {
-		if _, err := conn.ExecContext(ctx, `ALTER TABLE policy_change_proposal ADD COLUMN rejection_reason TEXT`); err != nil {
-			return err
-		}
-	}
-	var digestCol int
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('graph_run') WHERE name = 'params_digest'`).Scan(&digestCol); err != nil {
-		return err
-	}
-	if digestCol == 0 {
-		if _, err := conn.ExecContext(ctx, `ALTER TABLE graph_run ADD COLUMN params_digest TEXT NOT NULL DEFAULT '{}'`); err != nil {
-			return err
-		}
-	}
-	var triggerCol int
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('graph_run') WHERE name = 'trigger_name'`).Scan(&triggerCol); err != nil {
-		return err
-	}
-	if triggerCol == 0 {
-		if _, err := conn.ExecContext(ctx, `ALTER TABLE graph_run ADD COLUMN trigger_name TEXT`); err != nil {
-			return err
-		}
-	}
-	for _, col := range []struct{ name, ddl string }{
-		{"schedule_id", "ALTER TABLE graph_run ADD COLUMN schedule_id TEXT"},
-		{"schedule_tick", "ALTER TABLE graph_run ADD COLUMN schedule_tick INTEGER"},
-	} {
-		var n int
-		if err := conn.QueryRowContext(ctx,
-			fmt.Sprintf(`SELECT COUNT(*) FROM pragma_table_info('graph_run') WHERE name = '%s'`, col.name)).Scan(&n); err != nil {
-			return err
-		}
-		if n == 0 {
-			if _, err := conn.ExecContext(ctx, col.ddl); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func ctxBackground() context.Context { return context.Background() }
-
-func migrateInPlace(ctx context.Context, db *sql.DB) error {
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		return err
-	}
-	if _, err := conn.ExecContext(ctx, schemaDDL); err != nil {
-		_, _ = conn.ExecContext(ctx, "ROLLBACK")
-		return fmt.Errorf("apply schema: %w", err)
-	}
-	if err := migrateSchemaAdditions(ctx, conn); err != nil {
-		_, _ = conn.ExecContext(ctx, "ROLLBACK")
-		return fmt.Errorf("apply schema migrations: %w", err)
-	}
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", storeSchemaVersion)); err != nil {
-		_, _ = conn.ExecContext(ctx, "ROLLBACK")
-		return err
-	}
-	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
-		_, _ = conn.ExecContext(ctx, "ROLLBACK")
-		return err
-	}
-	return nil
 }
 
 func closeOnErr(db *sql.DB, err error) error {

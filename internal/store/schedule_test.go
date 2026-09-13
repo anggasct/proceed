@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -407,52 +406,25 @@ func TestFireDueSchedulesIsolatesPerScheduleErrors(t *testing.T) {
 	}
 }
 
-func TestMigrationAddsScheduleColumns(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "proceed.db")
-	s, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec(`ALTER TABLE graph_run DROP COLUMN schedule_id`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec(`ALTER TABLE graph_run DROP COLUMN schedule_tick`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec(`DROP TABLE schedule`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec("PRAGMA user_version = 5"); err != nil {
-		t.Fatal(err)
-	}
-	s.Close()
-
-	backup := migrationBackupPath(path)
-	if err := os.Remove(backup); err != nil && !os.IsNotExist(err) {
-		t.Fatal(err)
-	}
-	s2, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s2.Close()
+func TestFreshStoreHasScheduleColumns(t *testing.T) {
+	s := openTestStore(t)
+	defer s.Close()
 	for _, col := range []string{"schedule_id", "schedule_tick"} {
 		var n int
-		if err := s2.db.QueryRow(
+		if err := s.db.QueryRow(
 			`SELECT COUNT(*) FROM pragma_table_info('graph_run') WHERE name = ?`, col).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		if n != 1 {
-			t.Fatalf("column %s missing after migration", col)
+			t.Fatalf("column %s missing in fresh baseline store", col)
 		}
 	}
 	var tables int
-	if err := s2.db.QueryRow(
+	if err := s.db.QueryRow(
 		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schedule'`).Scan(&tables); err != nil {
 		t.Fatal(err)
 	}
 	if tables != 1 {
-		t.Fatal("schedule table missing after migration")
+		t.Fatal("schedule table missing in fresh baseline store")
 	}
 }

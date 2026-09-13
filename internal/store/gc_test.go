@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -459,37 +458,24 @@ func TestGCEmptyStoreAndKeepAll(t *testing.T) {
 	}
 }
 
-func TestGCMigrationAddsRecordTable(t *testing.T) {
+func TestGCFreshStoreHasRecordTable(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "proceed.db")
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.db.Exec(`DROP TABLE gc_record`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec("PRAGMA user_version = 6"); err != nil {
-		t.Fatal(err)
-	}
-	s.Close()
-	backup := migrationBackupPath(path)
-	_ = os.Remove(backup)
-	s2, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s2.Close()
+	defer s.Close()
 	var tables int
-	if err := s2.db.QueryRow(
+	if err := s.db.QueryRow(
 		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'gc_record'`).Scan(&tables); err != nil {
 		t.Fatal(err)
 	}
 	if tables != 1 {
-		t.Fatal("gc_record table missing after migration")
+		t.Fatal("gc_record table missing in fresh baseline store")
 	}
 	var v int
-	if err := s2.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
 		t.Fatal(err)
 	}
 	if v != storeSchemaVersion {

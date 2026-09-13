@@ -223,13 +223,9 @@ func Export(ctx context.Context, dataDir, output string) error {
 		if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 			return storeErr(CodeGraphInvalid, "source store unreadable: %v", err)
 		}
-		if version > storeSchemaVersion {
-			return storeErr(CodeGraphInvalid, "source store schema version %d is newer than supported %d",
+		if version != storeSchemaVersion {
+			return storeErr(CodeGraphInvalid, "source store schema version %d is not supported by this build (supported: %d); start from an empty store",
 				version, storeSchemaVersion)
-		}
-		if version < storeSchemaVersion {
-			return storeErr(CodeGraphInvalid,
-				"source store is at schema version %d (supported: %d); open the store once to migrate it, then export", version, storeSchemaVersion)
 		}
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
@@ -555,8 +551,8 @@ func validateStagedStore(path string, manifestVersion int) error {
 		return storeErr(CodeGraphInvalid,
 			"corrupt archive: store snapshot schema version %d does not match manifest %d", version, manifestVersion)
 	}
-	if version > storeSchemaVersion {
-		return storeErr(CodeGraphInvalid, "archive schema version %d is newer than supported %d",
+	if version != storeSchemaVersion {
+		return storeErr(CodeGraphInvalid, "archive schema version %d is not supported by this build (supported: %d)",
 			version, storeSchemaVersion)
 	}
 	for _, table := range requiredTables {
@@ -598,16 +594,6 @@ func verifyStagedProjections(ctx context.Context, staging string) error {
 	defer db.Close()
 	var verifyErr error
 	err = func() error {
-		// Projection replay executes current-schema SQL, so older snapshots
-		// need additive columns pre-applied before verification.
-		conn, err := db.Conn(ctx)
-		if err != nil {
-			return err
-		}
-		defer conn.Close()
-		if err := migrateSchemaAdditions(ctx, conn); err != nil {
-			return err
-		}
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err

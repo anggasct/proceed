@@ -1,6 +1,6 @@
 package store
 
-const storeSchemaVersion = 7
+const storeSchemaVersion = 1
 
 var schemaDDL = `
 CREATE TABLE IF NOT EXISTS graph (

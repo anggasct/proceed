@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -139,36 +138,14 @@ func TestCreateRunRecordsTriggerName(t *testing.T) {
 	}
 }
 
-func TestMigrationAddsTriggerNameColumn(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "proceed.db")
-	s, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec(`ALTER TABLE graph_run DROP COLUMN trigger_name`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec("PRAGMA user_version = 4"); err != nil {
-		t.Fatal(err)
-	}
-	s.Close()
-
-	backup := migrationBackupPath(path)
-	if err := os.Remove(backup); err != nil && !os.IsNotExist(err) {
-		t.Fatal(err)
-	}
-	s2, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s2.Close()
+func TestFreshStoreHasTriggerNameColumn(t *testing.T) {
+	s := openTestStore(t)
 
 	var n int
-	if err := s2.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('graph_run') WHERE name = 'trigger_name'`).Scan(&n); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('graph_run') WHERE name = 'trigger_name'`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 1 {
-		t.Fatal("trigger_name column missing after migration")
+		t.Fatal("trigger_name column missing in fresh baseline store")
 	}
 }

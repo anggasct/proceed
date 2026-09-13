@@ -191,11 +191,11 @@ VALUES ('default', 'controller-1', 'run', ?, ?)`, now, now+60000); err != nil {
 	}
 }
 
-func TestExportRejectsOlderStoreReadonly(t *testing.T) {
+func TestExportRejectsUnsupportedStoreReadonly(t *testing.T) {
 	ctx := context.Background()
 	sourceDir := t.TempDir()
 	s := buildPopulatedDir(t, sourceDir)
-	if _, err := s.db.Exec("PRAGMA user_version = 1"); err != nil {
+	if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", storeSchemaVersion+1)); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
@@ -204,7 +204,7 @@ func TestExportRejectsOlderStoreReadonly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	archive := filepath.Join(t.TempDir(), "older.tgz")
+	archive := filepath.Join(t.TempDir(), "unsupported.tgz")
 	err = Export(ctx, sourceDir, archive)
 	if !IsCode(err, CodeGraphInvalid) {
 		t.Fatalf("error = %v, want GRAPH_INVALID", err)
@@ -222,8 +222,8 @@ func TestExportRejectsOlderStoreReadonly(t *testing.T) {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 1 {
-		t.Errorf("export mutated source schema version: got %d, want 1", version)
+	if version != storeSchemaVersion+1 {
+		t.Errorf("export mutated source schema version: got %d, want %d", version, storeSchemaVersion+1)
 	}
 	after, err := snapshotDirExcluding(sourceDir, dirLockName, "proceed.db-wal", "proceed.db-shm")
 	if err != nil {
@@ -566,51 +566,7 @@ func TestImportRejectsSchemaVersionDisagreement(t *testing.T) {
 	}
 }
 
-func recraftArchiveAsOlderSchema(t *testing.T, archive, outPath string) {
-	t.Helper()
-	members, err := readArchiveMembers(archive)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var manifest exportManifest
-	if err := json.Unmarshal(members[manifestMember], &manifest); err != nil {
-		t.Fatal(err)
-	}
-	work := filepath.Join(t.TempDir(), "work.db")
-	if err := os.WriteFile(work, members[manifest.DB.Path], 0o644); err != nil {
-		t.Fatal(err)
-	}
-	db, err := sql.Open("sqlite", "file:"+work+"?_pragma=busy_timeout(5000)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Ping(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`ALTER TABLE graph_run DROP COLUMN trigger_name`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", storeSchemaVersion-1)); err != nil {
-		t.Fatal(err)
-	}
-	db.Close()
-	content, err := os.ReadFile(work)
-	if err != nil {
-		t.Fatal(err)
-	}
-	members[manifest.DB.Path] = content
-	manifest.DB.SHA256 = sha256Hex(content)
-	manifest.DB.SizeBytes = int64(len(content))
-	manifest.SchemaVersion = storeSchemaVersion - 1
-	encoded, err := json.Marshal(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	members[manifestMember] = encoded
-	writeTestArchive(t, outPath, members)
-}
-
-func TestImportAcceptsOlderSchemaArchive(t *testing.T) {
+func TestImportRejectsNonBaselineSchemaArchive(t *testing.T) {
 	ctx := context.Background()
 	sourceDir := t.TempDir()
 	s := buildPopulatedDir(t, sourceDir)
@@ -620,51 +576,26 @@ func TestImportAcceptsOlderSchemaArchive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	older := filepath.Join(t.TempDir(), "older.tgz")
-	recraftArchiveAsOlderSchema(t, archive, older)
+	members, err := readArchiveMembers(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest exportManifest
+	if err := json.Unmarshal(members[manifestMember], &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.SchemaVersion = storeSchemaVersion + 1
+	encoded, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members[manifestMember] = encoded
+	future := filepath.Join(t.TempDir(), "future.tgz")
+	writeTestArchive(t, future, members)
 
 	targetDir := t.TempDir()
-	if err := Import(ctx, older, targetDir); err != nil {
-		t.Fatalf("import of a pre-v%d archive failed: %v", storeSchemaVersion, err)
-	}
-
-	restored, err := Open(filepath.Join(targetDir, "proceed.db"))
-	if err != nil {
-		t.Fatalf("restored store failed to open: %v", err)
-	}
-	defer restored.Close()
-
-	var version int
-	if err := restored.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
-		t.Fatal(err)
-	}
-	if version != storeSchemaVersion {
-		t.Errorf("restored user_version = %d, want %d", version, storeSchemaVersion)
-	}
-	var triggerCol int
-	if err := restored.db.QueryRow(
-		`SELECT COUNT(*) FROM pragma_table_info('graph_run') WHERE name = 'trigger_name'`).Scan(&triggerCol); err != nil {
-		t.Fatal(err)
-	}
-	if triggerCol != 1 {
-		t.Error("trigger_name column missing after restoring an older archive")
-	}
-	var runs int
-	if err := restored.db.QueryRow("SELECT COUNT(*) FROM graph_run").Scan(&runs); err != nil {
-		t.Fatal(err)
-	}
-	if runs != 1 {
-		t.Errorf("restored graph_run rows = %d, want 1", runs)
-	}
-	if _, err := restored.ListWebhookTriggers(ctx); err != nil {
-		t.Fatalf("webhook triggers unreadable on restored store: %v", err)
-	}
-	report, err := restored.RebuildProjections(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if report.Diverged {
-		t.Error("restored store projections diverge from the event stream")
+	if err := Import(ctx, future, targetDir); !IsCode(err, CodeGraphInvalid) {
+		t.Fatalf("import of a non-baseline archive error = %v, want GRAPH_INVALID", err)
 	}
 }
 
