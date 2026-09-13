@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -314,53 +314,47 @@ func TestAppendMonotonicUnderConcurrency(t *testing.T) {
 	}
 }
 
-func TestOpenUpgradesOlderBaseline(t *testing.T) {
-	dir := t.TempDir()
-	path := dir + "/proceed.db"
-	s, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec("PRAGMA user_version = 1"); err != nil {
-		t.Fatal(err)
-	}
-	s.Close()
+func TestOpenRejectsUnsupportedVersion(t *testing.T) {
+	for _, old := range []int{0, 2, 3, 4, 5, 6, 7} {
+		dir := t.TempDir()
+		path := dir + "/proceed.db"
+		s, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		version := old
+		if old == 0 {
+			version = storeSchemaVersion + 1
+		}
+		if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
+			t.Fatal(err)
+		}
+		s.Close()
 
-	s2, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s2.Close()
-	var v int
-	if err := s2.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
-		t.Fatal(err)
-	}
-	if v != storeSchemaVersion {
-		t.Errorf("user_version = %d, want %d", v, storeSchemaVersion)
-	}
-	backup := migrationBackupPath(path)
-	if _, err := os.Stat(backup); err != nil {
-		t.Fatalf("pre-migration backup missing: %v", err)
-	}
-	bk, err := sql.Open("sqlite", "file:"+backup+"?_pragma=busy_timeout(5000)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer bk.Close()
-	var bv int
-	if err := bk.QueryRow("PRAGMA user_version").Scan(&bv); err != nil {
-		t.Fatal(err)
-	}
-	if bv != 1 {
-		t.Errorf("backup user_version = %d, want 1 (pre-migration state)", bv)
-	}
-	var n int
-	if err := s2.db.QueryRow("SELECT COUNT(*) FROM event").Scan(&n); err != nil {
-		t.Fatal(err)
+		_, err = Open(path)
+		if !IsCode(err, CodeGraphInvalid) {
+			t.Fatalf("version %d error = %v, want GRAPH_INVALID", version, err)
+		}
+		if matches, _ := filepath.Glob(dir + "/proceed.db.pre-schema-*.bak"); len(matches) != 0 {
+			t.Fatalf("version %d created migration backup %v, want none", version, matches)
+		}
+		var v int
+		db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+		db.Close()
+		if v != version {
+			t.Fatalf("version %d store restamped to %d, want untouched", version, v)
+		}
 	}
 }
 
-func TestOpenMigrationRollbackOnFailure(t *testing.T) {
+func TestConcurrentOpenSameVersion(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/proceed.db"
 	s, err := Open(path)
@@ -374,77 +368,6 @@ func TestOpenMigrationRollbackOnFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := s.CreateRun(context.Background(), frozen.GraphVersionID, nil, ""); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec("PRAGMA user_version = 1"); err != nil {
-		t.Fatal(err)
-	}
-	s.Close()
-
-	orig := schemaDDL
-	schemaDDL = "CREATE TABLE broken (this is not valid sql);"
-	_, err = Open(path)
-	if err == nil {
-		t.Fatal("migration with invalid DDL must fail")
-	}
-	schemaDDL = orig
-
-	s3, err := Open(path)
-	if err != nil {
-		t.Fatalf("store unusable after failed migration: %v", err)
-	}
-	defer s3.Close()
-	var v int
-	if err := s3.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
-		t.Fatal(err)
-	}
-	if v != storeSchemaVersion {
-		t.Errorf("user_version = %d after retry, want %d (retry completes the migration)", v, storeSchemaVersion)
-	}
-	var runs int
-	if err := s3.db.QueryRow("SELECT COUNT(*) FROM graph_run").Scan(&runs); err != nil {
-		t.Fatal(err)
-	}
-	if runs != 1 {
-		t.Errorf("graph_run rows = %d after failed migration, want 1 (original data intact)", runs)
-	}
-}
-
-func TestOpenRejectsNewerSchema(t *testing.T) {
-	dir := t.TempDir()
-	path := dir + "/proceed.db"
-	s, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", storeSchemaVersion+1)); err != nil {
-		t.Fatal(err)
-	}
-	s.Close()
-
-	_, err = Open(path)
-	if !IsCode(err, CodeGraphInvalid) {
-		t.Fatalf("newer schema error = %v, want GRAPH_INVALID", err)
-	}
-}
-
-func TestConcurrentOpenMigratesOnce(t *testing.T) {
-	dir := t.TempDir()
-	path := dir + "/proceed.db"
-	s, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	src := readFixture(t, "../../internal/compiler/testdata/customer-research.yaml")
-	doc := compileFixture(t, src)
-	frozen, err := s.FreezeDefinition(context.Background(), "a.yaml", src, doc)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.CreateRun(context.Background(), frozen.GraphVersionID, nil, ""); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec("PRAGMA user_version = 1"); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
@@ -465,20 +388,6 @@ func TestConcurrentOpenMigratesOnce(t *testing.T) {
 		if err := <-errs; err != nil {
 			t.Fatalf("concurrent open failed: %v", err)
 		}
-	}
-
-	backup := migrationBackupPath(path)
-	bk, err := sql.Open("sqlite", "file:"+backup+"?_pragma=busy_timeout(5000)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer bk.Close()
-	var bv int
-	if err := bk.QueryRow("PRAGMA user_version").Scan(&bv); err != nil {
-		t.Fatal(err)
-	}
-	if bv != 1 {
-		t.Errorf("pre-migration backup user_version = %d, want 1 (backup must capture pre-migration state)", bv)
 	}
 
 	final, err := Open(path)
