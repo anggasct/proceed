@@ -6,9 +6,10 @@ import (
 )
 
 type RunGraphNode struct {
-	NodeKey      string `json:"node_key"`
-	Status       string `json:"status"`
-	AttemptCount int64  `json:"attempt_count"`
+	NodeKey      string       `json:"node_key"`
+	Status       string       `json:"status"`
+	AttemptCount int64        `json:"attempt_count"`
+	Failure      *NodeFailure `json:"failure"`
 }
 
 type RunGraphEdge struct {
@@ -58,6 +59,18 @@ ORDER BY gn.node_key`, runID, g.GraphVersionID)
 	}
 	if err := nodeRows.Err(); err != nil {
 		return nil, err
+	}
+
+	eventCauses, err := s.terminalEventCauses(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	resultCauses, err := s.attemptResultCauses(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range g.Nodes {
+		g.Nodes[i].Failure = resolveNodeFailure(g.Nodes[i].NodeKey, g.Nodes[i].AttemptCount, eventCauses, resultCauses)
 	}
 
 	edgeRows, err := s.db.QueryContext(ctx, `
