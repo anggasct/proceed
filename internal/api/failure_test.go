@@ -100,6 +100,7 @@ func TestAPIRunStateSurfacesNodeFailureCause(t *testing.T) {
 
 func TestAPIUnknownRunAndScopeUnchangedForRunState(t *testing.T) {
 	cfg := testConfig(t)
+	cfg.Tokens = append(cfg.Tokens, config.Token{Name: "noread", Token: "noread-secret", Scopes: []string{"run"}})
 	server, _, _ := testServer(t, cfg)
 
 	rec, payload := doJSON(t, server.Handler(), "GET", "/v1/runs/01MISSING", "viewer-secret", "")
@@ -110,5 +111,20 @@ func TestAPIUnknownRunAndScopeUnchangedForRunState(t *testing.T) {
 	rec, _ = doJSON(t, server.Handler(), "GET", "/v1/runs/01MISSING", "", "")
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("missing token = %d, want 401", rec.Code)
+	}
+
+	for _, target := range []string{"/v1/runs/01MISSING", "/v1/runs/01MISSING/graph"} {
+		rec, payload := doJSON(t, server.Handler(), "GET", target, "noread-secret", "")
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s read-less token = %d, want 403", target, rec.Code)
+		}
+		errBody, ok := payload["error"].(map[string]any)
+		if !ok || errBody["code"] != "POLICY_DENIED" {
+			t.Fatalf("%s error envelope = %v, want POLICY_DENIED", target, payload)
+		}
+		details, ok := errBody["details"].(map[string]any)
+		if !ok || details["required_scope"] != "read" {
+			t.Fatalf("%s details = %v, want required_scope read", target, errBody["details"])
+		}
 	}
 }
